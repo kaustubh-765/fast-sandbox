@@ -105,7 +105,7 @@ func run(ctx context.Context) error {
 	}
 	pullMs := time.Since(convertStarted).Milliseconds()
 	convertStarted = time.Now()
-	rootfs, err := stageConvert(spec, workdir)
+	rootfs, mitmCA, err := stageConvert(spec, workdir)
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func run(ctx context.Context) error {
 	// Stage 5: manifest + checksums, recording the CPU template the
 	// snapshot stage actually booted with.
 	manifestStarted := time.Now()
-	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, workdir, phases.CPUTemplate)
+	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, workdir, phases.CPUTemplate, mitmCA)
 	if err != nil {
 		return err
 	}

@@ -48,6 +48,7 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/inspect", s.handleInspect)
 	mux.HandleFunc("/api/v2/fastlet/delete", s.handleDelete)
 	mux.HandleFunc("/api/v2/fastlet/bindings/reconcile", s.handleReconcileBindings)
+	mux.HandleFunc("/api/v2/fastlet/handlers/invoke", s.handleInvokeHandler)
 	mux.HandleFunc("/api/v2/fastlet/snapshots/create", s.handleSnapshotCreate)
 	mux.HandleFunc("/api/v2/fastlet/snapshots/inspect", s.handleSnapshotInspect)
 	mux.HandleFunc("/api/v2/fastlet/snapshots/delete", s.handleSnapshotDelete)
@@ -141,6 +142,16 @@ func (s *FastletServer) handleReconcileBindings(w http.ResponseWriter, r *http.R
 	}
 	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
 	response, err := s.sandboxManager.ReconcileBindings(r.Context(), &req)
+	writeResponse(w, response, err)
+}
+
+func (s *FastletServer) handleInvokeHandler(w http.ResponseWriter, r *http.Request) {
+	var req fastletapi.InvokeHandlerRequest
+	if !decodePost(w, r, &req) {
+		return
+	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
+	response, err := s.sandboxManager.InvokeHandler(r.Context(), &req)
 	writeResponse(w, response, err)
 }
 

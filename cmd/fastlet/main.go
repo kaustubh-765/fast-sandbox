@@ -98,6 +98,7 @@ func main() {
 		klog.ErrorS(err, "Failed to configure action handlers")
 		os.Exit(1)
 	}
+	actionManager.SetVaultHandler(fastletaction.VaultHandlerFromEnv())
 
 	klog.InfoS("fastlet starting",
 		"podName", podName, "podIP", podIP, "nodeName", nodeName,
@@ -133,6 +134,14 @@ func main() {
 	if configurable, ok := rt.(agentClientConfigurable); ok {
 		configurable.SetFastletPodUID(podUID)
 		configurable.SetAgentSocket(getEnv("FAST_SANDBOX_RUNTIME_AGENT_SOCKET", ""))
+	}
+	// The driver-invoked egress vault transfer (OSEP-0022): checkpoints stage
+	// the subject's vault file into the bundle before the runtime release,
+	// restores import it before the data plane becomes ready. Optional:
+	// drivers without the capability (and pools without a vault handler)
+	// simply never move vault files.
+	if configurable, ok := rt.(vaultMoverConfigurable); ok {
+		configurable.SetVaultMover(actionManager)
 	}
 	registryProvider := registryconfig.NewFileProvider(getEnv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", registryconfig.MountPath))
 	if revision, err := registryProvider.Refresh(); err != nil {
@@ -383,6 +392,12 @@ type nodeCleanupConfigurable interface {
 type agentClientConfigurable interface {
 	SetFastletPodUID(podUID string)
 	SetAgentSocket(socketPath string)
+}
+
+// vaultMoverConfigurable is the optional driver capability for the
+// egress-owned vault transfer across pause/resume.
+type vaultMoverConfigurable interface {
+	SetVaultMover(mover runtimecontract.VaultMover)
 }
 
 func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager, proxyClient *fastletproxy.ControlClient) {

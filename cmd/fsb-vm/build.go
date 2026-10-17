@@ -261,6 +261,7 @@ type buildRootfsOps struct {
 	writeConfig      func(context.Context, string, fetchedImage, int) (string, error)
 	addDevice        func(context.Context, string) (int, string, error)
 	deleteDevice     func(context.Context, int) error
+	recoverDevice    func(context.Context, string) (int, error)
 	repairFilesystem func(context.Context, string) error
 	resizeFilesystem func(context.Context, string, int) error
 	verifyFilesystem func(context.Context, string) error
@@ -274,9 +275,12 @@ func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 		probeSourceSize: func(ctx context.Context, workDir string, fetched fetchedImage, undo *rollback) (int64, error) {
 			return probeSourceVirtualSize(ctx, ublkd, workDir, fetched, undo)
 		},
-		writeConfig:      writeBuildRootfsConfig,
-		addDevice:        ublkd.Add,
-		deleteDevice:     ublkd.Del,
+		writeConfig:  writeBuildRootfsConfig,
+		addDevice:    ublkd.Add,
+		deleteDevice: ublkd.Del,
+		recoverDevice: func(ctx context.Context, config string) (int, error) {
+			return releaseOwnedDevicesByConfig(ctx, ublkd, config)
+		},
 		repairFilesystem: repairExt4,
 		resizeFilesystem: resizeExt4,
 		verifyFilesystem: verifyExt4,
@@ -286,29 +290,51 @@ func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 	}
 }
 
-// deviceAttachment tracks one ublk device the build attached. detach is
-// idempotent and is shared by the explicit release and the rollback step:
-// once the device is released the rollback becomes a no-op, so a dev_id that
-// ublkd may already have handed to another device is never deleted twice.
+// deviceAttachment tracks ownership of one ublk device across uncertain Add
+// and Del responses. Its rollback is armed before Add is sent. A known dev_id
+// is used for the fast-path delete; after any uncertain response, recovery
+// lists devices and matches the config path before deleting, so a recycled id
+// can never identify another build's device.
 type deviceAttachment struct {
-	devID    int
-	devPath  string
-	attached bool
-	release  func(context.Context, int) error
+	config            string
+	devID             int
+	devPath           string
+	attached          bool
+	addOutcomeUnknown bool
+	release           func(context.Context, int) error
+	recoverOwned      func(context.Context, string) (int, error)
 }
 
-// attachDevice records a freshly added device and arms its rollback. A
-// failed release stops the rollback, so the config and upper the device
-// still reads are not deleted underneath it.
-func attachDevice(devID int, devPath string, release func(context.Context, int) error, undo *rollback) *deviceAttachment {
-	attachment := &deviceAttachment{devID: devID, devPath: devPath, attached: true, release: release}
+func trackDevice(config string, release func(context.Context, int) error, recoverOwned func(context.Context, string) (int, error), undo *rollback) *deviceAttachment {
+	attachment := &deviceAttachment{config: config, devID: -1, release: release, recoverOwned: recoverOwned}
 	undo.pushDescribed(attachment.String, func() error {
 		return attachment.detach(context.Background())
 	})
 	return attachment
 }
 
+// add marks ownership as uncertain before issuing the request. If the daemon
+// accepts the Add but its response is lost, rollback therefore recovers the
+// device by config before any backing files are removed.
+func (attachment *deviceAttachment) add(ctx context.Context, add func(context.Context, string) (int, string, error)) error {
+	attachment.attached = true
+	attachment.addOutcomeUnknown = false
+	attachment.devID = -1
+	attachment.devPath = ""
+	devID, devPath, err := add(ctx, attachment.config)
+	if err != nil {
+		attachment.addOutcomeUnknown = errors.Is(err, errAddOutcomeUnknown)
+		return err
+	}
+	attachment.devID = devID
+	attachment.devPath = devPath
+	return nil
+}
+
 func (attachment *deviceAttachment) String() string {
+	if attachment.devID < 0 {
+		return "ublk device owned by config " + attachment.config
+	}
 	return fmt.Sprintf("ublk device %d (%s)", attachment.devID, attachment.devPath)
 }
 
@@ -316,10 +342,27 @@ func (attachment *deviceAttachment) detach(ctx context.Context) error {
 	if !attachment.attached {
 		return nil
 	}
-	if err := attachment.release(ctx, attachment.devID); err != nil {
-		return err
+	var releaseErr error
+	if attachment.devID >= 0 {
+		if releaseErr = attachment.release(ctx, attachment.devID); releaseErr == nil {
+			attachment.attached = false
+			attachment.addOutcomeUnknown = false
+			return nil
+		}
+		// Del may have succeeded despite a lost response. Do not retry a dev_id
+		// that the daemon could already have recycled; switch to config recovery.
+		attachment.devID = -1
+		attachment.devPath = ""
+	}
+	matches, err := attachment.recoverOwned(ctx, attachment.config)
+	if err != nil {
+		return errors.Join(releaseErr, err)
+	}
+	if attachment.addOutcomeUnknown && matches == 0 {
+		return errors.Join(releaseErr, fmt.Errorf("ublkd add of %s may still be in flight; keeping its backing files", attachment.config))
 	}
 	attachment.attached = false
+	attachment.addOutcomeUnknown = false
 	return nil
 }
 
@@ -344,11 +387,10 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 	if err != nil {
 		return nil, err
 	}
-	devID, devPath, err := ops.addDevice(ctx, configPath)
-	if err != nil {
+	attachment := trackDevice(configPath, ops.deleteDevice, ops.recoverDevice, undo)
+	if err := attachment.add(ctx, ops.addDevice); err != nil {
 		return nil, err
 	}
-	attachment := attachDevice(devID, devPath, ops.deleteDevice, undo)
 
 	if err := ops.repairFilesystem(ctx, attachment.devPath); err != nil {
 		return nil, err
@@ -372,13 +414,9 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 		if err := ops.resizeUpper(ctx, configPath, targetGiB); err != nil {
 			return nil, err
 		}
-		devID, devPath, err = ops.addDevice(ctx, configPath)
-		if err != nil {
+		if err := attachment.add(ctx, ops.addDevice); err != nil {
 			return nil, err
 		}
-		attachment.devID = devID
-		attachment.devPath = devPath
-		attachment.attached = true
 	}
 	deviceBytes, err := ops.deviceSize(attachment.devPath)
 	if err != nil {
@@ -618,11 +656,12 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 	if err != nil {
 		return err
 	}
-	snapDevID, snapDevPath, err := ublkd.Add(ctx, snapConfig)
-	if err != nil {
+	snapfiles := trackDevice(snapConfig, ublkd.Del, func(ctx context.Context, config string) (int, error) {
+		return releaseOwnedDevicesByConfig(ctx, ublkd, config)
+	}, undo)
+	if err := snapfiles.add(ctx, ublkd.Add); err != nil {
 		return err
 	}
-	snapfiles := attachDevice(snapDevID, snapDevPath, ublkd.Del, undo)
 	if err := mkfsExt4(ctx, snapfiles.devPath); err != nil {
 		return err
 	}

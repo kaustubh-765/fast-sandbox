@@ -445,6 +445,45 @@ func TestPullCheckpointFullFlowWithoutIndex(t *testing.T) {
 	require.Len(t, store.requested(), before, "a committed checkpoint cache is not re-pulled")
 }
 
+func TestPullCheckpointMaterializesOptionalVaultBundle(t *testing.T) {
+	// A checkpoint manifest that lists the vault bundle: the pull materializes
+	// it next to the snapshot files so the restore path can hand it to egress.
+	vaultContent := []byte(`{"v":1,"revision":3,"vault":{"token":"t"}}`)
+	store, client, manifestPayload, nativeBodies := publishFixture(t)
+	delete(store.objects, "index/"+imageKey(testImage)+".json")
+	buildDir := sha256Hex(manifestPayload)[:16]
+	store.objects[buildDir+"/"+publishVaultName] = vaultContent
+	files := map[string]any{}
+	for name, content := range nativeBodies {
+		files[name] = map[string]any{"sha256": sha256Hex(content), "sizeBytes": len(content)}
+	}
+	files[publishVaultName] = map[string]any{"sha256": sha256Hex(vaultContent), "sizeBytes": len(vaultContent)}
+	withVault, err := json.MarshalIndent(map[string]any{
+		"schemaVersion": 1, "runtime": "firecracker", "files": files,
+	}, "", "  ")
+	require.NoError(t, err)
+	digest := sha256Hex(withVault)
+	store.objects[buildDir+"/manifest.json"] = withVault
+	manifestRef := "s3://" + testBucket + "/" + testPrefix + "/" + buildDir + "/manifest.json"
+	root := t.TempDir()
+	reference := artifacts.CheckpointReference(digest)
+
+	require.NoError(t, (&Client{s3: client}).PullCheckpoint(t.Context(), root, reference, manifestRef, digest))
+	cached, statErr := os.Stat(filepath.Join(imageDir(root, reference), publishVaultName))
+	require.NoError(t, statErr)
+	require.Equal(t, int64(len(vaultContent)), cached.Size())
+
+	// A checkpoint manifest without a vault entry materializes none.
+	_, client2, manifestPayload2, _ := publishFixture(t)
+	digest2 := sha256Hex(manifestPayload2)
+	root2 := t.TempDir()
+	require.NoError(t, (&Client{s3: client2}).PullCheckpoint(t.Context(), root2,
+		artifacts.CheckpointReference(digest2),
+		"s3://"+testBucket+"/"+testPrefix+"/"+digest2[:16]+"/manifest.json", digest2))
+	_, statErr = os.Stat(filepath.Join(imageDir(root2, artifacts.CheckpointReference(digest2)), publishVaultName))
+	require.True(t, os.IsNotExist(statErr), "golden-image and vault-less checkpoints stage no vault bundle")
+}
+
 func TestPullCheckpointRejectsDigestMismatch(t *testing.T) {
 	_, client, manifestPayload, _ := publishFixture(t)
 	digest := sha256Hex(manifestPayload)

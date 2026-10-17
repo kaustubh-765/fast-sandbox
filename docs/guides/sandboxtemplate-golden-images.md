@@ -136,6 +136,62 @@ container runtime would; an env here with the same name overrides the
 inherited value. Do not place secrets here — they are published
 verbatim in the manifest; use `publishSecretRef` for credentials.
 
+### `spec.egressMitmCertificate`
+
+Optional. Bakes the **egress MITM proxy CA certificate** into the golden
+image (OSEP-0022), so guest HTTPS verifies against the pinned CA from first
+boot — nothing is delivered at sandbox create time.
+
+```yaml
+spec:
+  egressMitmCertificate:
+    secretRef:
+      name: opensandbox-mitm-ca   # Secret in the template's namespace
+    key: ca.crt                   # default; the certificate entry only
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `egressMitmCertificate.secretRef.name` | — (required) | Secret carrying the certificate; must live in the template's namespace |
+| `egressMitmCertificate.key` | `ca.crt` | Secret data entry holding the PEM certificate; **only this key** is mounted into the build Pod |
+
+Behavior:
+
+- The controller projects the single configured key (volume `Items`) into the
+  build Pod; the rest of the Secret — e.g. the CA private key — never enters
+  the build. The builder accepts entries consisting solely of PEM
+  `CERTIFICATE` blocks — private keys, other PEM blocks, and trailing
+  non-PEM data are rejected — and bakes them re-encoded (canonical PEM), so
+  the published bytes are exactly what the lineage fingerprints cover. It
+  does not verify CA constraints (`BasicConstraints CA:TRUE`), so the entry
+  must hold a properly issued CA certificate.
+- The builder writes the certificates into the rootfs at
+  `/opt/opensandbox/mitmproxy-ca-cert.pem` — the path the execd bootstrap
+  script watches — and sets the trust gate
+  (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`, after `spec.envs`, so it
+  wins).
+- The builder records the baked CA's public-key identity into the manifest
+  lineage (`lineage.egressMitmCA`): per `CERTIFICATE` block, `certSha256`
+  (SHA-256 of the certificate DER — matched byte-for-byte against the egress
+  pinned-CA fingerprint exposed on `/healthz`, which is how a template↔pool
+  pinning mismatch becomes checkable), `spkiSha256` (the key identity,
+  stable across re-issuance with the same key), and `notAfter`. Fingerprints
+  only — never the Secret reference, the private key, or certificate bytes;
+  absent when this field is unset (consumers treat that as "unknown" and
+  skip the comparison). See the
+  [artifact manifest reference](artifact-manifest-reference.md).
+- At the build's snapshot boot the bootstrap installs the CA into the guest
+  trust store (`update-ca-certificates` / `update-ca-trust`, plus NSS and JDK
+  keystores), builds the merged bundle (roots + MITM CA), and exports
+  `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`. These rootfs
+  writes and process envs are part of the golden image, so restored sandboxes
+  trust the CA across egress restart and pause/resume.
+- The CA is cluster-global (one Secret per deployment): one baked template
+  works with every pool's egress — the field is pool-agnostic.
+- Requires `spec.execd` (the trust installation lives in the bootstrap
+  script); without it the build fails — the certificate could be baked but
+  never trusted.
+
 ### `spec.readiness`
 
 Defines when the guest is considered ready for the snapshot.

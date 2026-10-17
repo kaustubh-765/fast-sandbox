@@ -276,6 +276,7 @@ func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, re
 	}
 	devID, devPath, err := ublkd.Add(ctx, config)
 	if err != nil {
+		(*record).addOutcomeUnknown = errors.Is(err, errAddOutcomeUnknown)
 		return "", err
 	}
 	(*record).DevID, (*record).DevPath = devID, devPath

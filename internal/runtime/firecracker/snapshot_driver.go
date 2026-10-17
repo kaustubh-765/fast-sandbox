@@ -139,6 +139,20 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		"spilled", plan.spilled, "rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
 		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
 
+	// Checkpoints carry the egress-owned vault file in the bundle: the export
+	// runs here — inside the pause flow, strictly before the control plane
+	// releases the runtime (the release is what sends REMOVE_BINDING and
+	// purges the egress-local file). An export failure fails the checkpoint,
+	// so the egress-local file survives for the retry. Template snapshots
+	// NEVER export: the vault belongs to one sandbox instance, and a shared
+	// boot image would leak it to every sandbox booted from the template.
+	if kind == fastletapi.SnapshotKindCheckpoint {
+		if err := d.stageCheckpointVault(ctx, input.SandboxID, plan.staging); err != nil {
+			_ = os.RemoveAll(plan.staging)
+			return nil, err
+		}
+	}
+
 	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, plan.staging, plan.sandboxDir, input.ActionBindings)
 	if err != nil {
 		_ = os.RemoveAll(plan.staging)
@@ -225,12 +239,25 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		_ = os.RemoveAll(staging)
 		return fmt.Errorf("prepare checkpoint cache staging: %w", err)
 	}
-	for from, to := range map[string]string{
+	mappings := map[string]string{
 		publishedRootfsName:  rootfsImageName,
 		vmstateSnapshotName:  vmstateSnapshotName,
 		memorySnapshotName:   memorySnapshotName,
 		snapshotManifestName: snapshotManifestName,
-	} {
+	}
+	// The vault file is an optional bundle member; it rides into the cache
+	// so the restore path finds it next to the snapshot files. Mirror the
+	// assembly/publish stat contract: only absence skips it — dropping the
+	// file on a transient error would corrupt the node-local cache
+	// asymmetrically against the published set.
+	if _, err := os.Stat(filepath.Join(staging, vaultBundleName)); err == nil {
+		mappings[vaultBundleName] = vaultBundleName
+	} else if !errors.Is(err, os.ErrNotExist) {
+		_ = os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(staging)
+		return fmt.Errorf("stat staged %s for the cache commit: %w", vaultBundleName, err)
+	}
+	for from, to := range mappings {
 		if err := os.Rename(filepath.Join(staging, from), filepath.Join(tmpDir, to)); err != nil {
 			_ = os.RemoveAll(tmpDir)
 			_ = os.RemoveAll(staging)
@@ -622,12 +649,147 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	return nil
 }
 
+// vaultBundleName is the staged vault file of a checkpoint bundle. It
+// carries the egress-owned vault of one sandbox instance; the egress re-stamps
+// its incarnation at restore import.
+const vaultBundleName = "vault.json"
+
+// stageCheckpointVault exports the subject's egress vault into the checkpoint
+// staging directory (no-op without a mover). The Handler copies the file
+// itself: a successful export with no file at the target simply means the
+// subject held no vault; any transfer failure fails the checkpoint so the
+// egress-local file survives for the retry.
+func (d *Driver) stageCheckpointVault(ctx context.Context, sandboxUID, staging string) error {
+	d.mu.RLock()
+	mover := d.vaultMover
+	d.mu.RUnlock()
+	if mover == nil {
+		return nil //nolint:nilerr // no mover wired: vault transfer disabled
+	}
+	if err := mover.ExportVault(ctx, sandboxUID, filepath.Join(staging, vaultBundleName)); err != nil {
+		return fmt.Errorf("export egress vault for the checkpoint bundle: %w", err)
+	}
+	return nil
+}
+
+// maxVaultBundleBytes bounds the vault bundle file buffered for provenance
+// verification. The vault is decoupled from the binding-input cap, so the
+// bound is its own (generous) limit; nothing larger is ever legitimate.
+const maxVaultBundleBytes = 4 << 20
+
+// importRestoreVault delivers a restored checkpoint's vault bundle file to
+// egress — before the data plane becomes ready. Only a resumed checkpoint
+// carries the file (golden-image caches never do); a nil mover is a no-op.
+// The committed manifest's egressVault entry is the enforced provenance:
+// an authorized-but-missing file, a read failure, a marker/size/digest
+// mismatch, or an import failure all degrade the subject's vault
+// fail-closed and observably — mirroring the corrupt vault file posture at
+// registration. The Handler reads the bundle file itself; the driver only
+// verifies it and hands over the path.
+func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, vmstatePath, sandboxUID string) {
+	if spec.Restore == nil {
+		return
+	}
+	d.mu.RLock()
+	mover := d.vaultMover
+	d.mu.RUnlock()
+	if mover == nil {
+		return
+	}
+	bundleDir := filepath.Dir(vmstatePath)
+	vaultPath := filepath.Join(bundleDir, vaultBundleName)
+
+	marker, markerPresent, markerErr := vaultManifestMarker(bundleDir)
+	if markerErr != nil {
+		klog.ErrorS(markerErr, "read the checkpoint manifest for the vault provenance failed; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+		return
+	}
+
+	info, statErr := os.Stat(vaultPath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			if markerPresent {
+				// The manifest authorizes a vault but the bundle file is
+				// gone (partial cache damage): never a silent skip.
+				klog.ErrorS(errVaultBundleMissing, "checkpoint manifest authorizes a vault but the bundle file is missing; the restored Sandbox vault degrades",
+					"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+			}
+			return //nolint:nilerr // no manifest-listed vault: nothing to import
+		}
+		klog.ErrorS(statErr, "read bundled egress vault failed; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+		return //nolint:nilerr // already logged
+	}
+	if !markerPresent {
+		klog.ErrorS(errVaultBundleUnlisted, "bundled vault file is not listed by the checkpoint manifest; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+		return //nolint:nilerr // unlisted credential bytes are never delivered
+	}
+	// Stat-first bounds: the whole file is never buffered before the size
+	// contract holds, so a corrupted/replaced file cannot grow the driver's
+	// memory arbitrarily.
+	if info.Size() != marker.SizeBytes || info.Size() > maxVaultBundleBytes {
+		klog.ErrorS(errVaultBundleMismatch, "bundled vault size mismatches the manifest entry; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath,
+			"stagedBytes", info.Size(), "manifestBytes", marker.SizeBytes)
+		return //nolint:nilerr // already logged
+	}
+	vaultData, readErr := os.ReadFile(vaultPath)
+	if readErr != nil {
+		klog.ErrorS(readErr, "read bundled egress vault failed; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+		return //nolint:nilerr // already logged
+	}
+	if marker.SHA256 != artifacts.SHA256Of(vaultData) {
+		klog.ErrorS(errVaultBundleMismatch, "bundled vault digest mismatches the manifest entry; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
+		return //nolint:nilerr // unverified credential bytes are never delivered
+	}
+	if importErr := mover.ImportVault(ctx, sandboxUID, vaultPath); importErr != nil {
+		klog.ErrorS(importErr, "egress vault import failed; the restored Sandbox vault degrades",
+			"sandboxID", sandboxUID, "checkpoint", restoreRef)
+	}
+}
+
+// vaultMarker is the manifest's egressVault provenance entry.
+type vaultMarker struct {
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+// sentinel degradation causes of the restore import; the log line carries
+// the specifics.
+var (
+	errVaultBundleMissing  = errors.New("vault bundle file missing")
+	errVaultBundleUnlisted = errors.New("vault bundle file not listed by the manifest")
+	errVaultBundleMismatch = errors.New("vault bundle does not match the manifest entry")
+)
+
+// vaultManifestMarker parses the committed checkpoint manifest's egressVault
+// entry. A manifest without the marker authorizes nothing.
+func vaultManifestMarker(bundleDir string) (*vaultMarker, bool, error) {
+	payload, err := os.ReadFile(filepath.Join(bundleDir, snapshotManifestName))
+	if err != nil {
+		return nil, false, fmt.Errorf("read checkpoint manifest: %w", err)
+	}
+	var document struct {
+		EgressVault *vaultMarker `json:"egressVault"`
+	}
+	if err := json.Unmarshal(payload, &document); err != nil {
+		return nil, false, fmt.Errorf("decode checkpoint manifest: %w", err)
+	}
+	return document.EgressVault, document.EgressVault != nil, nil
+}
+
 // assembleSnapshotManifest builds the restore-compatible manifest of the
 // dumped set. lineage, machine (vcpu/memory), guestNetwork, and
 // compatibility ride forward from the SOURCE manifest verbatim — the dumped
 // vmstate carries the source snapshot's CPU state, so its compatibility
 // identity is the source's. Only files, machine.rootfs, format, and
 // validation describe this dump. Returns the total logical artifact size.
+// A staged vault bundle file joins files, SHA256SUMS, and the egressVault
+// manifest marker.
 func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
@@ -646,10 +808,21 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 		return 0, err
 	}
 
+	bundleFiles := []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName}
+	// Mirror the publish side (PublishImage): only absence means "no vault",
+	// any other stat failure fails the assembly — a transient error here
+	// would otherwise produce a manifest that omits the vault while the
+	// publish still uploads the orphaned file.
+	if _, err := os.Stat(filepath.Join(staging, vaultBundleName)); err == nil {
+		bundleFiles = append(bundleFiles, vaultBundleName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("stat staged %s: %w", vaultBundleName, err)
+	}
+
 	cache := map[string]string{}
 	files := map[string]any{}
 	var sizeBytes, rootfsSize int64
-	for _, name := range []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName} {
+	for _, name := range bundleFiles {
 		entry, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
 		if err != nil {
 			return 0, fmt.Errorf("checksum %s: %w", name, err)
@@ -662,7 +835,7 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 			}
 		}
 	}
-	if err := artifacts.WriteSHA256SUMS(staging, []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName}, cache); err != nil {
+	if err := artifacts.WriteSHA256SUMS(staging, bundleFiles, cache); err != nil {
 		return 0, err
 	}
 
@@ -697,6 +870,14 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 			recorded = append(recorded, map[string]string{"handler": binding.Handler, "input": binding.Input})
 		}
 		document["actionBindings"] = recorded
+	}
+	// The egress vault marker describes THIS dump: a source checkpoint's
+	// inherited marker must never ride forward — it would claim vault state
+	// this bundle does not carry and publish the previous subject's vault
+	// fingerprint into shared, world-readable template manifests.
+	delete(document, "egressVault")
+	if vaultEntry, ok := files[vaultBundleName]; ok {
+		document["egressVault"] = vaultEntry
 	}
 
 	manifestBytes, err := artifacts.MarshalManifest(document)

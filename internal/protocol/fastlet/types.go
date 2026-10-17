@@ -385,6 +385,37 @@ type ReconcileBindingsResponse struct {
 	Error   *FastletError  `json:"error,omitempty"`
 }
 
+// InvokeHandlerRequest relays one opaque payload to a Pool-declared Action
+// Handler on the Sandbox's Pod loopback (the FastPath handler-relay channel).
+// The Fastlet is the delivery endpoint: it forwards the payload verbatim and
+// returns the handler's HTTP status and body verbatim; it never interprets
+// either side.
+type InvokeHandlerRequest struct {
+	Identity SandboxIdentity `json:"identity"`
+	// Handler is the Pool-declared Action Handler name; the Fastlet resolves
+	// the handler's declared loopback port from its Pool settings.
+	Handler string `json:"handler"`
+	// Payload is opaque bytes relayed to the handler as the request body.
+	Payload []byte `json:"payload,omitempty"`
+	// Method is the HTTP method of the relayed request; empty defaults to
+	// POST.
+	Method string `json:"method,omitempty"`
+	// Path is the loopback request path addressed on the handler; it must
+	// start with '/'.
+	Path string `json:"path"`
+}
+
+// InvokeHandlerResponse carries the handler's HTTP response verbatim. Status
+// is the handler's HTTP status code (100-599): 0 means the relay produced no
+// handler result, and FastPath rejects any other value as Unavailable. Error
+// is reserved for relay failures (unknown Sandbox, undeclared handler,
+// unreachable handler) and never carries the handler's own outcome.
+type InvokeHandlerResponse struct {
+	Status int32         `json:"status"`
+	Body   []byte        `json:"body,omitempty"`
+	Error  *FastletError `json:"error,omitempty"`
+}
+
 type SetDrainingRequest struct {
 	Draining bool   `json:"draining"`
 	Reason   string `json:"reason,omitempty"`

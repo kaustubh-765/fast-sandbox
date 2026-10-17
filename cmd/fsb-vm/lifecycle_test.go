@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -267,8 +270,12 @@ func TestReleaseOwnedDevicesMatchesConfig(t *testing.T) {
 		{DevID: 2, Config: "/state/other/rootfs.config.v1.json"},
 		{DevID: 3, Config: "/state/sb/rootfs.config.v1.json"},
 	}
-	if err := releaseOwnedDevices(context.Background(), releaser, devices, "/state/sb/rootfs.config.v1.json"); err != nil {
+	matches, err := releaseOwnedDevices(context.Background(), releaser, devices, "/state/sb/rootfs.config.v1.json")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if matches != 2 {
+		t.Fatalf("matches = %d, want 2", matches)
 	}
 	if fmt.Sprint(releaser.deleted) != "[1 3]" {
 		t.Fatalf("deleted = %v, want [1 3]", releaser.deleted)
@@ -327,6 +334,35 @@ func TestReleaseSandboxReclaimsByConfig(t *testing.T) {
 	}
 }
 
+func TestReleaseSandboxKeepsUnknownAddStateWhenListIsEmpty(t *testing.T) {
+	layout, state := newReleaseFixture(t)
+	state.Rootfs.addOutcomeUnknown = true
+	releaser := &fakeReleaser{devices: []ublkdDevice{{DevID: 5, Config: layout.snapfilesConfig}}}
+
+	err := releaseSandbox(context.Background(), releaser, layout, state)
+	if err == nil || !strings.Contains(err.Error(), "may still be in flight") {
+		t.Fatalf("releaseSandbox = %v, want in-flight Add error", err)
+	}
+	if state.Rootfs == nil || state.Snapfiles != nil {
+		t.Fatalf("only the unknown rootfs Add must remain: %+v", state)
+	}
+	persisted, readErr := readState(layout.home)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if persisted.Rootfs == nil || persisted.Rootfs.addOutcomeUnknown {
+		t.Fatalf("persisted rootfs = %+v, want retryable record without process-local marker", persisted.Rootfs)
+	}
+	// A later explicit delete has no in-process Add to wait for and may accept
+	// the empty listing as confirmation that there is no device to release.
+	if err := releaseSandbox(context.Background(), &fakeReleaser{}, layout, &persisted); err != nil {
+		t.Fatalf("explicit delete retry: %v", err)
+	}
+	if persisted.Rootfs != nil {
+		t.Fatalf("retry kept rootfs record: %+v", persisted.Rootfs)
+	}
+}
+
 func TestReleaseSandboxKeepsStateOnFailure(t *testing.T) {
 	layout, state := newReleaseFixture(t)
 	releaser := &fakeReleaser{
@@ -365,7 +401,15 @@ func TestDeviceAttachmentReleasesOnce(t *testing.T) {
 		return nil
 	}
 	undo := &rollback{}
-	attachment := attachDevice(5, "/dev/ublkb5", release, undo)
+	attachment := trackDevice("/config", release, func(context.Context, string) (int, error) {
+		t.Fatal("config recovery must not run after a confirmed delete")
+		return 0, nil
+	}, undo)
+	if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+		return 5, "/dev/ublkb5", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := attachment.detach(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +420,132 @@ func TestDeviceAttachmentReleasesOnce(t *testing.T) {
 	}
 	if fmt.Sprint(released) != "[5]" {
 		t.Fatalf("released = %v, want exactly one release", released)
+	}
+}
+
+func TestDeviceAttachmentRecoversUncertainResponsesByConfig(t *testing.T) {
+	t.Run("add response lost", func(t *testing.T) {
+		var recovered string
+		undo := &rollback{}
+		attachment := trackDevice("/work/rootfs.config.v1.json", func(context.Context, int) error {
+			t.Fatal("an unknown dev_id must not be deleted")
+			return nil
+		}, func(_ context.Context, config string) (int, error) {
+			recovered = config
+			return 1, nil
+		}, undo)
+		if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+			return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+		}); err == nil {
+			t.Fatal("add must report the lost response")
+		}
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
+		if recovered != attachment.config || attachment.attached {
+			t.Fatalf("recovered = %q, attachment = %+v", recovered, attachment)
+		}
+	})
+
+	t.Run("add still in flight", func(t *testing.T) {
+		undo := &rollback{}
+		attachment := trackDevice("/work/rootfs.config.v1.json", func(context.Context, int) error {
+			t.Fatal("an unknown dev_id must not be deleted")
+			return nil
+		}, func(context.Context, string) (int, error) {
+			return 0, nil
+		}, undo)
+		if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+			return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+		}); err == nil {
+			t.Fatal("add must report the lost response")
+		}
+		err := undo.run()
+		if err == nil || !strings.Contains(err.Error(), "may still be in flight") {
+			t.Fatalf("rollback error = %v", err)
+		}
+		if !attachment.attached {
+			t.Fatal("attachment must remain armed while Add may still be running")
+		}
+	})
+
+	t.Run("del response lost", func(t *testing.T) {
+		var deleted []int
+		var recovered string
+		undo := &rollback{}
+		attachment := trackDevice("/work/rootfs.config.v1.json", func(_ context.Context, devID int) error {
+			deleted = append(deleted, devID)
+			return errors.New("EOF")
+		}, func(_ context.Context, config string) (int, error) {
+			recovered = config
+			return 0, nil
+		}, undo)
+		if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+			return 5, "/dev/ublkb5", nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := attachment.detach(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(deleted) != "[5]" || recovered != attachment.config {
+			t.Fatalf("deleted = %v, recovered = %q", deleted, recovered)
+		}
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(deleted) != "[5]" {
+			t.Fatalf("possibly recycled dev_id deleted twice: %v", deleted)
+		}
+	})
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (roundTrip roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+func TestUblkdAddClassifiesTransportOutcome(t *testing.T) {
+	cases := []struct {
+		name        string
+		roundTrip   roundTripperFunc
+		wantUnknown bool
+	}{
+		{
+			name: "response lost after connect",
+			roundTrip: func(*http.Request) (*http.Response, error) {
+				return nil, io.EOF
+			},
+			wantUnknown: true,
+		},
+		{
+			name: "dial failed",
+			roundTrip: func(*http.Request) (*http.Response, error) {
+				return nil, &net.OpError{Op: "dial", Net: "unix", Err: syscall.ENOENT}
+			},
+		},
+		{
+			name: "response received but malformed",
+			roundTrip: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("{")),
+				}, nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &ublkdClient{httpClient: &http.Client{Transport: tc.roundTrip}}
+			_, _, err := client.Add(context.Background(), "/work/config.json")
+			if err == nil {
+				t.Fatal("Add must fail")
+			}
+			if got := errors.Is(err, errAddOutcomeUnknown); got != tc.wantUnknown {
+				t.Fatalf("unknown outcome = %t, want %t: %v", got, tc.wantUnknown, err)
+			}
+		})
 	}
 }
 

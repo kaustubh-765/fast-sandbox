@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -484,10 +485,13 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 			t.Fatal(err)
 		}
 		ops := buildRootfsOps{
-			probeSourceSize:  func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
-			writeConfig:      func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
-			addDevice:        func(context.Context, string) (int, string, error) { return 2, "/dev/old", nil },
-			deleteDevice:     func(context.Context, int) error { return errors.New("device busy") },
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
+			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
+			addDevice:       func(context.Context, string) (int, string, error) { return 2, "/dev/old", nil },
+			deleteDevice:    func(context.Context, int) error { return errors.New("delete response lost") },
+			recoverDevice: func(context.Context, string) (int, error) {
+				return 0, errors.New("device busy")
+			},
 			repairFilesystem: func(context.Context, string) error { return errors.New("repair failed") },
 		}
 		undo := &rollback{}
@@ -497,11 +501,75 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		}
 		err := undo.run()
 		if err == nil || !strings.Contains(err.Error(), "device busy") ||
-			!strings.Contains(err.Error(), "ublk device 2 (/dev/old)") || !strings.Contains(err.Error(), "work dir "+workDir) {
+			!strings.Contains(err.Error(), "ublk device owned by config config") || !strings.Contains(err.Error(), "work dir "+workDir) {
 			t.Fatalf("rollback error = %v", err)
 		}
 		if _, err := os.Stat(workDir); err != nil {
 			t.Errorf("work dir removed despite attached device: %v", err)
+		}
+	})
+
+	t.Run("uncertain add is recovered before work dir removal", func(t *testing.T) {
+		workDir := filepath.Join(t.TempDir(), "work")
+		if err := os.Mkdir(workDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		config := filepath.Join(workDir, "rootfs.config.v1.json")
+		var recovered string
+		ops := buildRootfsOps{
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
+			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return config, nil },
+			addDevice: func(context.Context, string) (int, string, error) {
+				return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+			},
+			deleteDevice: func(context.Context, int) error { return nil },
+			recoverDevice: func(_ context.Context, ownedConfig string) (int, error) {
+				recovered = ownedConfig
+				return 1, nil
+			},
+		}
+		undo := &rollback{}
+		undo.push("work dir "+workDir, func() error { return os.RemoveAll(workDir) })
+		if _, err := prepareBuildRootfs(context.Background(), workDir, fetchedImage{}, 20, undo, ops); err == nil || !strings.Contains(err.Error(), "EOF") {
+			t.Fatalf("prepare error = %v", err)
+		}
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
+		if recovered != config {
+			t.Errorf("recovered config = %q, want %q", recovered, config)
+		}
+		if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+			t.Errorf("work dir survived confirmed device recovery: %v", err)
+		}
+	})
+
+	t.Run("uncertain add keeps work dir when recovery cannot confirm", func(t *testing.T) {
+		workDir := filepath.Join(t.TempDir(), "work")
+		if err := os.Mkdir(workDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		config := filepath.Join(workDir, "rootfs.config.v1.json")
+		ops := buildRootfsOps{
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
+			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return config, nil },
+			addDevice: func(context.Context, string) (int, string, error) {
+				return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+			},
+			deleteDevice:  func(context.Context, int) error { return nil },
+			recoverDevice: func(context.Context, string) (int, error) { return 0, nil },
+		}
+		undo := &rollback{}
+		undo.push("work dir "+workDir, func() error { return os.RemoveAll(workDir) })
+		if _, err := prepareBuildRootfs(context.Background(), workDir, fetchedImage{}, 20, undo, ops); err == nil {
+			t.Fatal("prepare must fail")
+		}
+		err := undo.run()
+		if err == nil || !strings.Contains(err.Error(), "may still be in flight") || !strings.Contains(err.Error(), "work dir "+workDir) {
+			t.Fatalf("rollback error = %v", err)
+		}
+		if _, err := os.Stat(workDir); err != nil {
+			t.Errorf("work dir removed without confirmed recovery: %v", err)
 		}
 	})
 

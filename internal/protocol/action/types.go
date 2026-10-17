@@ -3,12 +3,26 @@ package action
 
 const APIVersion = "sandbox.fast.io/actions/v1"
 
+// HeaderSandboxUID is the trusted sandbox identity header the Fastlet
+// injects on relayed handler requests. The relayed method/path/body are
+// caller-controlled, so Handlers must scope per-subject state by this
+// platform-endorsed value (fence-validated by the Fastlet) instead of any
+// caller-controlled path segment.
+const HeaderSandboxUID = "X-Sandbox-Uid"
+
 type Operation string
 
 const (
 	OperationSetBinding    Operation = "SET_BINDING"
 	OperationLifecycleHook Operation = "LIFECYCLE_HOOK"
 	OperationRemoveBinding Operation = "REMOVE_BINDING"
+	// Vault snapshot transfer across pause/resume (OSEP-0022 "Vault
+	// Lifecycle"): export copies the subject's vault file into the snapshot
+	// bundle strictly before the runtime teardown; import lands the
+	// re-stamped bundle file before data-plane-ready at restore — the only
+	// authorized incarnation transfer. Driver-invoked via the Fastlet.
+	OperationVaultExport Operation = "VAULT_EXPORT"
+	OperationVaultImport Operation = "VAULT_IMPORT"
 )
 
 type LifecycleHook string
@@ -54,6 +68,16 @@ type LifecycleHookPayload struct {
 	Sequence int64         `json:"sequence"`
 }
 
+// SnapshotTransfer names the driver-provided staging file for one subject's
+// vault snapshot (OSEP-0022): the export target inside the snapshot bundle,
+// or the bundle source at restore. One file per invocation; the path is
+// Pod-local and validated by the Handler (absolute, no parent traversal).
+// The bytes never cross the envelope: the Handler copies/reads the file
+// itself.
+type SnapshotTransfer struct {
+	Path string `json:"path"`
+}
+
 type Request struct {
 	APIVersion   string                `json:"apiVersion"`
 	Operation    Operation             `json:"operation"`
@@ -63,6 +87,7 @@ type Request struct {
 	Attachment   Attachment            `json:"attachment"`
 	Binding      *BindingPayload       `json:"binding,omitempty"`
 	Hook         *LifecycleHookPayload `json:"hook,omitempty"`
+	Snapshot     *SnapshotTransfer     `json:"snapshot,omitempty"`
 }
 
 type HandlerStatus struct {

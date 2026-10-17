@@ -42,6 +42,11 @@ type deviceRecord struct {
 	Config  string `json:"config"`
 	DevID   int    `json:"dev_id"`
 	DevPath string `json:"dev_path,omitempty"`
+
+	// addOutcomeUnknown is deliberately process-local. If create loses the Add
+	// response, its immediate rollback must retain the backing files when List
+	// is empty. A later explicit delete can safely retry from persisted state.
+	addOutcomeUnknown bool `json:"-"`
 }
 
 // path returns the recorded device path for display ("-" when none).

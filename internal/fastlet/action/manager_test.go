@@ -23,13 +23,25 @@ type recordedRequest struct {
 	request actionapi.Request
 }
 
+type recordedRelay struct {
+	port       int32
+	sandboxUID string
+	method     string
+	path       string
+	body       []byte
+}
+
 type fakeCaller struct {
-	mu         sync.Mutex
-	instanceID string
-	statusErr  error
-	requests   []recordedRequest
-	fail       map[actionapi.Operation]int
-	statusCall atomic.Int32
+	mu          sync.Mutex
+	instanceID  string
+	statusErr   error
+	requests    []recordedRequest
+	fail        map[actionapi.Operation]int
+	statusCall  atomic.Int32
+	relayCalls  []recordedRelay
+	relayStatus int
+	relayBody   []byte
+	relayErr    error
 }
 
 func (f *fakeCaller) Status(context.Context, int32) (actionapi.HandlerStatus, error) {
@@ -57,6 +69,20 @@ func (f *fakeCaller) snapshot() []recordedRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]recordedRequest(nil), f.requests...)
+}
+
+func (f *fakeCaller) Relay(_ context.Context, port int32, sandboxUID, method, path string, body []byte) (int, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.relayCalls = append(f.relayCalls, recordedRelay{port: port, sandboxUID: sandboxUID, method: method, path: path, body: append([]byte(nil), body...)})
+	if f.relayErr != nil {
+		return 0, nil, f.relayErr
+	}
+	status := f.relayStatus
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return status, f.relayBody, nil
 }
 
 func handler(name string, port int32, hooks ...apiv1alpha2.LifecycleHook) apiv1alpha2.ActionHandler {
@@ -247,6 +273,10 @@ func (b *blockingCaller) Invoke(context.Context, int32, actionapi.Request) error
 	return nil
 }
 
+func (*blockingCaller) Relay(context.Context, int32, string, string, string, []byte) (int, []byte, error) {
+	return http.StatusOK, nil, nil
+}
+
 func TestDifferentSandboxesInvokeConcurrently(t *testing.T) {
 	caller := &multiBlockingCaller{entered: make(chan string, 2), release: make(chan struct{})}
 	manager, err := NewManager([]apiv1alpha2.ActionHandler{handler("egress", 18080)}, caller)
@@ -288,6 +318,10 @@ func (b *multiBlockingCaller) Invoke(_ context.Context, _ int32, request actiona
 	b.entered <- request.Sandbox.UID
 	<-b.release
 	return nil
+}
+
+func (*multiBlockingCaller) Relay(context.Context, int32, string, string, string, []byte) (int, []byte, error) {
+	return http.StatusOK, nil, nil
 }
 
 func TestDeleteUsesReverseOrderAndForgetsStateOnFailure(t *testing.T) {
@@ -368,6 +402,10 @@ func (c *deleteDeadlineCaller) Invoke(ctx context.Context, port int32, request a
 	c.mu.Unlock()
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (*deleteDeadlineCaller) Relay(context.Context, int32, string, string, string, []byte) (int, []byte, error) {
+	return http.StatusOK, nil, nil
 }
 
 func (c *deleteDeadlineCaller) removePorts() []int32 {

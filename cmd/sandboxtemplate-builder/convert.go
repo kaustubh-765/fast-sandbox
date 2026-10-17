@@ -65,53 +65,55 @@ func ensureLoopDevices() error {
 }
 
 // stageConvert materializes the OCI layout into a sparse ext4 rootfs and
-// injects execd, the optional guest init, envs, and /etc/hosts.
-func stageConvert(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string, error) {
+// injects execd, the optional guest init, envs, and /etc/hosts, returning
+// the rootfs path and the baked MITM CA lineage (nil when none).
+func stageConvert(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string, []mitmCALineage, error) {
 	rootfs := filepath.Join(workdir, rootfsImageName)
 	layoutDir := filepath.Join(workdir, "oci-layout")
 	sizeGiB, err := sizeGiB(spec.Output.RootfsSize)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if output, err := exec.Command(oci2rootfsBin, layoutDir, "--output", rootfs,
 		"--size", fmt.Sprintf("%dG", sizeGiB), "--platform", "linux/amd64").CombinedOutput(); err != nil {
-		return "", fmt.Errorf("oci2rootfs: %w: %s", err, output)
+		return "", nil, fmt.Errorf("oci2rootfs: %w: %s", err, output)
 	}
 	// e2fsck exit 1 means "errors corrected" (e.g. oci2rootfs writes a low
 	// ref count for multi-hardlink inodes) — a repaired rootfs is success.
 	if output, err := exec.Command("e2fsck", "-fy", rootfs).CombinedOutput(); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-			return "", fmt.Errorf("e2fsck: %w: %s", err, output)
+			return "", nil, fmt.Errorf("e2fsck: %w: %s", err, output)
 		}
 		klog.V(2).InfoS("e2fsck corrected rootfs inconsistencies", "output", strings.TrimSpace(string(output)))
 	}
 	if err := ensureLoopDevices(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	mountPoint := filepath.Join(workdir, ".rootfs-mount")
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if output, err := exec.Command("mount", "-o", "loop", rootfs, mountPoint).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("loop mount rootfs: %w: %s", err, output)
+		return "", nil, fmt.Errorf("loop mount rootfs: %w: %s", err, output)
 	}
-	if err := injectRuntime(spec, workdir, mountPoint); err != nil {
+	mitmCA, err := injectRuntime(spec, workdir, mountPoint)
+	if err != nil {
 		_ = exec.Command("umount", mountPoint).Run()
 		_ = os.RemoveAll(mountPoint)
-		return "", err
+		return "", nil, err
 	}
 	// Unmount before verifying: e2fsck must never run on a mounted (rw)
 	// filesystem.
 	if output, err := exec.Command("umount", mountPoint).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("umount rootfs: %w: %s", err, output)
+		return "", nil, fmt.Errorf("umount rootfs: %w: %s", err, output)
 	}
 	_ = os.RemoveAll(mountPoint)
 	if output, err := exec.Command("e2fsck", "-fn", rootfs).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("e2fsck verify: %w: %s", err, output)
+		return "", nil, fmt.Errorf("e2fsck verify: %w: %s", err, output)
 	}
-	return rootfs, nil
+	return rootfs, mitmCA, nil
 }
 
 // defaultGuestInit is injected when spec.init is empty: the readiness
@@ -127,11 +129,12 @@ func guestInitPath(spec apiv1alpha2.SandboxTemplateSpec) string {
 }
 
 // injectRuntime writes the execd files, the rendered guest init, the sandbox
-// env, and /etc/hosts into the mounted rootfs.
-func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint string) error {
+// env, and /etc/hosts into the mounted rootfs, returning the baked MITM CA
+// lineage (nil when none).
+func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint string) ([]mitmCALineage, error) {
 	opt := filepath.Join(mountPoint, "opt", "opensandbox")
 	if err := os.MkdirAll(opt, 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	execdRoot := filepath.Join(workdir, "execd-root")
 	for _, name := range []string{execdAssetName, bootstrapScriptName, prepareScriptName, "bwrap"} {
@@ -139,10 +142,10 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 		if info, err := os.Stat(source); err == nil && info.Mode().IsRegular() {
 			payload, err := os.ReadFile(source)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if err := os.WriteFile(filepath.Join(opt, name), payload, 0o755); err != nil { //nolint:gosec // executable file mode inside the built rootfs image
-				return err
+				return nil, err
 			}
 		} else if spec.Execd != "" {
 			// execd is requested but this file is missing from the image:
@@ -160,20 +163,20 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	initPath := guestInitPath(spec)
 	relative := filepath.Clean(strings.TrimPrefix(initPath, "/"))
 	if !strings.HasPrefix(initPath, "/") || relative == ".." || strings.HasPrefix(relative, "../") {
-		return fmt.Errorf("init path %q must be an absolute path inside the rootfs", initPath)
+		return nil, fmt.Errorf("init path %q must be an absolute path inside the rootfs", initPath)
 	}
 	guestInit := filepath.Join(mountPoint, relative)
 	if err := os.MkdirAll(filepath.Dir(guestInit), 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.WriteFile(guestInit, []byte(renderGuestInit(spec)), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
-		return err
+		return nil, err
 	}
 
 	envLines := []string{"export ENTRYPOINT=" + shellQuote(entrypointCommand(spec))}
 	merged, err := mergeGuestEnvs(spec, workdir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	names := make([]string, 0, len(merged))
 	for name := range merged {
@@ -185,15 +188,26 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 		// bare value containing $ or backticks would be expanded by sh.
 		envLines = append(envLines, fmt.Sprintf("export %s=%s", name, shellQuote(merged[name])))
 	}
+	// Bake the egress MITM CA at the bootstrap contract path; the gate line
+	// follows the merged envs so it wins over spec.envs.
+	var mitmCA []mitmCALineage
+	if spec.EgressMITMCertificate != nil {
+		lineage, err := injectEgressMITMCertificate(spec, mountPoint)
+		if err != nil {
+			return nil, err
+		}
+		mitmCA = lineage
+		envLines = append(envLines, "export "+guestMITMTrustGate+"=true")
+	}
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "sandbox-init.env"),
 		[]byte(strings.Join(envLines, "\n")+"\n"), 0o600); err != nil {
-		return err
+		return nil, err
 	}
 
 	hosts := filepath.Join(mountPoint, "etc", "hosts")
 	if _, err := os.Stat(hosts); err != nil {
 		if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"), 0o644); err != nil { //nolint:gosec // guest /etc/hosts, world-readable by design
-			return err
+			return nil, err
 		}
 	}
 	// Guest DNS resolver: the guest network (address/gateway) is baked by
@@ -203,9 +217,9 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	// time, which previously corrupted the image on the loop-mount write).
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "resolv.conf"), //nolint:gosec // guest resolv.conf, world-readable by design
 		[]byte("nameserver "+bakedGuestGateway+"\n"), 0o644); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return mitmCA, nil
 }
 
 // injectStaticBusybox copies the builder image's static busybox into the

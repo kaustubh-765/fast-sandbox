@@ -12,6 +12,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +29,10 @@ import (
 // publishArtifacts are the artifact files of a native (non-overlaybd) set,
 // uploaded in this order before the manifest.
 var publishArtifacts = []string{"rootfs.ext4", manifestVMStateName, manifestMemoryName}
+
+// publishVaultName is the optional vault bundle file of a checkpoint set:
+// uploaded when staged next to the manifest.
+const publishVaultName = "vault.json"
 
 // publishManifestName is the commit-point document of the artifact set.
 const publishManifestName = "manifest.json"
@@ -70,8 +75,18 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	klog.InfoS("runtime-agent publish started", "kind", kind, "key", key, "digest", artifactDigest, "stagingDir", dir)
 
 	// Artifacts and SHA256SUMS first: the namespace stays incomplete (and
-	// unaddressable) until the manifest lands.
+	// unaddressable) until the manifest lands. The vault bundle file joins
+	// the artifact uploads when the checkpoint staged one — any stat failure
+	// other than absence fails the publish, since the staged manifest and
+	// SHA256SUMS already reference the file and a stranded member would
+	// break the cross-node resume.
 	entries := append([]string(nil), publishArtifacts...)
+	if _, err := os.Stat(filepath.Join(dir, publishVaultName)); err == nil {
+		entries = append(entries, publishVaultName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "file", publishVaultName)
+		return PublishResult{}, fmt.Errorf("stat staged %s: %w", publishVaultName, err)
+	}
 	entries = append(entries, artifacts.SHA256SUMSName)
 	for _, name := range entries {
 		if err := c.putFile(ctx, dir, name, base+"/"+name); err != nil {

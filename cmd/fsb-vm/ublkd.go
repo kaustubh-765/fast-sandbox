@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,26 @@ import (
 
 // maxUblkdResponseBytes bounds the control-API responses read from ublkd.
 const maxUblkdResponseBytes = 1 << 20
+
+// errAddOutcomeUnknown means the Add request may still be running in ublkd.
+// The daemon does not expose in-flight Adds through List, so callers must keep
+// the config and its backing files until a later cleanup can confirm the result.
+var errAddOutcomeUnknown = errors.New("ublkd add outcome unknown")
+
+type ublkdRequestError struct {
+	err error
+}
+
+func (err *ublkdRequestError) Error() string { return err.err.Error() }
+func (err *ublkdRequestError) Unwrap() error { return err.err }
+
+// definitelyNotSent is true only when connecting to the unix socket failed.
+// Every transport failure after a connection was established is ambiguous: the
+// daemon may have accepted the request even though no response reached us.
+func (err *ublkdRequestError) definitelyNotSent() bool {
+	var opErr *net.OpError
+	return errors.As(err.err, &opErr) && opErr.Op == "dial"
+}
 
 // ublkdClient talks to overlaybd-ublkd's HTTP-over-unix-socket control API
 // (ADR-002): POST /v1/add, POST /v1/del, GET /v1/list, GET /v1/ping.
@@ -81,6 +102,10 @@ func (c *ublkdClient) Add(ctx context.Context, configPath string) (int, string, 
 	request := map[string]string{"config": configPath}
 	var response ublkdAddResponse
 	if err := c.do(ctx, http.MethodPost, "/v1/add", request, &response); err != nil {
+		var requestErr *ublkdRequestError
+		if errors.As(err, &requestErr) && !requestErr.definitelyNotSent() {
+			return 0, "", fmt.Errorf("%w: %w", errAddOutcomeUnknown, err)
+		}
 		return 0, "", err
 	}
 	if !response.OK {
@@ -133,7 +158,7 @@ func (c *ublkdClient) do(ctx context.Context, method, path string, input, output
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return err
+		return &ublkdRequestError{err: err}
 	}
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, maxUblkdResponseBytes)

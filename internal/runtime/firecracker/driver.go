@@ -54,8 +54,11 @@ type Driver struct {
 	checkStorage   func(context.Context, string) error
 	networkManager *fastletnetwork.Manager
 	infraMgr       *fastletinfra.Manager
-	prepareInfra   func(ctx context.Context, config *fastletapi.RuntimeSandboxConfig) (fastletinfra.PreparedInstance, error)
-	processes      map[string]Process
+	// vaultMover carries the egress-owned vault file across pause/resume
+	// (OSEP-0022); nil disables the transfer.
+	vaultMover   runtimecontract.VaultMover
+	prepareInfra func(ctx context.Context, config *fastletapi.RuntimeSandboxConfig) (fastletinfra.PreparedInstance, error)
+	processes    map[string]Process
 	// agentSocket, newAgentClient, and agentClient wire the node-level
 	// runtime-agent (agent_wiring.go): an empty socket means local mode, a
 	// nil newAgentClient disables the agent client, and agentClient is the
@@ -260,6 +263,16 @@ func (d *Driver) SetNamespace(namespace string) {
 func (d *Driver) SetNetworkManager(manager *fastletnetwork.Manager) {
 	d.mu.Lock()
 	d.networkManager = manager
+	d.mu.Unlock()
+}
+
+// SetVaultMover wires the driver-invoked egress vault transfer: checkpoints
+// stage the subject's vault file into the bundle before the runtime release
+// purges it, and restores import it before the data plane becomes ready.
+// A nil mover (the default) disables vault transfer.
+func (d *Driver) SetVaultMover(mover runtimecontract.VaultMover) {
+	d.mu.Lock()
+	d.vaultMover = mover
 	d.mu.Unlock()
 }
 
@@ -700,6 +713,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	bootDur := time.Since(bootStarted)
+
+	// A resumed checkpoint may carry the egress-owned vault file: import it
+	// into egress here — before EnsureSandbox returns, so strictly before the
+	// Fastlet dispatches the data-plane-ready hook (OSEP-0022 import
+	// ordering). A failure degrades the subject's vault (fail-closed,
+	// observable on the handler) and must not fail the restore — the same
+	// posture as a corrupt vault file at registration.
+	d.importRestoreVault(ctx, spec, restoreRef, vmstatePath, identity.SandboxUID)
 
 	state.Phase = PhaseRunning
 	state.StageDurations = map[string]time.Duration{

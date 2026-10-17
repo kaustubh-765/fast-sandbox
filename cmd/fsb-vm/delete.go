@@ -110,15 +110,21 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 	if err != nil {
 		return errors.Join(append(failures, fmt.Errorf("list ublkd devices: %w", err))...)
 	}
-	if err := releaseOwnedDevices(ctx, ublkd, devices, layout.rootfsConfig); err != nil {
+	rootfsMatches, err := releaseOwnedDevices(ctx, ublkd, devices, layout.rootfsConfig)
+	if err != nil {
 		failures = append(failures, fmt.Errorf("release rootfs device: %w", err))
+	} else if state.Rootfs != nil && state.Rootfs.addOutcomeUnknown && rootfsMatches == 0 {
+		failures = append(failures, fmt.Errorf("ublkd add of %s may still be in flight; keeping its backing files", layout.rootfsConfig))
 	} else {
 		state.Rootfs = nil
 	}
 	// The snapfiles device stays attached while its filesystem is mounted.
 	if unmountErr == nil {
-		if err := releaseOwnedDevices(ctx, ublkd, devices, layout.snapfilesConfig); err != nil {
-			failures = append(failures, fmt.Errorf("release snapfiles device: %w", err))
+		snapfilesMatches, releaseErr := releaseOwnedDevices(ctx, ublkd, devices, layout.snapfilesConfig)
+		if releaseErr != nil {
+			failures = append(failures, fmt.Errorf("release snapfiles device: %w", releaseErr))
+		} else if state.Snapfiles != nil && state.Snapfiles.addOutcomeUnknown && snapfilesMatches == 0 {
+			failures = append(failures, fmt.Errorf("ublkd add of %s may still be in flight; keeping its backing files", layout.snapfilesConfig))
 		} else {
 			state.Snapfiles = nil
 		}
@@ -146,20 +152,36 @@ func stopFirecracker(recorded *processRecord, apiSocket string) error {
 	return terminateProcess(*target, firecrackerStopGrace)
 }
 
-// releaseOwnedDevices detaches every device ublkd lists under config. A
-// recorded dev_id is never deleted blindly: once released, the id can be
-// reused by another sandbox's device.
-func releaseOwnedDevices(ctx context.Context, ublkd deviceReleaser, devices []ublkdDevice, config string) error {
+// releaseOwnedDevicesByConfig lists the daemon's current devices and releases
+// only those whose config ownership identity matches. It returns the match
+// count so a caller with an unknown Add outcome does not mistake an empty List
+// for proof that an in-flight Add has finished. It never trusts a possibly
+// recycled dev_id.
+func releaseOwnedDevicesByConfig(ctx context.Context, ublkd deviceReleaser, config string) (int, error) {
+	devices, err := ublkd.List(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list ublkd devices for config %s: %w", config, err)
+	}
+	return releaseOwnedDevices(ctx, ublkd, devices, config)
+}
+
+// releaseOwnedDevices detaches every device ublkd lists under config and
+// returns how many matching devices were visible. A recorded dev_id is never
+// deleted blindly: once released, the id can be reused by another sandbox's
+// device.
+func releaseOwnedDevices(ctx context.Context, ublkd deviceReleaser, devices []ublkdDevice, config string) (int, error) {
+	matches := 0
 	var failures []error
 	for _, device := range devices {
 		if device.Config != config {
 			continue
 		}
+		matches++
 		if err := ublkd.Del(ctx, device.DevID); err != nil {
 			failures = append(failures, err)
 		}
 	}
-	return errors.Join(failures...)
+	return matches, errors.Join(failures...)
 }
 
 // removeSandboxDirs deletes the runtime directory, then the home holding

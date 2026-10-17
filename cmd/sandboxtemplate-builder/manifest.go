@@ -32,14 +32,15 @@ const (
 // between the two outputs via the cache. The serialization and checksum
 // conventions live in internal/artifacts so every producer (builder, live
 // snapshot driver, runtime-agent) emits byte-identical layouts. cpuTemplate
-// is what the snapshot stage reported (see compatibilityCPUTemplate).
-func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir, cpuTemplate string) ([]byte, error) {
+// is what the snapshot stage reported (see compatibilityCPUTemplate); mitmCA
+// carries the baked egress MITM CA lineage (nil when none).
+func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir, cpuTemplate string, mitmCA []mitmCALineage) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB, cpuTemplate)
+	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB, cpuTemplate, mitmCA)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +63,7 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // declared minimum with the real artifact size. The lineage object records
 // where the set came from and what was baked in at build time; snapshot
 // and checkpoint producers carry it forward verbatim across generations.
-func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int, cpuTemplate string) (map[string]any, error) {
+func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int, cpuTemplate string, mitmCA []mitmCALineage) (map[string]any, error) {
 	files := map[string]any{}
 	staged := []struct{ name, path string }{
 		{rootfsImageName, rootfs},
@@ -103,24 +104,31 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),
 		"hostKernel":         artifacts.HostKernelRelease(),
 	}
+	lineage := map[string]any{
+		"image":        spec.Image,
+		"imageDigest":  sourceDigest,
+		execdAssetName: spec.Execd,
+		"kernel": map[string]any{
+			"name":   filepath.Base(kernel),
+			"digest": kernelDigest,
+		},
+		"entrypoint": spec.Entrypoint,
+		"init":       spec.Init,
+		// Note: envs are published verbatim into the manifest — do not
+		// place secrets here; use the publishSecretRef secret for
+		// credentials.
+		"envs": spec.Envs,
+	}
+	// The egress MITM CA the build baked: public-key fingerprints only.
+	// Absent when no CA is baked; consumers read that as unknown and skip
+	// pinning comparisons.
+	if len(mitmCA) > 0 {
+		lineage["egressMitmCA"] = map[string]any{"certificates": mitmCA}
+	}
 	return map[string]any{
 		"schemaVersion": 1,
 		"runtime":       "firecracker",
-		"lineage": map[string]any{
-			"image":        spec.Image,
-			"imageDigest":  sourceDigest,
-			execdAssetName: spec.Execd,
-			"kernel": map[string]any{
-				"name":   filepath.Base(kernel),
-				"digest": kernelDigest,
-			},
-			"entrypoint": spec.Entrypoint,
-			"init":       spec.Init,
-			// Note: envs are published verbatim into the manifest — do not
-			// place secrets here; use the publishSecretRef secret for
-			// credentials.
-			"envs": spec.Envs,
-		},
+		"lineage":       lineage,
 		"compatibility": compatibility,
 		"machine": map[string]any{
 			"vcpu":   spec.Machine.VCPU,

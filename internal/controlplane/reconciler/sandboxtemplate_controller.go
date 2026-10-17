@@ -210,6 +210,18 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// A MITM certificate selector with an empty Secret name would only fail
+	// later at Pod admission with an opaque apiserver error; surface it as a
+	// terminal build failure instead. This runs after cleanupStalePods so a
+	// superseded build Pod never outlives a terminal Failed template.
+	if cert := template.Spec.EgressMITMCertificate; cert != nil && cert.SecretRef.Name == "" {
+		err := fmt.Errorf("spec.egressMitmCertificate.secretRef.name is required")
+		if failErr := r.failBuild(ctx, &template, "InvalidMITMCertificate", err); failErr != nil {
+			return ctrl.Result{}, failErr
+		}
+		return ctrl.Result{}, nil
+	}
+
 	switch {
 	case pod == nil:
 		// No build Pod yet: create one for this generation. Create errors
@@ -578,6 +590,27 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			Name: "publish-credentials",
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: ref.Name,
+			}},
+		})
+	}
+	// The egress MITM CA certificate: files, never env, key-only projection.
+	if cert := template.Spec.EgressMITMCertificate; cert != nil {
+		key := cert.Key
+		if key == "" {
+			key = apiv1alpha2.EgressMITMCertDefaultKey // mirror the CRD default
+		}
+		env = append(env, corev1.EnvVar{Name: apiv1alpha2.EgressMITMCertDirEnv, Value: apiv1alpha2.EgressMITMCertMountDir})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name: "mitm-certificate", MountPath: apiv1alpha2.EgressMITMCertMountDir, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "mitm-certificate",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: cert.SecretRef.Name,
+				Items: []corev1.KeyToPath{{
+					Key:  key,
+					Path: apiv1alpha2.EgressMITMCertItemName,
+				}},
 			}},
 		})
 	}

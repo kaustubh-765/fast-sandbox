@@ -133,6 +133,42 @@ func TestPublishImageUploadOrderAndIndexLayout(t *testing.T) {
 		"PUTs sign with the write credential")
 }
 
+func TestPublishCheckpointUploadsOptionalVaultBundle(t *testing.T) {
+	store := newFakePublishStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+
+	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
+	require.NoError(t, err)
+
+	// A staged vault bundle file joins the artifact uploads.
+	dir := stageArtifactSet(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, publishVaultName), []byte(`{"v":1,"vault":{}}`), 0o600))
+	_, err = client.PublishImage(t.Context(), agentprotocol.PublishKindCheckpoint, "", dir)
+	require.NoError(t, err)
+	vaultKeys := 0
+	for _, key := range store.ordered() {
+		if strings.HasSuffix(key, "/"+publishVaultName) {
+			vaultKeys++
+			require.Equal(t, []byte(`{"v":1,"vault":{}}`), store.body(key))
+		}
+	}
+	require.Equal(t, 1, vaultKeys, "the vault bundle uploads exactly once, before the manifest")
+
+	// A set without a vault bundle uploads none.
+	store2 := newFakePublishStore()
+	server2 := httptest.NewServer(http.HandlerFunc(store2.handle))
+	defer server2.Close()
+	client2, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server2.URL))
+	require.NoError(t, err)
+	dir2 := stageArtifactSet(t)
+	_, err = client2.PublishImage(t.Context(), agentprotocol.PublishKindCheckpoint, "", dir2)
+	require.NoError(t, err)
+	for _, key := range store2.ordered() {
+		require.NotContains(t, key, publishVaultName)
+	}
+}
+
 func TestPublishImageRetriesTransientFailureWithFreshBody(t *testing.T) {
 	store := newFakePublishStore()
 	server := httptest.NewServer(http.HandlerFunc(store.handle))

@@ -29,6 +29,13 @@ spec:
     vcpu: "1"
     memory: "512Mi"
   init: /usr/local/sbin/sandbox-init
+  # Optional: bake the egress MITM CA so guest HTTPS verifies against it
+  # from first boot. Only "key" below is mounted into the build Pod — the
+  # CA private key must never live under it.
+  # egressMitmCertificate:
+  #   secretRef:
+  #     name: opensandbox-mitm-ca
+  #   key: ca.crt
   readiness:
     warmupSeconds: 15
   output:

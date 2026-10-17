@@ -147,22 +147,25 @@ func probeSourceVirtualSize(ctx context.Context, ublkd *ublkdClient, workDir str
 	if _, err := writeConfig(configPath, config); err != nil {
 		return 0, err
 	}
-	devID, devPath, err := ublkd.Add(ctx, configPath)
-	if err != nil {
+	// Track config ownership before Add: if the daemon creates the probe but
+	// its response is lost, rollback finds it by config before deleting lowers.
+	probe := trackDevice(configPath, ublkd.Del, func(ctx context.Context, config string) (int, error) {
+		return releaseOwnedDevicesByConfig(ctx, ublkd, config)
+	}, undo)
+	if err := probe.add(ctx, ublkd.Add); err != nil {
 		return 0, err
 	}
 	// The probe device reads the local lower blobs: it joins the rollback so
 	// a failed detach keeps them, and is released here once measured.
-	probe := attachDevice(devID, devPath, ublkd.Del, undo)
-	size, err := blockDeviceSize(devPath)
+	size, err := blockDeviceSize(probe.devPath)
 	if err != nil {
 		return 0, err
 	}
 	if size <= 0 {
-		return 0, fmt.Errorf("probe device %s reports non-positive size %d", devPath, size)
+		return 0, fmt.Errorf("probe device %s reports non-positive size %d", probe.devPath, size)
 	}
 	if err := probe.detach(ctx); err != nil {
-		return 0, fmt.Errorf("detach probe device %d: %w", devID, err)
+		return 0, fmt.Errorf("detach probe device %d: %w", probe.devID, err)
 	}
 	return size, nil
 }

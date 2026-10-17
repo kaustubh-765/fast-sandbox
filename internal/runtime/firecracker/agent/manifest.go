@@ -82,6 +82,25 @@ func (m manifest) nativeFiles() ([]nativeFile, error) {
 	return files, nil
 }
 
+// vaultFile returns the optional vault bundle entry of a checkpoint set.
+// An absent entry is (file, false, nil) — golden images never carry one; a
+// present-but-malformed entry fails the pull, matching nativeFiles(): the
+// committed manifest lists the file, so silently skipping it would strand
+// the checkpoint's vault state.
+func (m manifest) vaultFile() (nativeFile, bool, error) {
+	entry, ok := m.Files[publishVaultName]
+	if !ok {
+		return nativeFile{}, false, nil
+	}
+	if !validSHA256(entry.SHA256) {
+		return nativeFile{}, false, fmt.Errorf("manifest artifact %s has an invalid sha256", publishVaultName)
+	}
+	return nativeFile{
+		publish: publishVaultName, cache: publishVaultName,
+		sha256: entry.SHA256, sizeBytes: entry.SizeBytes,
+	}, true, nil
+}
+
 // validSHA256 reports whether sum is a lowercase sha256 hex digest.
 func validSHA256(sum string) bool {
 	if len(sum) != sha256.Size*2 {

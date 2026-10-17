@@ -1,0 +1,139 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+)
+
+// guestMITMCertPath is the execd bootstrap contract path the certificate
+// must land at for the runtime trust flow to fire.
+const guestMITMCertPath = "/opt/opensandbox/mitmproxy-ca-cert.pem"
+
+// guestMITMTrustGate enables the bootstrap's MITM trust installation
+// (system store, merged bundle, NSS, JDK keystores, client env vars).
+const guestMITMTrustGate = "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT"
+
+// mitmCALineage is one baked certificate's public-key identity for the
+// manifest lineage (lineage.egressMitmCA.certificates[]) — fingerprints
+// only, never key or Secret material.
+type mitmCALineage struct {
+	// CertSHA256 is the SHA-256 of the certificate DER (lowercase hex),
+	// matched against the egress pinned-CA fingerprint on /healthz.
+	CertSHA256 string `json:"certSha256"`
+	// SPKISHA256 is the SHA-256 of the SubjectPublicKeyInfo DER: the key
+	// identity, stable across re-issuance.
+	SPKISHA256 string `json:"spkiSha256"`
+	// NotAfter is the certificate expiry (RFC3339, display-only).
+	NotAfter string `json:"notAfter"`
+}
+
+// injectEgressMITMCertificate bakes the mounted MITM CA certificates into
+// the guest rootfs at the bootstrap contract path and returns their lineage
+// fingerprints. The trust installation itself stays owned by the execd
+// bootstrap script, which runs at this build's snapshot boot.
+func injectEgressMITMCertificate(spec apiv1alpha2.SandboxTemplateSpec, mountPoint string) ([]mitmCALineage, error) {
+	if spec.Execd == "" {
+		return nil, errors.New("spec.egressMitmCertificate requires spec.execd: the guest trust installation lives in the execd bootstrap")
+	}
+	dir := os.Getenv(apiv1alpha2.EgressMITMCertDirEnv)
+	if dir == "" {
+		return nil, errors.New("egressMitmCertificate is set but the build Pod did not mount it: " + apiv1alpha2.EgressMITMCertDirEnv + " is unset")
+	}
+	payload, err := os.ReadFile(filepath.Join(dir, apiv1alpha2.EgressMITMCertItemName))
+	if err != nil {
+		return nil, fmt.Errorf("read mounted mitm certificate: %w", err)
+	}
+	certificates, err := parseCACertificates(payload)
+	if err != nil {
+		return nil, err
+	}
+	// Bake the re-encoded certificates, never the entry verbatim: the
+	// published bytes are then exactly what the lineage fingerprints cover.
+	baked := encodeCertificates(certificates)
+	target := filepath.Join(mountPoint, strings.TrimPrefix(guestMITMCertPath, "/"))
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(target, baked, 0o644); err != nil { //nolint:gosec // guest CA certificate, world-readable by design
+		return nil, err
+	}
+	return certificateLineage(certificates)
+}
+
+// parseCACertificates is the second gate after the controller's key-only
+// projection: the entry must consist solely of PEM CERTIFICATE blocks (plus
+// whitespace) and hold at least one valid X.509 certificate — private-key
+// blocks, other PEM blocks, and trailing non-PEM data are rejected outright.
+// CA constraints (BasicConstraints CA:TRUE) are not verified.
+func parseCACertificates(payload []byte) ([]*x509.Certificate, error) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return nil, errors.New("mounted mitm certificate entry is empty")
+	}
+	if bytes.Contains(payload, []byte("PRIVATE KEY")) {
+		return nil, errors.New("mounted mitm certificate entry contains a private key; only certificates may be baked")
+	}
+	var certificates []*x509.Certificate
+	rest := payload
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("mounted mitm certificate entry holds a non-CERTIFICATE PEM block %q", block.Type)
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("mitm certificate entry is not a valid X.509 certificate: %w", err)
+		}
+		certificates = append(certificates, certificate)
+	}
+	if len(certificates) == 0 {
+		return nil, errors.New("mitm certificate entry holds no PEM CERTIFICATE block")
+	}
+	if len(bytes.TrimSpace(rest)) > 0 {
+		return nil, errors.New("mitm certificate entry holds trailing non-PEM data; only PEM CERTIFICATE blocks may be baked")
+	}
+	return certificates, nil
+}
+
+// encodeCertificates re-encodes the parsed certificates as canonical PEM.
+func encodeCertificates(certificates []*x509.Certificate) []byte {
+	var baked []byte
+	for _, certificate := range certificates {
+		baked = append(baked, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})...)
+	}
+	return baked
+}
+
+// certificateLineage fingerprints the parsed certificates for the manifest
+// lineage.
+func certificateLineage(certificates []*x509.Certificate) ([]mitmCALineage, error) {
+	lineage := make([]mitmCALineage, 0, len(certificates))
+	for _, certificate := range certificates {
+		spki, err := x509.MarshalPKIXPublicKey(certificate.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint mitm certificate %q: %w", certificate.Subject, err)
+		}
+		certDigest := sha256.Sum256(certificate.Raw)
+		spkiDigest := sha256.Sum256(spki)
+		lineage = append(lineage, mitmCALineage{
+			CertSHA256: hex.EncodeToString(certDigest[:]),
+			SPKISHA256: hex.EncodeToString(spkiDigest[:]),
+			NotAfter:   certificate.NotAfter.UTC().Format(time.RFC3339),
+		})
+	}
+	return lineage, nil
+}

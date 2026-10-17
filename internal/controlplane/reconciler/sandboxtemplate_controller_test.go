@@ -925,3 +925,154 @@ func builderEnvEntry(pod *corev1.Pod, name string) *corev1.EnvVar {
 	}
 	return nil
 }
+
+// TestSandboxTemplateReconcileMountsMitmCertificate: the egressMitmCertificate
+// Secret is projected key-only into the build Pod — the rest of the Secret
+// (which may carry the CA private key) never enters the build.
+// TestSandboxTemplateReconcileInvalidMitmCertificateCleansStalePod: an
+// egressMitmCertificate selector with an empty Secret name fails the build
+// terminally, and the in-flight Pod of the superseded generation is deleted
+// first — it must never outlive a terminal Failed template.
+func TestSandboxTemplateReconcileInvalidMitmCertificateCleansStalePod(t *testing.T) {
+	namespace, name := "tenant-a", "invalid-mitm"
+	template := newSandboxTemplate(namespace, name)
+	reconciler := newSandboxTemplateReconciler(t, template)
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	// First reconcile creates a Pod for generation 1.
+	reconcileOnce(t, reconciler, key)
+	if pods := listBuilderPods(t, reconciler, namespace); len(pods) != 1 {
+		t.Fatalf("expected one build pod, got %d", len(pods))
+	}
+
+	// Spec changes: generation 2 with an invalid MITM certificate selector.
+	if err := reconciler.Get(context.Background(), key, template); err != nil {
+		t.Fatalf("get template: %v", err)
+	}
+	template.Generation = 2
+	template.Spec.EgressMITMCertificate = &apiv1alpha2.MITMCertificateSpec{
+		SecretRef: corev1.LocalObjectReference{Name: ""},
+	}
+	if err := reconciler.Update(context.Background(), template); err != nil {
+		t.Fatalf("update template: %v", err)
+	}
+	reconcileOnce(t, reconciler, key)
+
+	if pods := listBuilderPods(t, reconciler, namespace); len(pods) != 0 {
+		t.Fatalf("expected the stale pod to be deleted and no fresh pod created, got %d", len(pods))
+	}
+	var updated apiv1alpha2.SandboxTemplate
+	if err := reconciler.Get(context.Background(), key, &updated); err != nil {
+		t.Fatalf("get template: %v", err)
+	}
+	if updated.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed {
+		t.Fatalf("expected Failed phase, got %s", updated.Status.Phase)
+	}
+	found := false
+	for _, condition := range updated.Status.Conditions {
+		if condition.Type == apiv1alpha2.SandboxTemplateConditionBuildSucceeded &&
+			condition.Status == corev1.ConditionFalse && condition.Reason == "InvalidMITMCertificate" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected an InvalidMITMCertificate failure condition, got %+v", updated.Status.Conditions)
+	}
+}
+
+func TestSandboxTemplateReconcileMountsMitmCertificate(t *testing.T) {
+	namespace, name := "tenant-a", "golden-mitm"
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.EgressMITMCertificate = &apiv1alpha2.MITMCertificateSpec{
+		SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
+		Key:       "tls-ca.crt",
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mitm-ca", Namespace: namespace},
+		Data: map[string][]byte{
+			"tls-ca.crt":  []byte("CERT"),
+			"private.key": []byte("KEY"),
+		},
+	}
+	reconciler := newSandboxTemplateReconciler(t, template, secret)
+	reconcileOnce(t, reconciler, client.ObjectKey{Namespace: namespace, Name: name})
+	pods := listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one build pod in %s, got %d", namespace, len(pods))
+	}
+	pod := &pods[0]
+
+	var volume *corev1.Volume
+	for index := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[index].Name == "mitm-certificate" {
+			volume = &pod.Spec.Volumes[index]
+			break
+		}
+	}
+	if volume == nil || volume.Secret == nil {
+		t.Fatalf("expected a mitm-certificate secret volume, got %+v", pod.Spec.Volumes)
+	}
+	if volume.Secret.SecretName != "mitm-ca" {
+		t.Fatalf("expected the mitm-ca secret, got %+v", volume.Secret)
+	}
+	// Only the certificate key may be projected: the private key never
+	// enters the build Pod.
+	wantItems := []corev1.KeyToPath{{Key: "tls-ca.crt", Path: apiv1alpha2.EgressMITMCertItemName}}
+	if !reflect.DeepEqual(volume.Secret.Items, wantItems) {
+		t.Fatalf("expected key-only projection %v, got %+v", wantItems, volume.Secret.Items)
+	}
+
+	mountFound := false
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "mitm-certificate" {
+			mountFound = mount.MountPath == apiv1alpha2.EgressMITMCertMountDir && mount.ReadOnly
+		}
+	}
+	if !mountFound {
+		t.Fatalf("expected a read-only mitm-certificate mount at %s, got %+v",
+			apiv1alpha2.EgressMITMCertMountDir, pod.Spec.Containers[0].VolumeMounts)
+	}
+
+	entry := builderEnvEntry(pod, apiv1alpha2.EgressMITMCertDirEnv)
+	if entry == nil || entry.Value != apiv1alpha2.EgressMITMCertMountDir {
+		t.Fatalf("expected the %s env pointing at %s, got %+v",
+			apiv1alpha2.EgressMITMCertDirEnv, apiv1alpha2.EgressMITMCertMountDir, entry)
+	}
+
+	// The serialized spec still carries the reference so the builder bakes
+	// the certificate during injectRuntime.
+	if got := builderSpecFromPod(t, pod).EgressMITMCertificate; got == nil || got.SecretRef.Name != "mitm-ca" || got.Key != "tls-ca.crt" {
+		t.Fatalf("expected egressMitmCertificate in the builder spec, got %+v", got)
+	}
+}
+
+// TestSandboxTemplateReconcileDefaultsMitmCertificateKey: an empty key
+// mirrors the CRD default (ca.crt) for paths that bypass admission.
+func TestSandboxTemplateReconcileDefaultsMitmCertificateKey(t *testing.T) {
+	namespace, name := "tenant-b", "golden-mitm-default"
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.EgressMITMCertificate = &apiv1alpha2.MITMCertificateSpec{
+		SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mitm-ca", Namespace: namespace},
+		Data:       map[string][]byte{"ca.crt": []byte("CERT")},
+	}
+	reconciler := newSandboxTemplateReconciler(t, template, secret)
+	reconcileOnce(t, reconciler, client.ObjectKey{Namespace: namespace, Name: name})
+	pods := listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one build pod in %s, got %d", namespace, len(pods))
+	}
+	for _, volume := range pods[0].Spec.Volumes {
+		if volume.Name != "mitm-certificate" || volume.Secret == nil {
+			continue
+		}
+		wantItems := []corev1.KeyToPath{{Key: apiv1alpha2.EgressMITMCertDefaultKey, Path: apiv1alpha2.EgressMITMCertItemName}}
+		if !reflect.DeepEqual(volume.Secret.Items, wantItems) {
+			t.Fatalf("expected the default key projection %v, got %+v", wantItems, volume.Secret.Items)
+		}
+		return
+	}
+	t.Fatalf("expected a mitm-certificate secret volume, got %+v", pods[0].Spec.Volumes)
+}
