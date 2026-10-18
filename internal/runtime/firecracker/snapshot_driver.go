@@ -356,10 +356,10 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if state.Config.Spec.Memory == "" {
+	if state.Config.Limits.Memory == "" {
 		return 0, fmt.Errorf("sandbox spec carries no memory size")
 	}
-	mib, err := parseMemMiB(state.Config.Spec.Memory)
+	mib, err := parseMemMiB(state.Config.Limits.Memory)
 	if err != nil {
 		return 0, err
 	}
@@ -491,7 +491,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 
 	// Resolve the spill area BEFORE pausing: an unspillable dump falls back
 	// up front, never mid-window.
-	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Spec.Memory)
+	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Limits.Memory)
 	plan.spilled = spillDir != ""
 	klog.InfoS("firecracker sandbox dump starting",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
@@ -686,7 +686,7 @@ const maxVaultBundleBytes = 4 << 20
 // fail-closed and observably — mirroring the corrupt vault file posture at
 // registration. The Handler reads the bundle file itself; the driver only
 // verifies it and hands over the path.
-func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, vmstatePath, sandboxUID string) {
+func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxDesiredSpec, restoreRef, vmstatePath, sandboxUID string) {
 	if spec.Restore == nil {
 		return
 	}
@@ -799,7 +799,7 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 	// boot, or the cached checkpoint manifest when the Sandbox was itself
 	// resumed from a checkpoint (the checkpoint carries every lineage field
 	// forward, and the original image may not exist on this node at all).
-	sourceRef, err := restoreReference(state.Config.Spec)
+	sourceRef, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return 0, err
 	}
@@ -849,7 +849,7 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 		lineage = map[string]any{}
 		document["lineage"] = lineage
 	}
-	lineage["image"] = state.Config.Spec.Image
+	lineage["image"] = state.Config.Desired.Image
 	// compatibility rides forward untouched — see assembleSnapshotManifest.
 	document["files"] = files
 	// machine.rootfs reflects this dump's actual rootfs size; vcpu/memory
