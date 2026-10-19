@@ -230,3 +230,19 @@ func hasHostPath(profile runtimecatalog.RuntimeProfile, hostPath string) bool {
 	}
 	return false
 }
+
+func TestFirecrackerSharedRootfsBudgetBinding(t *testing.T) {
+	config, err := Parse([]byte(`
+version: v1alpha2
+environments:
+  default:
+    runtimes:
+      firecracker:
+        firecracker:
+          sharedRootfsMemory: "0"
+`))
+	require.NoError(t, err)
+	plan, err := Resolve(runtimecatalog.Builtin(), config, apiv1alpha2.RuntimeFirecracker)
+	require.NoError(t, err)
+	require.Equal(t, "0", plan.Profile.Firecracker.SharedRootfsMemory)
+}

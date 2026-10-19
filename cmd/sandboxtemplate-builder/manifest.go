@@ -70,6 +70,14 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		{vmstateFileName, vmstate},
 		{memoryFileName, memory},
 	}
+	basePath := filepath.Join(filepath.Dir(rootfs), artifacts.SharedRootfsName)
+	if sharedRootfsEnabled(spec) {
+		if _, err := os.Stat(basePath); err != nil {
+			return nil, fmt.Errorf("DAX base required: %w", err)
+		}
+		staged = append(staged, struct{ name, path string }{artifacts.SharedRootfsName, basePath})
+	}
+
 	if len(layers) > 0 {
 		staged = append(staged,
 			struct{ name, path string }{"overlaybd/rootfs/layer.lsmt", layers[0]})
@@ -84,6 +92,10 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			return nil, fmt.Errorf("checksum %s: %w", artifact.name, err)
 		}
 		files[artifact.name] = entry
+	}
+	if sharedRootfsEnabled(spec) {
+		entry := files[rootfsImageName].(map[string]any)
+		rootfsGiB = artifacts.SizeGiB(entry["sizeBytes"].(int64))
 	}
 	kernelDigest, err := artifacts.SHA256FileCached(kernel, cache)
 	if err != nil {
@@ -125,7 +137,7 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	if len(mitmCA) > 0 {
 		lineage["egressMitmCA"] = map[string]any{"certificates": mitmCA}
 	}
-	return map[string]any{
+	document := map[string]any{
 		"schemaVersion": 1,
 		"runtime":       "firecracker",
 		"lineage":       lineage,
@@ -155,7 +167,11 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"booted":   true,
 			"restored": true,
 		},
-	}, nil
+	}
+	if entry, ok := files[artifacts.SharedRootfsName].(map[string]any); ok {
+		document["sharedRootfs"] = artifacts.SharedRootfs{Layout: artifacts.SharedRootfsLayout, SHA256: entry["sha256"].(string), SizeBytes: entry["sizeBytes"].(int64)}
+	}
+	return document, nil
 }
 
 // compatibilityCPUTemplate normalizes the snapshot-stage CPU template for
@@ -174,6 +190,11 @@ func compatibilityCPUTemplate(cpuTemplate string) string {
 // deliberately excluded.
 func writeChecksums(workdir string, cache map[string]string) error {
 	files := []string{rootfsImageName, vmstateFileName, memoryFileName}
+	if _, err := os.Stat(filepath.Join(workdir, artifacts.SharedRootfsName)); err == nil {
+		files = append(files, artifacts.SharedRootfsName)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	layers, err := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt"))
 	if err != nil {
 		return fmt.Errorf("glob overlaybd layers: %w", err)

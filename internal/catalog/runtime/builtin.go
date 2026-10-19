@@ -77,8 +77,9 @@ func builtinProfiles() map[apiv1alpha2.RuntimeName]RuntimeProfile {
 					// KernelPath stays empty: snapshots bake their own kernel
 					// and restore never boots one (#84); direct boot pins an
 					// operator kernelPath.
-					BinaryPath: firecrackerBinaryPath,
-					RootfsPath: firecrackerRootfsDir, StateRoot: firecrackerStateRootDir,
+					BinaryPath:         firecrackerBinaryPath,
+					SharedRootfsMemory: "32Gi",
+					RootfsPath:         firecrackerRootfsDir, StateRoot: firecrackerStateRootDir,
 					DefaultVCPUs: 1, DefaultMemory: "512Mi", BootTimeoutSeconds: 30,
 				},
 				Deployment: DeploymentRequirements{

@@ -80,6 +80,11 @@ type ContainerdConfig struct {
 // microVM per Sandbox create request, restored from the golden snapshot
 // set; nothing is pre-warmed.
 type FirecrackerConfig struct {
+	// SharedRootfsMemory bounds the immutable pmem base per Sandbox slot.
+	// Empty defaults to 32Gi; "0" permits only legacy block-root snapshots.
+	// The controller reserves this plus metadata in addition to guest RAM.
+	SharedRootfsMemory string `json:"sharedRootfsMemory,omitempty"`
+
 	BinaryPath         string `json:"binaryPath"`
 	JailerPath         string `json:"jailerPath,omitempty"`
 	KernelPath         string `json:"kernelPath"`

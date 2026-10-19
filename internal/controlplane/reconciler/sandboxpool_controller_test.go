@@ -1083,3 +1083,27 @@ func TestUpdatePoolObservationRetriesConflictByRefetchingLatest(t *testing.T) {
 	require.NotNil(t, apiMeta.FindStatusCondition(persisted.Status.Conditions, apiv1alpha2.PoolConditionRuntimeReady), "conditions written by another writer must be preserved")
 	require.Equal(t, observation.warmImages, stale.Status.WarmImages, "the caller must adopt the persisted status")
 }
+
+func TestFirecrackerPodReservesDAXForEverySlot(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	r := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin(), FastletProxyImage: "proxy:test", RouteVerifyPublicKey: "key"}
+	pool := &apiv1alpha2.SandboxPool{ObjectMeta: metav1.ObjectMeta{Name: "dax", Namespace: "default", UID: "uid"}, Spec: apiv1alpha2.SandboxPoolSpec{
+		Runtime: apiv1alpha2.RuntimeFirecracker, MaxSandboxesPerPod: 2,
+		SandboxResources: apiv1alpha2.SandboxResourceProfile{CPU: resource.MustParse("4"), Memory: resource.MustParse("8Gi"), PIDs: 256},
+		FastletTemplate:  corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}}}},
+	}}
+	plan, err := runtimeenv.ResolveDefault(r.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := r.constructPodWithRuntimePlan(pool, plan)
+	require.NoError(t, err)
+	// 2 * (8Gi guest + 32Gi base + 1Gi metadata) + 256Mi runtime.
+	require.Equal(t, "84224Mi", pod.Spec.Containers[0].Resources.Requests.Memory().String())
+	require.Equal(t, "84224Mi", pod.Spec.Containers[0].Resources.Limits.Memory().String())
+	pool.Spec.FastletTemplate.Spec.Containers[0].Resources.Limits = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")}
+	_, err = r.constructPodWithRuntimePlan(pool, plan)
+	require.ErrorContains(t, err, "below conservative requirement")
+	plan.Profile.Firecracker.SharedRootfsMemory = "0"
+	_, err = r.constructPodWithRuntimePlan(pool, plan)
+	require.NoError(t, err)
+}

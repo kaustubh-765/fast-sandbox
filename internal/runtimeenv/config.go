@@ -87,6 +87,9 @@ func (c Config) Validate() error { //nolint:gocognit // pre-existing sequential 
 				return fmt.Errorf("environment %s runtime %s: %w", name, runtimeName, err)
 			}
 			if binding.Firecracker != nil {
+				if _, err := (runtimecatalog.FirecrackerConfig{SharedRootfsMemory: binding.Firecracker.SharedRootfsMemory}).SharedRootfsBudget(); err != nil {
+					return fmt.Errorf("environment %s runtime %s: %w", name, runtimeName, err)
+				}
 				for _, value := range []struct{ field, path string }{
 					{"firecracker.binaryPath", binding.Firecracker.BinaryPath},
 					{"firecracker.jailerPath", binding.Firecracker.JailerPath},

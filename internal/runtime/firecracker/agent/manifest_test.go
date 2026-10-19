@@ -98,3 +98,23 @@ func TestValidSHA256(t *testing.T) {
 	require.False(t, validSHA256(strings.Repeat("g", 64)))
 	require.False(t, validSHA256(""))
 }
+
+func TestSharedBaseIsRequiredAndVerified(t *testing.T) {
+	payload := testManifest(map[string][]byte{"rootfs.ext4": []byte("upper"), "vmstate.snap": []byte("state"), "memory.snap": []byte("memory")})
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(payload, &doc))
+	sum := strings.Repeat("a", 64)
+	doc["sharedRootfs"] = map[string]any{"layout": "pmem-dax-v1", "sha256": sum, "sizeBytes": 2 << 20}
+	encode := func() []byte { p, e := json.Marshal(doc); require.NoError(t, e); return p }
+	_, err := parseManifest(encode())
+	require.Error(t, err)
+	doc["files"].(map[string]any)["base.ext4"] = map[string]any{"sha256": sum, "sizeBytes": 2 << 20}
+	parsed, err := parseManifest(encode())
+	require.NoError(t, err)
+	files, err := parsed.nativeFiles()
+	require.NoError(t, err)
+	require.Len(t, files, 4)
+	doc["files"].(map[string]any)["base.ext4"].(map[string]any)["sha256"] = strings.Repeat("b", 64)
+	_, err = parseManifest(encode())
+	require.Error(t, err)
+}

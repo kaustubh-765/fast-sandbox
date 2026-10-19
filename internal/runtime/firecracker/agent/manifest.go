@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // manifestFile describes one published artifact.
@@ -19,7 +21,8 @@ type manifestFile struct {
 // manifest is the consumer-side view of manifest.json; only the file list
 // is needed by the pull layer.
 type manifest struct {
-	Files map[string]manifestFile `json:"files"`
+	Files        map[string]manifestFile `json:"files"`
+	SharedRootfs *artifacts.SharedRootfs `json:"sharedRootfs,omitempty"`
 }
 
 // parseManifest decodes a downloaded manifest document.
@@ -30,6 +33,9 @@ func parseManifest(payload []byte) (manifest, error) {
 	}
 	if len(document.Files) == 0 {
 		return manifest{}, fmt.Errorf("manifest has no files")
+	}
+	if _, err := artifacts.DecodeSharedRootfs(payload); err != nil {
+		return manifest{}, err
 	}
 	return document, nil
 }
@@ -78,6 +84,13 @@ func (m manifest) nativeFiles() ([]nativeFile, error) {
 			publish: name.publish, cache: name.cache,
 			sha256: entry.SHA256, sizeBytes: entry.SizeBytes,
 		})
+	}
+	if m.SharedRootfs != nil {
+		entry, ok := m.Files[artifacts.SharedRootfsName]
+		if !ok || entry.SHA256 != m.SharedRootfs.SHA256 || entry.SizeBytes != m.SharedRootfs.SizeBytes {
+			return nil, fmt.Errorf("inconsistent DAX base")
+		}
+		files = append(files, nativeFile{publish: artifacts.SharedRootfsName, cache: artifacts.SharedRootfsName, sha256: entry.SHA256, sizeBytes: entry.SizeBytes})
 	}
 	return files, nil
 }

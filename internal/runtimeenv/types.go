@@ -76,11 +76,14 @@ type RuntimeBinding struct {
 // driver configuration (internal/catalog/runtime.FirecrackerConfig). Every
 // field is optional; empty values keep the builtin profile default.
 type FirecrackerBinding struct {
-	BinaryPath string `json:"binaryPath,omitempty"`
-	JailerPath string `json:"jailerPath,omitempty"`
-	KernelPath string `json:"kernelPath,omitempty"`
-	RootfsPath string `json:"rootfsPath,omitempty"`
-	StateRoot  string `json:"stateRoot,omitempty"`
+	// SharedRootfsMemory is the maximum pmem base size per Sandbox slot.
+	// Empty keeps 32Gi; "0" selects legacy-only admission and memory sizing.
+	SharedRootfsMemory string `json:"sharedRootfsMemory,omitempty"`
+	BinaryPath         string `json:"binaryPath,omitempty"`
+	JailerPath         string `json:"jailerPath,omitempty"`
+	KernelPath         string `json:"kernelPath,omitempty"`
+	RootfsPath         string `json:"rootfsPath,omitempty"`
+	StateRoot          string `json:"stateRoot,omitempty"`
 }
 
 // ResolvedContainerdEnvironment is the per-runtime view consumed by Fastlet.

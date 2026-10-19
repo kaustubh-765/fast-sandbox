@@ -455,7 +455,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// window cannot exhaust the slot pool. Local mode (no agent socket)
 	// keeps the pre-warmed behavior: a still-missing image reports
 	// ErrImageNotReady and the create fails exactly as before.
-	if err := verifyRestorableImage(stateRoot, restoreRef); err != nil {
+	if err := d.verifyRestorableImage(stateRoot, restoreRef); err != nil {
 		return nil, err
 	}
 
@@ -547,6 +547,17 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// a structured error, not at snapshot/load with an MSR/XSTATE fault.
 	if err == nil {
 		err = d.validateRestoreCompatibility(stateRoot, restoreRef)
+	}
+	if err == nil {
+		err = validateSharedRootfsBudget(d.config, stateRoot, restoreRef)
+	}
+	if err == nil {
+		machine, found, machineErr := readCachedManifestMachine(stateRoot, restoreRef)
+		if machineErr != nil {
+			err = machineErr
+		} else if found {
+			err = d.validateSharedRootfsAllocation(stateRoot, restoreRef, machine.Memory)
+		}
 	}
 	var instanceRootfs, jailRoot, apiAddress string
 	if err == nil {
@@ -1100,6 +1111,10 @@ func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstateP
 		if prepareErr := prepareJailRoot(jailRoot, cached, vmstatePath, memoryPath); prepareErr != nil {
 			return "", "", "", prepareErr
 		}
+		if stageErr := stageSharedRootfs(stateRoot, image, jailRoot); stageErr != nil {
+			d.removeJailRoot(sandboxID)
+			return "", "", "", stageErr
+		}
 		// Bind the snapshot spill root into the jail BEFORE the VMM starts:
 		// the jailer clones its mount namespace at process start, so a dump
 		// window bind would be invisible to the running VMM. A failed bind
@@ -1121,6 +1136,9 @@ func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstateP
 	}
 	instanceRootfs, err = prepareInstanceRootfs(stateRoot, image, stateDir)
 	if err != nil {
+		return "", "", "", err
+	}
+	if err := stageSharedRootfs(stateRoot, image, stateDir); err != nil {
 		return "", "", "", err
 	}
 	return instanceRootfs, "", filepath.Join(stateDir, "api.sock"), nil

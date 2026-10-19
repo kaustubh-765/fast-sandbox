@@ -209,7 +209,9 @@ Precedence: custom `probe` → execd `/ping` (when execd is injected) →
 
 | Field | Required | Default | Meaning |
 | --- | ---: | --- | --- |
-| `output.rootfsSize` | Yes | `"30Gi"` | Logical capacity of the produced `rootfs.ext4` (Kubernetes quantity). Rounded **up** to SI GiB for oci2rootfs (`30Gi` → 33G → ~30.7 GiB sparse file) |
+| `output.rootfsSize` | Yes | `"30Gi"` | Base conversion capacity, or writable root capacity with `sharedRootfs: false` (Kubernetes quantity). Rounded **up** to SI GB for oci2rootfs (`30Gi` → 33G → ~30.7 GiB sparse file) |
+| `output.sharedRootfs` | No | `true` | Build an immutable DAX base with a private OverlayFS upper; `false` retains the legacy block-root layout |
+| `output.writableSize` | No | `rootfsSize` | Private upper disk capacity; requires `sharedRootfs: true` |
 | `output.format` | Yes | `overlaybd` | `native` (raw snapshot files only) or `overlaybd` (plus LSMT layers for on-demand range reads); both contain the full artifact set |
 | `output.publish` | No | platform store | S3-compatible target, e.g. `s3://sandbox-images/publish`. Empty defaults to the platform artifact store (`fast-sandbox-artifact-store` ConfigMap); a non-empty value must equal that store or the build fails with an `InvalidOutput` condition, so a template cannot silently publish where no node agent reads. Digest-addressed publication; the builder itself refuses to run with an empty target unless `SANDBOX_TEMPLATE_ALLOW_NO_PUBLISH=1` |
 | `output.publishSecretRef` | No | — | Name of the write-credential Secret in the template's namespace (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`); the controller mounts it into the build Pod and the builder reads the keys as files (never env-injected). Without it the build relies on platform-level credentials (IRSA/node metadata). Runtime nodes read with a **separate** read-only credential — write keys never reach them |
@@ -247,7 +249,8 @@ what the node agents pull.
 ```text
 s3://sandbox-images/publish/
 ├── <sha256(manifest)[:16]>/          # per-build digest namespace
-│   ├── rootfs.ext4                   # sparse ext4 (native filename: rootfs.img)
+│   ├── base.ext4                     # immutable DAX base (sharedRootfs=true only)
+│   ├── rootfs.ext4                   # private upper, or legacy root (cache: rootfs.img)
 │   ├── vmstate.snap
 │   ├── memory.snap
 │   ├── overlaybd/{rootfs,memory}/layer.lsmt   # format=overlaybd only
@@ -303,3 +306,92 @@ manifest.json}` (native filename mapping: `rootfs.ext4` → `rootfs.img`).
 
 - [E2E: golden-image builder](sandboxtemplate-golden-image-e2e.md)
 - [Reference: API](../reference/api.md) (SandboxTemplate CRD fields)
+
+## Shared DAX root filesystem
+
+New template builds use a read-only, file-backed virtio-pmem ext4 base and
+a private ext4 OverlayFS upper disk by default. `output.writableSize` optionally sizes the private upper disk independently
+of `output.rootfsSize` (the base conversion capacity); by default they match.
+No persistent-memory hardware
+or business Dockerfile changes are required. Set `spec.output.sharedRootfs: false`
+to build the legacy block-root layout. Existing golden snapshots keep their
+original layout; rebuild a template to adopt DAX. Upgrade the builder and all
+Firecracker consumers before publishing shared-rootfs templates.
+
+The base is immutable and digest-verified. The vmstate records its fixed relative
+path, so every restore stages that exact base inside the instance or jail. Live
+snapshots and pause checkpoints include the base, upper disk, vmstate and RAM;
+restoring on another node does not depend on the original node's cache. Cache
+removal cannot remove an instance's hard link. A failed hard link is an error,
+not a private copy that would silently lose sharing.
+
+OverlayBD remains the packaging format for the private disk and RAM. The pmem
+base is materialized as a regular file before restore: an OverlayBD/ublk block
+device cannot be mapped as file-backed pmem. DAX is a guest filesystem property;
+OverlayBD compression/lazy loading and DAX page sharing are separate mechanisms.
+
+Sharing reduces repeated file pages, not guest anonymous heaps. Keep the full
+guest RAM reservation; shared file residency and pmem page metadata also consume
+host memory. A first-touch cgroup may own shared file charges for multiple VMs,
+so summing VMM RSS or dividing base bytes by VM count is not a safe memory limit.
+Cross-VM file sharing also exposes shared-cache timing channels; use dedicated
+nodes for mutually untrusted workloads where this violates the isolation policy.
+
+The Firecracker runtime profile's `firecracker.sharedRootfsMemory` is the
+maximum base size per Sandbox slot (default `32Gi`). Kubernetes requests and
+limits add the full budget plus a conservative 1/32 metadata allowance for
+each slot, on top of guest RAM and runtime overhead. The driver rejects a
+base larger than this budget. Explicit smaller memory requests or limits
+are rejected, preventing accidental memory overcommit in this mode. Multiple
+Fastlets reserve independently even when they share the same physical base.
+This first implementation saves residency, not Kubernetes allocated quota.
+
+Operators can lower the budget to a known image-size ceiling. A profile with
+`sharedRootfsMemory: "0"` keeps the original memory sizing and admits only
+legacy block-root artifacts; build those with `output.sharedRootfs: false`.
+Existing explicit Fastlet memory limits must be increased before switching
+to a DAX-enabled profile. This conservative reservation does not eliminate
+OOM caused by unrelated node workloads, kernel overhead beyond the allowance,
+or manually launched VMMs outside the managed Pool.
+
+For example, the relevant fields for a large image with a smaller writable
+workspace are:
+
+```yaml
+spec:
+  output:
+    format: overlaybd
+    rootfsSize: 20Gi
+    writableSize: 4Gi
+    sharedRootfs: true
+```
+
+The default 32 GiB base budget reserves 33 GiB including metadata per slot:
+a single 8 GiB Sandbox therefore requests 41.25 GiB including the builtin
+runtime overhead. Set the platform runtime environment's
+`environments.<name>.runtimes.firecracker.firecracker.sharedRootfsMemory`
+to an image-size ceiling such as `16Gi` when all admitted bases fit it.
+This lowers the same request to 24.75 GiB. A smaller limit fails admission
+rather than relying on free memory at that instant.
+
+The current Kubernetes agent materializes native artifacts for both output
+formats. OverlayBD layers still encode the private upper and memory images;
+the base remains a regular file. The separate `fsb-vm` OCI/ublk template-pair
+workflow retains its block-root layout.
+
+Full checkpoints carry their own base bytes. This keeps them independent
+of golden-image retention, but increases upload/storage cost compared with
+a hypothetical shared object reference. With the default upper capacity,
+published artifact sets can also be larger than legacy sets. Size node disk
+space for private upper writes, cache and checkpoint staging; OverlayFS
+copy-up can fail with `ENOSPC`. Read-only sharing does not benefit anonymous
+heaps and is reduced by writes or metadata changes that copy files up.
+Applications requiring a block-device root, filesystem-specific ioctls or
+raw pmem writes must use and validate the legacy layout; writing directly
+to the read-only pmem device can fault or terminate the VM.
+
+DAX snapshots copy the private upper after Firecracker drains block I/O,
+while the guest is paused. Golden-image restore validation uses a separate
+upper clone, so validation cannot change the disk paired with golden RAM.
+The controller verifies the builder's layout annotation and rejects an old
+builder that silently ignores a requested DAX layout.

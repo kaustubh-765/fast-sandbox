@@ -227,7 +227,7 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
 	cacheDir := filepath.Join(stateRoot, imageCacheDir, imageKey(reference))
-	if verifyRestorableImage(stateRoot, reference) == nil {
+	if d.verifyRestorableImage(stateRoot, reference) == nil {
 		// A concurrent replay already committed the identical set.
 		_ = os.RemoveAll(staging)
 		d.touchImage(reference)
@@ -244,6 +244,17 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		vmstateSnapshotName:  vmstateSnapshotName,
 		memorySnapshotName:   memorySnapshotName,
 		snapshotManifestName: snapshotManifestName,
+	}
+	payload, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
+	if err != nil {
+		return err
+	}
+	base, err := artifacts.DecodeSharedRootfs(payload)
+	if err != nil {
+		return err
+	}
+	if base != nil {
+		mappings[artifacts.SharedRootfsName] = artifacts.SharedRootfsName
 	}
 	// The vault file is an optional bundle member; it rides into the cache
 	// so the restore path finds it next to the snapshot files. Mirror the
@@ -269,7 +280,7 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		_ = os.RemoveAll(staging)
 		// A concurrent commit won the rename; the identical set is already
 		// addressable.
-		if verifyRestorableImage(stateRoot, reference) == nil {
+		if d.verifyRestorableImage(stateRoot, reference) == nil {
 			d.touchImage(reference)
 			return nil
 		}
@@ -468,7 +479,7 @@ func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
 // window pays the spill area's bandwidth (tmpfs/local NVMe) instead of the
 // StateRoot filesystem. The Sandbox keeps running on every failure path,
 // with a failed resume joined after (and never masking) the dump error.
-func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit // pre-existing pause/dump/resume window; refactor tracked separately
+func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit,maintidx // pre-existing pause/dump/resume window; refactor tracked separately
 	snapshotMu.Lock()
 	defer snapshotMu.Unlock()
 
@@ -555,9 +566,13 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// in-window full copy: it is not atomic and must happen while paused.
 	stagedRootfs := filepath.Join(plan.staging, publishedRootfsName)
 	rootfsCloned := false
+	_, baseErr := os.Stat(filepath.Join(filepath.Dir(rootfs), artifacts.SharedRootfsName))
+	sharedRootfs := baseErr == nil
 	reflinkStarted := time.Now()
-	if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
-		rootfsCloned = true
+	if !sharedRootfs {
+		if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
+			rootfsCloned = true
+		}
 	}
 	plan.rootfsClone = time.Since(reflinkStarted)
 
@@ -574,7 +589,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "spilled", plan.spilled,
 		"rootfsCloned", rootfsCloned)
 	dumpErr := func() error {
-		if !rootfsCloned {
+		if !rootfsCloned && !sharedRootfs {
 			copyStarted := time.Now()
 			if err := copyReflinkOrCopy(rootfs, stagedRootfs); err != nil {
 				return fmt.Errorf("copy instance rootfs: %w", err)
@@ -590,6 +605,16 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		plan.dumpAPI = time.Since(dumpStarted)
 		if err != nil {
 			return fmt.Errorf("create Firecracker snapshot: %w", err)
+		}
+		if sharedRootfs {
+			// Firecracker snapshot creation drains and flushes the block
+			// device. Capture the private upper after that barrier, while
+			// vCPUs remain paused; an earlier clone can miss completed writes.
+			copyStarted := time.Now()
+			if err := copyReflinkOrCopy(rootfs, stagedRootfs); err != nil {
+				return fmt.Errorf("copy drained private upper: %w", err)
+			}
+			plan.rootfsCopy = time.Since(copyStarted)
 		}
 		return nil
 	}()
@@ -808,7 +833,16 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 		return 0, err
 	}
 
+	// The cache source remains pinned by the live sandbox; checkpoint carries
+	// its own base, so another node can restore without the original cache.
+	sourceDir := filepath.Dir(cachedManifestPath(stateRoot, sourceRef))
+	if err := stageSnapshotBase(document, sourceDir, staging); err != nil {
+		return 0, err
+	}
 	bundleFiles := []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName}
+	if _, ok := document["sharedRootfs"]; ok {
+		bundleFiles = append(bundleFiles, artifacts.SharedRootfsName)
+	}
 	// Mirror the publish side (PublishImage): only absence means "no vault",
 	// any other stat failure fails the assembly — a transient error here
 	// would otherwise produce a manifest that omits the vault while the

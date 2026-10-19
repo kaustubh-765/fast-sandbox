@@ -15,6 +15,7 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
@@ -64,17 +65,28 @@ func resolveRootfsImage(stateRoot, image string) (string, error) {
 	return path, nil
 }
 
-// verifyRestorableImage verifies the COMPLETE restore set of an image is
-// committed in the local cache: rootfs plus both golden snapshots. This is
-// the single readiness criterion shared by async delivery and EnsureSandbox,
-// so a partially delivered cache (rootfs committed while vmstate/memory are
-// still transferring) never reports ready. Without it, a parked boot worker
-// polls EnsureSandbox in the delivery window, and every attempt acquires a
-// network slot only to release-destroy it on the snapshot check — burning
-// the slot pool faster than replenishment and failing the cold create.
+// verifyRestorableImage requires the agent commit point before any network
+// acquisition. rootfs and RAM can exist while a later DAX base is downloading.
+// Local hand-seeded legacy caches retain their manifest-optional behavior.
+func (d *Driver) verifyRestorableImage(stateRoot, image string) error {
+	if d.agentSocket != "" {
+		if _, err := os.Stat(cachedManifestPath(stateRoot, image)); err != nil {
+			return fmt.Errorf("%w: image manifest is not committed: %w", ErrImageNotReady, err)
+		}
+	}
+	return verifyRestorableImage(stateRoot, image)
+}
+
 func verifyRestorableImage(stateRoot, image string) error {
 	if _, err := resolveRootfsImage(stateRoot, image); err != nil {
 		return err
+	}
+	if base, source, err := cachedSharedRootfs(stateRoot, image); err != nil {
+		return err
+	} else if base != nil {
+		if info, err := os.Stat(source); err != nil || !info.Mode().IsRegular() || info.Size() != base.SizeBytes {
+			return fmt.Errorf("%w: incomplete DAX base", ErrImageNotReady)
+		}
 	}
 	if _, _, err := resolveRestoreSnapshotFiles(stateRoot, image); err != nil {
 		return err
@@ -198,6 +210,11 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 			return nil, fmt.Errorf("read Sandbox state %s for image GC: %w", directory, err)
 		}
 		referenced[imageKey(state.Config.Spec.Image)] = struct{}{}
+		if ref, err := restoreReference(state.Config.Spec); err != nil {
+			return nil, err
+		} else {
+			referenced[imageKey(ref)] = struct{}{}
+		}
 	}
 	cached, err := listCachedImages(stateRoot)
 	if err != nil {
@@ -220,11 +237,18 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 		if err != nil {
 			continue
 		}
-		total += info.Size()
+		imageBytes := info.Size()
+		if baseInfo, err := os.Stat(filepath.Join(stateRoot, imageCacheDir, digest, artifacts.SharedRootfsName)); err == nil {
+			// The upper disk is mostly empty capacity, not cached image
+			// content. Charge allocated blocks so a default sparse 30Gi upper
+			// does not immediately evict an otherwise small DAX template.
+			imageBytes = rootfsDiskBytes(info) + rootfsDiskBytes(baseInfo)
+		}
+		total += imageBytes
 		if _, used := referenced[digest]; used {
 			continue
 		}
-		entries = append(entries, entry{digest: digest, bytes: info.Size(), uses: useCount[digest]})
+		entries = append(entries, entry{digest: digest, bytes: imageBytes, uses: useCount[digest]})
 	}
 	// Least-frequently-used first; ties resolve deterministically by digest.
 	sort.Slice(entries, func(i, j int) bool {
@@ -243,6 +267,9 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 		}
 		total -= candidate.bytes
 		removed = append(removed, candidate.digest)
+	}
+	if err := collectSharedRootfs(stateRoot); err != nil {
+		return removed, err
 	}
 	return removed, nil
 }

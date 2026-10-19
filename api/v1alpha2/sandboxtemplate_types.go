@@ -105,10 +105,22 @@ type PrimeSpec struct {
 
 // OutputSpec describes the artifacts to produce and where to publish them.
 type OutputSpec struct {
-	// RootfsSize is the logical size of the converted rootfs.ext4 — the
-	// capacity the guest sees as its root drive. A Kubernetes resource
-	// quantity; the file is sparse. It must be large enough to hold the
-	// expanded OCI image content.
+	// SharedRootfs builds a read-only virtio-pmem/DAX base with a private
+	// OverlayFS upper disk. Nil enables it; false preserves block-root builds.
+	// Existing snapshots retain their recorded device topology.
+	// +kubebuilder:default=true
+	// +optional
+	SharedRootfs *bool `json:"sharedRootfs,omitempty"`
+
+	// WritableSize is the private OverlayFS upper disk capacity for shared
+	// rootfs builds. Empty keeps RootfsSize. It does not limit base image size.
+	// +optional
+	WritableSize string `json:"writableSize,omitempty"`
+
+	// RootfsSize is the conversion capacity for the expanded OCI image.
+	// Shared-rootfs builds compact that image into an immutable base and
+	// default the private upper capacity to this value. Legacy builds use
+	// it as the writable root drive capacity. A resource quantity; sparse.
 	// +kubebuilder:default="30Gi"
 	RootfsSize string `json:"rootfsSize"`
 

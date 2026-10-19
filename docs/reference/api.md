@@ -220,7 +220,9 @@ spec:
 | `readiness.probe` | No | — | Custom gate first: `tcp://host:port` or `cmd://<command>` |
 | `readiness.warmupSeconds` | Yes | `60` | Fallback time-based warmup |
 | `readiness.healthCheck` | No | — | Fallback health command; empty uses image `CMD-SHELL` |
-| `output.rootfsSize` | Yes | `"30Gi"` | Logical rootfs capacity (minimum, rounded up to SI GiB) |
+| `output.rootfsSize` | Yes | `"30Gi"` | OCI conversion capacity; also the default private upper capacity (minimum, rounded up to SI GB) |
+| `output.sharedRootfs` | No | `true` | Build an immutable virtio-pmem/DAX base with a private OverlayFS upper; `false` selects the legacy block root |
+| `output.writableSize` | No | `rootfsSize` | Private upper capacity for shared-rootfs builds; must be positive and requires `sharedRootfs` |
 | `output.format` | Yes | `overlaybd` | `native` or `overlaybd` (both contain the full snapshot set) |
 | `output.publish` | Yes | — | S3-compatible digest-addressed publish target, e.g. `s3://bucket/prefix` |
 | `output.publishSecretRef` | No | — | Write-credential Secret name in the template's namespace (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`) |

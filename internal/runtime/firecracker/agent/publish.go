@@ -81,6 +81,13 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	// SHA256SUMS already reference the file and a stranded member would
 	// break the cross-node resume.
 	entries := append([]string(nil), publishArtifacts...)
+	sharedBase, err := artifacts.DecodeSharedRootfs(manifestBytes)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if sharedBase != nil {
+		entries = append(entries, artifacts.SharedRootfsName)
+	}
 	if _, err := os.Stat(filepath.Join(dir, publishVaultName)); err == nil {
 		entries = append(entries, publishVaultName)
 	} else if !errors.Is(err, os.ErrNotExist) {

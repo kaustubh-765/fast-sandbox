@@ -132,6 +132,7 @@ type statefulFakeServer struct {
 	snapshotLoads []SnapshotLoadRequest
 	snapshotDumps []SnapshotCreateRequest
 	failSnapshot  bool
+	onSnapshot    func()
 	running       bool
 	socket        string
 }
@@ -191,6 +192,9 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		request := s.snapshotDumps[len(s.snapshotDumps)-1]
 		s.mu.Unlock()
+		if s.onSnapshot != nil {
+			s.onSnapshot()
+		}
 		// Emulate the VMM: write the two snapshot files where the request
 		// points so the driver's staging assembly finds them.
 		_ = os.WriteFile(request.SnapshotPath, []byte("vmstate-dump-data"), 0o640)

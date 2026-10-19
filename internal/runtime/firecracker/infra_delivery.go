@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"fast-sandbox/internal/artifacts"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 )
@@ -78,6 +79,15 @@ func deliverGuestInfra(ctx context.Context, runner fastletnetwork.CommandRunner,
 		}
 	}()
 
+	guestRoot := mountpoint
+	// A DAX instance stores its visible root in the upper/ directory. Never
+	// inject at the upper filesystem root or mutate the immutable base.
+	if _, err := os.Stat(filepath.Join(filepath.Dir(rootfsImage), artifacts.SharedRootfsName)); err == nil {
+		guestRoot = filepath.Join(mountpoint, "upper")
+		if err := os.MkdirAll(guestRoot, 0o755); err != nil {
+			return err
+		}
+	}
 	for _, mount := range instance.Mounts {
 		if mount.Source == "" || mount.Destination == "" {
 			continue
@@ -90,7 +100,7 @@ func deliverGuestInfra(ctx context.Context, runner fastletnetwork.CommandRunner,
 		if source == "" {
 			source = mount.Source
 		}
-		target := filepath.Join(mountpoint, mount.Destination)
+		target := filepath.Join(guestRoot, mount.Destination)
 		if _, err := runner.Run(ctx, "mkdir", "-p", filepath.Dir(target)); err != nil {
 			return err
 		}

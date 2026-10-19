@@ -153,6 +153,9 @@ func applyFirecrackerBinding(config *runtimecatalog.FirecrackerConfig, binding *
 	if config == nil || binding == nil {
 		return
 	}
+	if binding.SharedRootfsMemory != "" {
+		config.SharedRootfsMemory = binding.SharedRootfsMemory
+	}
 	if binding.BinaryPath != "" {
 		config.BinaryPath = binding.BinaryPath
 	}

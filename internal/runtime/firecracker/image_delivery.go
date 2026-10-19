@@ -95,7 +95,7 @@ func (d *Driver) deliverReference(reference string, pin func(context.Context) er
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	if err := verifyRestorableImage(stateRoot, reference); err == nil {
+	if err := d.verifyRestorableImage(stateRoot, reference); err == nil {
 		d.touchImage(reference)
 		return runtimecontract.ImageDelivered, nil
 	}
@@ -118,7 +118,7 @@ func (d *Driver) deliverReference(reference string, pin func(context.Context) er
 	}
 	// Another attempt may have committed after the initial cache check but
 	// before this caller acquired the tracker lock. Do not pin it again.
-	if err := verifyRestorableImage(stateRoot, reference); err == nil {
+	if err := d.verifyRestorableImage(stateRoot, reference); err == nil {
 		d.touchImage(reference)
 		return runtimecontract.ImageDelivered, nil
 	}
@@ -167,7 +167,7 @@ func (d *Driver) runDeliveryAttempt(reference string, pin func(context.Context) 
 		d.mu.RLock()
 		stateRoot := d.config.StateRoot
 		d.mu.RUnlock()
-		if resolveErr := verifyRestorableImage(stateRoot, reference); resolveErr != nil {
+		if resolveErr := d.verifyRestorableImage(stateRoot, reference); resolveErr != nil {
 			err = fmt.Errorf("%w: runtime-agent reports %q delivered but no committed restore set exists in the local cache (cache purged under an idempotent pin?); rebuild the environment or clear the agent journal to re-pull", ErrImageNotReady, reference)
 		} else {
 			d.touchImage(reference)

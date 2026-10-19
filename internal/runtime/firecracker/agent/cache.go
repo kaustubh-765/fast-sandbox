@@ -24,6 +24,8 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 const (
@@ -126,6 +128,9 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		return err
 	}
 	target := filepath.Join(dir, file.cache)
+	if file.publish == artifacts.SharedRootfsName {
+		return stageSharedBase(ctx, c, dir, storeKey, file)
+	}
 	match, err := fileMatches(target, file)
 	if err == nil && match {
 		return nil

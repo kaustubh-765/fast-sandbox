@@ -54,9 +54,10 @@ func (m *materializingAgent) PinImage(ctx context.Context, requestID, image stri
 	// The real agent commits the complete restore set; a partial commit
 	// (rootfs only) must NOT count as delivered.
 	for name, payload := range map[string]string{
-		rootfsImageName:     "rootfs-image-data",
-		vmstateSnapshotName: "vmstate-snapshot-data",
-		memorySnapshotName:  "memory-snapshot-data",
+		snapshotManifestName: "{}",
+		rootfsImageName:      "rootfs-image-data",
+		vmstateSnapshotName:  "vmstate-snapshot-data",
+		memorySnapshotName:   "memory-snapshot-data",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(payload), 0o640); err != nil {
 			return "", err

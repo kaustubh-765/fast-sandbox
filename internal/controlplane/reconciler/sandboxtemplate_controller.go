@@ -14,7 +14,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
@@ -27,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/artifactstore"
 )
 
@@ -112,7 +112,7 @@ type SandboxTemplateReconciler struct {
 }
 
 // Reconcile drives one SandboxTemplate towards its desired build state.
-func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) { //nolint:gocognit,maintidx // pre-existing reconcile state machine; refactor tracked separately
+func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) { //nolint:gocognit,gocyclo,maintidx // pre-existing reconcile state machine; refactor tracked separately
 	logger := klog.FromContext(ctx)
 	var template apiv1alpha2.SandboxTemplate
 	if err := r.Get(ctx, request.NamespacedName, &template); err != nil {
@@ -234,6 +234,12 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseBuilding
 		return ctrl.Result{}, r.updatePhase(ctx, &template)
 	case pod.Status.Phase == corev1.PodSucceeded:
+		if err := validateBuiltRootfsLayout(template.Spec, pod.Annotations[artifacts.RootfsLayoutAnnotation]); err != nil {
+			if failErr := r.failBuild(ctx, &template, "UnsupportedRootfsLayout", err); failErr != nil {
+				return ctrl.Result{}, failErr
+			}
+			return ctrl.Result{}, r.cleanupPod(ctx, pod)
+		}
 		// Build Pod finished: consume the reported annotations, mark the
 		// build succeeded, and clear the finished Pod.
 		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
@@ -625,28 +631,9 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	// and a per-template workspace volume. The memory limit tracks the
 	// guest's machine.memory (the VMM maps it 1:1) plus headroom, so a large
 	// spec does not get OOM-killed by a fixed 4 Gi limit.
-	memoryLimit := resource.MustParse("4Gi")
-	if machineMemory, err := resource.ParseQuantity(template.Spec.Machine.Memory); err == nil {
-		withHeadroom := machineMemory.DeepCopy()
-		withHeadroom.Add(resource.MustParse("1Gi"))
-		if withHeadroom.Cmp(memoryLimit) > 0 {
-			memoryLimit = withHeadroom
-		}
-	}
-	// The workspace emptyDir lives on the node's local disk and holds the
-	// rootfs plus the 1:1 guest memory snapshot; size the ephemeral-storage
-	// limit from the declared rootfsSize + machine.memory so a build cannot
-	// fill a shared node's disk. The kubelet enforces this via eviction.
-	storageLimit := resource.MustParse("10Gi")
-	if rootfsSize, err := resource.ParseQuantity(template.Spec.Output.RootfsSize); err == nil {
-		total := rootfsSize.DeepCopy()
-		if machineMemory, err := resource.ParseQuantity(template.Spec.Machine.Memory); err == nil {
-			total.Add(machineMemory)
-		}
-		total.Add(resource.MustParse("2Gi"))
-		if total.Cmp(storageLimit) > 0 {
-			storageLimit = total
-		}
+	buildResources, err := templateBuildResources(template.Spec)
+	if err != nil {
+		return err
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -673,18 +660,7 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 				SecurityContext: &corev1.SecurityContext{Privileged: ptr(true)},
 				// Multi-GiB snapshot work; requests guarantee scheduling
 				// headroom, limits bound the privileged builder.
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse("1"),
-						corev1.ResourceMemory:           resource.MustParse("2Gi"),
-						corev1.ResourceEphemeralStorage: resource.MustParse("5Gi"),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:              resource.MustParse("2"),
-						corev1.ResourceMemory:           memoryLimit,
-						corev1.ResourceEphemeralStorage: storageLimit,
-					},
-				},
+				Resources:    buildResources,
 				VolumeMounts: volumeMounts,
 			}},
 			Volumes: volumes,

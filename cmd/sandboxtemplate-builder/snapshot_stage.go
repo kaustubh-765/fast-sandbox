@@ -153,6 +153,14 @@ func runSnapshotStage(args []string) error {
 	vm.stop()
 	snapshotCreateMs := time.Since(snapshotStarted).Milliseconds()
 
+	if sharedRootfsEnabled(spec) {
+		validationDisk, err := prepareValidationRootfs(workdir, rootfs)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(validationDisk)
+	}
+
 	// Stage B: restore once for validation. The restore does not re-apply the
 	// machine config / rootfs drive: it relies on the snapshot's embedded
 	// device state and the original paths still existing on this host. This
@@ -350,10 +358,14 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 	if err := api(vm.socket, "PUT", "/entropy", map[string]any{}); err != nil {
 		return fmt.Errorf("attach entropy device: %w", err)
 	}
-	if err := api(vm.socket, "PUT", "/boot-source", map[string]any{
-		"kernel_image_path": kernel,
-		"boot_args":         bootArgs,
-	}); err != nil {
+	bootSource := map[string]any{"kernel_image_path": kernel, "boot_args": bootArgs}
+	if sharedRootfsEnabled(spec) {
+		bootSource["initrd_path"] = filepath.Join(filepath.Dir(rootfs), "dax-initramfs.cpio")
+		if err := api(vm.socket, "PUT", "/pmem/base", map[string]any{"id": "base", "path_on_host": artifacts.SharedRootfsName, "root_device": false, "read_only": true}); err != nil {
+			return err
+		}
+	}
+	if err := api(vm.socket, "PUT", "/boot-source", bootSource); err != nil {
 		return err
 	}
 	if err := api(vm.socket, "PUT", "/drives/rootfs", map[string]any{
@@ -632,4 +644,21 @@ func memoryMiB(quantity string) (int64, error) {
 		return 128, nil
 	}
 	return miB, nil
+}
+
+// prepareValidationRootfs prevents the restore-validation guest from changing
+// the upper disk paired with the already captured golden RAM/device state.
+func prepareValidationRootfs(workdir, rootfs string) (string, error) {
+	target := filepath.Join(workdir, "validation-rootfs.ext4")
+	if out, err := exec.Command("cp", "--reflink=auto", "--sparse=always", rootfs, target).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("clone validation upper: %w: %s", err, out)
+	}
+	drive := filepath.Join(workdir, snapshotDriveName)
+	if err := os.Remove(drive); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := os.Symlink(target, drive); err != nil {
+		return "", err
+	}
+	return target, nil
 }

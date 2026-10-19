@@ -811,7 +811,7 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: nodeCleanupVolumeName, MountPath: filepath.Dir(nodecleanup.DefaultSocketPath)})
 		}
 		if runtimeResourceOwner == c.Name {
-			if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
+			if err := applyRuntimeResources(c, profile, sandboxResources, getFastletCapacity(pool)); err != nil {
 				return nil, err
 			}
 		}

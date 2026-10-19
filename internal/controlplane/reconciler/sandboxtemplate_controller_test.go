@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/artifactstore"
 )
 
@@ -231,6 +232,7 @@ func TestSandboxTemplateReconcileCreatesPodAndTracksPhase(t *testing.T) {
 	// manifestRef/artifactDigest are consumed before cleanup.
 	pod.Annotations = map[string]string{
 		sandboxTemplateManifestRefAnnot:  "s3://bucket/sandbox-images/abc123/manifest.json",
+		artifacts.RootfsLayoutAnnotation: artifacts.SharedRootfsLayout,
 		sandboxTemplateArtifactDigestAnn: "deadbeef",
 	}
 	if err := reconciler.Update(context.Background(), pod); err != nil {
@@ -371,6 +373,10 @@ func TestSandboxTemplateReconcileBuildTTLRetainsPod(t *testing.T) {
 	reconcileOnce(t, reconciler, key)
 	pods := listBuilderPods(t, reconciler, namespace)
 	pod := &pods[0]
+	pod.Annotations = map[string]string{artifacts.RootfsLayoutAnnotation: artifacts.SharedRootfsLayout}
+	if err := reconciler.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
 	pod.Status.Phase = corev1.PodSucceeded
 	pod.Status.Conditions = []corev1.PodCondition{{
 		Type:               corev1.PodReady,

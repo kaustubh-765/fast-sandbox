@@ -36,8 +36,9 @@ func buildManifestFixture(t *testing.T) (apiv1alpha2.SandboxTemplateSpec, string
 	spec := apiv1alpha2.SandboxTemplateSpec{
 		Image: "registry.example.com/sandbox:v1",
 		Output: apiv1alpha2.OutputSpec{
-			Format:     apiv1alpha2.ArtifactFormatNative,
-			RootfsSize: "1Gi",
+			Format:       apiv1alpha2.ArtifactFormatNative,
+			SharedRootfs: boolPtr(false),
+			RootfsSize:   "1Gi",
 		},
 	}
 	kernel := filepath.Join(workdir, "vmlinux")
@@ -90,3 +91,5 @@ func TestBuildManifestMitmCALineage(t *testing.T) {
 		t.Fatalf("egressMitmCA.certificates = %+v, want [%+v]", recorded["certificates"], wantEntry)
 	}
 }
+
+func boolPtr(value bool) *bool { return &value }

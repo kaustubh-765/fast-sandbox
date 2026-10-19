@@ -36,6 +36,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 )
 
 const (
@@ -111,6 +112,10 @@ func run(ctx context.Context) error {
 	}
 	convertMs := time.Since(convertStarted).Milliseconds()
 
+	if err := prepareSharedRootfs(spec, workdir, rootfs); err != nil {
+		return err
+	}
+
 	// Stage 2+3: validate-boot and snapshot (mandatory for every format).
 	bootStarted := time.Now()
 	vmstate, memory, phases, err := stageBootAndSnapshot(spec, workdir, kernel, rootfs)
@@ -171,7 +176,11 @@ func run(ctx context.Context) error {
 		"publishMs", publishMs,
 		"totalMs", time.Since(started).Milliseconds())
 
-	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes))
+	layout := artifacts.BlockRootfsLayout
+	if sharedRootfsEnabled(spec) {
+		layout = artifacts.SharedRootfsLayout
+	}
+	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes), layout)
 }
 
 // loadSpecAndWorkdir reads the serialized SandboxTemplateSpec (the controller

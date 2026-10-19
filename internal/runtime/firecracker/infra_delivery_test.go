@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/artifacts"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 )
 
@@ -63,6 +64,23 @@ func TestDeliverGuestInfraSkipsEmptyPlan(t *testing.T) {
 	runner := &infraRunner{}
 	require.NoError(t, deliverGuestInfra(context.Background(), runner, "img", fastletinfra.PreparedInstance{}))
 	require.Empty(t, runner.commands)
+}
+
+func TestDeliverGuestInfraUsesPrivateDAXUpper(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, artifacts.SharedRootfsName)
+	require.NoError(t, os.WriteFile(base, []byte("immutable base"), 0o444))
+	runner := &infraRunner{}
+	err := deliverGuestInfra(context.Background(), runner, filepath.Join(root, "rootfs.img"), fastletinfra.PreparedInstance{Mounts: infraMounts(t)})
+	require.NoError(t, err)
+	for _, command := range runner.commands {
+		if strings.HasPrefix(command, "cp -a ") {
+			require.Contains(t, command, "/upper/.fast/")
+		}
+	}
+	payload, err := os.ReadFile(base)
+	require.NoError(t, err)
+	require.Equal(t, "immutable base", string(payload))
 }
 
 func TestDeliverGuestInfraUnmountsOnFailure(t *testing.T) {

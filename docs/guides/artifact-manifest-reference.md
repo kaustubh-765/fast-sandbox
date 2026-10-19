@@ -72,7 +72,7 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
 | `lineage.execd` | OpenSandbox execd image reference injected into the guest rootfs at build time. The injection happened during the build; this field records which execd the rootfs carries and is never re-resolved at runtime |
 | `lineage.kernel` | Guest kernel: `name` is the kernel file baked into the builder image, `digest` is its SHA-256. The kernel is a build-time asset only — nodes never carry one (restore is a vmstate resume that does not boot a kernel) — and it rides forward through snapshots |
 | `lineage.entrypoint` | The business command argv declared by the template. Already wired into the rootfs boot chain at build time; published verbatim as provenance/audit |
-| `lineage.init` | Path of the injected guest PID 1 (default `/usr/local/sbin/sandbox-init`; empty means no injection — the image's own init is responsible). A recorded build-time fact |
+| `lineage.init` | Path of the injected guest PID 1 (default `/usr/local/sbin/sandbox-init`; empty selects the default injected runtime init). A recorded build-time fact |
 | `lineage.envs` | The template envs published **verbatim** (no `valueFrom` support); written into the guest's `/etc/sandbox-init.env` at build time on top of the source image's inherited OCI `Config.Env` (not recorded here — recover it from `lineage.imageDigest` via the registry), overriding it per name. Never put secrets here — anyone who can read the manifest can read these values; credentials belong in `publishSecretRef` |
 | `lineage.egressMitmCA` | Present only when the template baked an egress MITM CA certificate (`spec.egressMitmCertificate`): `certificates[]` records, in the order they appear in the baked Secret entry, the public-key identity of every PEM CERTIFICATE block — `certSha256` (SHA-256 of the certificate DER, lowercase hex, matched byte-for-byte against the egress pinned-CA fingerprint on `/healthz`), `spkiSha256` (SHA-256 of the SubjectPublicKeyInfo DER — the key identity, stable across re-issuance with the same key), and `notAfter` (RFC3339, display-only: a baked CA expiring is a future outage visible in the manifest). Fingerprints only — never the Secret reference, the private key, or certificate bytes. Absent on builds without the field and on legacy artifacts: consumers treat that as "unknown" and skip template↔pool pinning comparisons rather than fail. Inherited verbatim like the rest of `lineage`, so restored sandboxes and checkpoints keep the record of which CA their rootfs trusts |
 | `machine` | The snapshot's resource triad: `vcpu` and `memory` are resource quantities (e.g. `"2"`, `"2Gi"`); `rootfs` is the actual rootfs capacity (the declared minimum rounded up to whole GiB, e.g. `"30Gi"`, matching `files["rootfs.ext4"].sizeBytes`). `vcpu`/`memory` are the restore-authoritative configuration — Firecracker refuses to restore with a memory size different from the one the vmstate was created with, so the create request's cpu/mem are only validated: a request below the snapshot memory is rejected explicitly. Snapshots inherit `vcpu`/`memory` verbatim from the source image; `rootfs` is rewritten per capture from the actual artifacts |
@@ -86,6 +86,27 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
 See also: [SandboxTemplate golden images](sandboxtemplate-golden-images.md),
 [Sandbox Snapshots](sandbox-snapshots.md),
 [Pause, resume, and snapshot integration](pause-resume-snapshot-integration.md).
+
+## Shared root filesystem dependency
+
+New DAX templates additionally carry `files["base.ext4"]` and:
+
+```json
+"sharedRootfs": {
+  "layout": "pmem-dax-v1",
+  "sha256": "<the base.ext4 sha256>",
+  "sizeBytes": 15485370368
+}
+```
+
+The size is positive and 2 MiB aligned. The metadata must match the file entry
+exactly. Unknown layouts, a missing base, and digest/size mismatches fail
+restore. An absent block selects the legacy block-root topology. In the DAX
+layout `rootfs.ext4` is the private upper disk, and `machine.rootfs` describes
+that disk. Live snapshot/checkpoint publication retains the dependency and
+base bytes. Node caches hard-link a single digest-addressed base inode into
+artifact sets and instance jails. Native and OverlayBD template packaging
+retain this regular-file base; it is never served as a ublk device.
 
 
 ## Large artifact transfers

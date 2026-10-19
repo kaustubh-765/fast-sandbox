@@ -42,6 +42,11 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 		// the immutable build directory and goes up with the artifacts.
 		{filepath.Join(workdir, "SHA256SUMS"), "SHA256SUMS"},
 	}
+	if _, err := os.Stat(filepath.Join(workdir, artifacts.SharedRootfsName)); err == nil {
+		entries = append(entries, struct{ local, key string }{filepath.Join(workdir, artifacts.SharedRootfsName), artifacts.SharedRootfsName})
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
 	if layers, err := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt")); err == nil {
 		for _, layer := range layers {
 			relative, err := filepath.Rel(workdir, layer)
@@ -196,7 +201,7 @@ func uploadWithRetry(ctx context.Context, aws string, args, env []string, local,
 // controller can surface it on the template status. It uses a merge Patch
 // touching only the two annotations to avoid racing kubelet's own status
 // updates. Standalone runs (E2E, local debugging) simply skip the report.
-func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error {
+func patchPodAnnotations(ctx context.Context, manifestRef, digest, layout string) error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		klog.V(2).InfoS("skipping pod annotation update (not running in a cluster)", "err", err)
@@ -214,17 +219,11 @@ func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error 
 	if name == "" {
 		return errors.New("POD_NAME is required to report build results")
 	}
-	refJSON, err := json.Marshal(manifestRef)
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]string{manifestRefAnnotation: manifestRef, digestAnnotation: digest, artifacts.RootfsLayoutAnnotation: layout}}})
 	if err != nil {
 		return err
 	}
-	digestJSON, err := json.Marshal(digest)
-	if err != nil {
-		return err
-	}
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":%s,"%s":%s}}}`,
-		manifestRefAnnotation, refJSON, digestAnnotation, digestJSON)
-	_, err = clientSet.CoreV1().Pods(namespace).Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	_, err = clientSet.CoreV1().Pods(namespace).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
 	return err
 }
 

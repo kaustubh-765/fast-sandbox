@@ -43,6 +43,7 @@ type snapshotAgentFake struct {
 	manifest    map[string]any
 	sums        string
 	missingFile string
+	rootfs      []byte
 }
 
 func (f *snapshotAgentFake) PublishImage(_ context.Context, _, kind, key, dir string) (PublishOutcome, error) {
@@ -58,6 +59,10 @@ func (f *snapshotAgentFake) PublishImage(_ context.Context, _, kind, key, dir st
 		return PublishOutcome{}, err
 	}
 	f.sums, f.kind, f.key = string(sums), kind, key
+	f.rootfs, err = os.ReadFile(filepath.Join(dir, "rootfs.ext4"))
+	if err != nil {
+		return PublishOutcome{}, err
+	}
 	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
 		if info, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil || info.Size() == 0 {
 			f.missingFile = name
@@ -662,4 +667,36 @@ func TestImportRestoreVaultDeliversBundleBeforeDataPlane(t *testing.T) {
 	fixture.driver.importRestoreVault(context.Background(), spec, "app-v1", vmstatePath, sandboxID)
 	_, imports = mover.snapshot()
 	require.Empty(t, imports)
+}
+
+func TestDAXSnapshotCapturesUpperAfterVMMBlockDrain(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	cached := filepath.Dir(cachedManifestPath(fixture.stateRoot, fixture.sandboxSpec.Spec.Image))
+	base := filepath.Join(cached, artifacts.SharedRootfsName)
+	require.NoError(t, os.WriteFile(base, make([]byte, 2<<20), 0o444))
+	sum, err := artifacts.SHA256File(base)
+	require.NoError(t, err)
+	doc, err := readSourceManifest(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
+	require.NoError(t, err)
+	doc["sharedRootfs"] = artifacts.SharedRootfs{Layout: artifacts.SharedRootfsLayout, SHA256: sum, SizeBytes: 2 << 20}
+	files, ok := doc["files"].(map[string]any)
+	if !ok {
+		files = map[string]any{}
+		doc["files"] = files
+	}
+	files[artifacts.SharedRootfsName] = map[string]any{"sha256": sum, "sizeBytes": 2 << 20}
+	payload, err := artifacts.MarshalManifest(doc)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(cachedManifestPath(fixture.stateRoot, fixture.sandboxSpec.Spec.Image), payload, 0o600))
+	instance := filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID)
+	require.NoError(t, os.Link(base, filepath.Join(instance, artifacts.SharedRootfsName)))
+	fixture.server.onSnapshot = func() {
+		require.NoError(t, os.WriteFile(filepath.Join(instance, instanceRootfsName), []byte("drained upper"), 0o600))
+	}
+	_, err = fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{SandboxID: sandboxID, SnapshotID: "dax-snapshot", TemplateName: "dax-output"})
+	require.NoError(t, err)
+	require.Equal(t, []byte("drained upper"), agent.rootfs)
+	require.Contains(t, agent.manifest, "sharedRootfs")
+	require.Contains(t, agent.manifest["files"], artifacts.SharedRootfsName)
 }
