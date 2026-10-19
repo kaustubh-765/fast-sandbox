@@ -6,6 +6,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -107,8 +109,9 @@ func WithEndpoint(endpoint string) Option {
 	return func(config *optionsConfig) { config.endpoint = endpoint }
 }
 
-// WithHTTPClient replaces the default HTTP client (5-minute request
-// timeout), e.g. to tune timeouts or the transport.
+// WithHTTPClient replaces the metadata HTTP client (default timeout: five
+// minutes). Artifact streams reuse its transport with a 30-minute timeout;
+// caller cancellation and deadlines apply to both.
 func WithHTTPClient(client *http.Client) Option {
 	return func(config *optionsConfig) { config.httpClient = client }
 }
@@ -142,6 +145,15 @@ func WithPeerGateway(base, routePrefix string) Option {
 	}
 }
 
+// A node serves many Fastlets concurrently. Atomic rename prevents partial
+// visibility but does not prevent duplicate multi-GiB downloads exhausting disk.
+// Fixed stripes bound lock memory; both image and checkpoint pulls use them.
+var artifactPullLocks [256]sync.Mutex
+
+func artifactPullLock(dir string) *sync.Mutex {
+	return &artifactPullLocks[sha256.Sum256([]byte(dir))[0]]
+}
+
 // PullImage resolves the addressing chain for image and materializes the
 // native artifact set in the local cache:
 //
@@ -168,6 +180,9 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (result
 		return fmt.Errorf("%w: image reference is required", runtimecontract.ErrInvalidConfig)
 	}
 	dir := imageDir(stateRoot, image)
+	lock := artifactPullLock(dir)
+	lock.Lock()
+	defer lock.Unlock()
 	if complete, err := cacheComplete(dir); err != nil {
 		return err
 	} else if complete {
@@ -227,6 +242,9 @@ func (c *Client) PullCheckpoint(ctx context.Context, stateRoot, reference, manif
 		return fmt.Errorf("%w: checkpoint manifestRef and artifactDigest are required", runtimecontract.ErrInvalidConfig)
 	}
 	dir := imageDir(stateRoot, reference)
+	lock := artifactPullLock(dir)
+	lock.Lock()
+	defer lock.Unlock()
 	if complete, err := cacheComplete(dir); err != nil {
 		return err
 	} else if complete {
@@ -302,6 +320,28 @@ func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactD
 // prefix drift) falls back to direct S3, so a broken gateway degrades to
 // stage-1 behavior without failing the pull.
 func (c *Client) getArtifact(ctx context.Context, storeKey string) (io.ReadCloser, error) {
+	// Large bases and legacy roots can exceed the metadata client's five-minute
+	// timeout. Keep a bounded streaming timeout and the caller's cancellation,
+	// without changing shared clients while concurrent pulls are active.
+	stream := *c
+	store := *c.s3
+	store.http = artifactHTTPClient(c.s3.http)
+	stream.s3 = &store
+	if c.peer != nil {
+		peer := *c.peer
+		peer.http = artifactHTTPClient(c.peer.http)
+		stream.peer = &peer
+	}
+	return stream.getArtifactStream(ctx, storeKey)
+}
+
+func artifactHTTPClient(client *http.Client) *http.Client {
+	stream := *client
+	stream.Timeout = 30 * time.Minute
+	return &stream
+}
+
+func (c *Client) getArtifactStream(ctx context.Context, storeKey string) (io.ReadCloser, error) {
 	if c.peer == nil {
 		return c.s3.get(ctx, storeKey)
 	}

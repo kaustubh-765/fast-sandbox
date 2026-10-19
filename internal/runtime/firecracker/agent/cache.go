@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -119,6 +120,11 @@ func cacheComplete(dir string) (bool, error) {
 // verifies. The object is fetched through the client, which routes artifact
 // bytes over the P2P gateway when configured (falling back to direct S3).
 func stageFile(ctx context.Context, c *Client, dir, storeKey string, file nativeFile) error {
+	// PullImage/PullCheckpoint serialize each artifact set. Remove only
+	// abandoned temporary members from an earlier interrupted download.
+	if err := removeStaleDownloads(dir, file.cache+".tmp-"); err != nil {
+		return err
+	}
 	target := filepath.Join(dir, file.cache)
 	match, err := fileMatches(target, file)
 	if err == nil && match {
@@ -157,9 +163,12 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		}
 	}()
 	digest := sha256.New()
-	written, err := io.Copy(tmp, io.TeeReader(body, digest))
+	written, err := io.CopyBuffer(sparseArtifactWriter{file: tmp}, io.TeeReader(body, digest), make([]byte, 256*1024))
 	if err != nil {
 		return fmt.Errorf("download %s: %w", file.publish, err)
+	}
+	if err := tmp.Truncate(written); err != nil {
+		return err
 	}
 	if written != file.sizeBytes {
 		return fmt.Errorf("artifact %s size mismatch: got %d bytes, want %d", file.publish, written, file.sizeBytes)
@@ -236,4 +245,19 @@ func fileMatches(path string, file nativeFile) (bool, error) {
 		return false, err
 	}
 	return hex.EncodeToString(digest.Sum(nil)) == file.sha256, nil
+}
+
+func removeStaleDownloads(dir, prefix string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), prefix) {
+			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
 }

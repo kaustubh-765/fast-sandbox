@@ -1,12 +1,17 @@
 package artifacts
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestSha256FileSparse verifies the sparse-aware hasher produces the same
@@ -52,5 +57,30 @@ func TestSha256FileSparse(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("sparse hash mismatch: got %s want %s", got, want)
+	}
+}
+
+func TestSHA256FileConcurrentInputs(t *testing.T) {
+	var workers sync.WaitGroup
+	failures := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		data := bytes.Repeat([]byte{byte(i + 1)}, 2<<20)
+		path := filepath.Join(t.TempDir(), "data")
+		require.NoError(t, os.WriteFile(path, data, 0o600))
+		want := SHA256Of(data)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			got, err := SHA256File(path)
+			if err == nil && got != want {
+				err = fmt.Errorf("concurrent digest mismatch")
+			}
+			failures <- err
+		}()
+	}
+	workers.Wait()
+	close(failures)
+	for err := range failures {
+		require.NoError(t, err)
 	}
 }

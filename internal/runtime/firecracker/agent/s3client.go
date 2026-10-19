@@ -34,7 +34,7 @@ func (e *httpError) Error() string {
 	if len(body) > 200 {
 		body = body[:200] + "..."
 	}
-	return fmt.Sprintf("S3 GET failed with status %d: %s", e.StatusCode, body)
+	return fmt.Sprintf("S3 request failed with status %d: %s", e.StatusCode, body)
 }
 
 const (
@@ -155,6 +155,13 @@ func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open fu
 	urlString, err := c.objectURL(key)
 	if err != nil {
 		return err
+	}
+	if size > singlePutLimit {
+		partSize := max(int64(64<<20), (size-1)/10000+1)
+		if partSize > singlePutLimit {
+			return fmt.Errorf("object exceeds S3 multipart capacity")
+		}
+		return c.putMultipart(ctx, urlString, size, partSize, open)
 	}
 	backoff := c.retryDelay
 	var lastErr error
@@ -461,7 +468,7 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 	return hmacSHA256(key, "aws4_request")
 }
 
-// signWrite applies AWS Signature Version 4 to a PUT with the write
+// signWrite applies AWS Signature Version 4 to a write request with the write
 // credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
 // promise a content hash header without a second full read.
 func (c *s3Client) signWrite(request *http.Request) {
@@ -481,7 +488,7 @@ func (c *s3Client) signWrite(request *http.Request) {
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
-		http.MethodPut,
+		request.Method,
 		canonicalURI,
 		request.URL.RawQuery,
 		canonicalHeaders,

@@ -19,6 +19,9 @@ import (
 // them (holes are semantically zero), so multi-GiB sparse roots are not read
 // in full. Dense files fall back to a plain full read.
 func SHA256File(path string) (string, error) { //nolint:gocognit // pre-existing sparse-hash state machine; refactor tracked separately
+	// Each call owns its scratch space: snapshot/restore workers hash in
+	// parallel and must never overwrite another digest's input buffer.
+	hashBuffer := make([]byte, 4*1024*1024)
 	handle, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -96,10 +99,6 @@ func SHA256File(path string) (string, error) { //nolint:gocognit // pre-existing
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
-
-// hashBuffer keeps a large read buffer for hashing so high-latency storage
-// does not dominate the phase with syscall round trips.
-var hashBuffer = make([]byte, 4*1024*1024)
 
 // scanSparse walks the SEEK_DATA/SEEK_HOLE map of a file without reading
 // payload and returns the total data bytes and the segment count. ENXIO is

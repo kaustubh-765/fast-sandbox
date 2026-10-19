@@ -86,3 +86,14 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
 See also: [SandboxTemplate golden images](sandboxtemplate-golden-images.md),
 [Sandbox Snapshots](sandbox-snapshots.md),
 [Pause, resume, and snapshot integration](pause-resume-snapshot-integration.md).
+
+
+## Large artifact transfers
+
+The runtime agent uses streaming multipart uploads for artifact files larger
+than 5 GiB. Its write credential must also permit `s3:AbortMultipartUpload`;
+failed or cancelled uploads are aborted. Configure the store's lifecycle policy
+to remove abandoned multipart uploads after an agent or node crash. Artifact
+downloads allow up to 30 minutes per stream, bounded by the caller deadline;
+metadata requests retain their shorter timeout. This applies to both direct S3
+and P2P downloads, including large legacy root images.

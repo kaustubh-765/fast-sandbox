@@ -497,3 +497,23 @@ func TestPullCheckpointRequiresAddress(t *testing.T) {
 	require.Error(t, (&Client{s3: client}).PullCheckpoint(t.Context(), t.TempDir(), "", "s3://b/m.json", "digest"))
 	require.Error(t, (&Client{s3: client}).PullCheckpoint(t.Context(), t.TempDir(), artifacts.CheckpointReference("d"), "", ""))
 }
+
+func TestConcurrentFastletsPullImageOnce(t *testing.T) {
+	store, s3, manifest, _ := publishFixture(t)
+	client := &Client{s3: s3}
+	root := t.TempDir()
+	var workers sync.WaitGroup
+	failures := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		workers.Add(1)
+		go func() { defer workers.Done(); failures <- client.PullImage(context.Background(), root, testImage) }()
+	}
+	workers.Wait()
+	close(failures)
+	for err := range failures {
+		require.NoError(t, err)
+	}
+	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
+		require.Equal(t, 1, store.countRequested(sha256Hex(manifest)[:16]+"/"+name))
+	}
+}
