@@ -11,11 +11,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // createOptions holds the create-command flags (ADR-007/009/010). The machine
 // sizing is fixed by the snapshot, so create takes no vCPU/memory flags.
 type createOptions struct {
+	prepareOnly  bool
 	templateFile string
 	kernel       string
 	network      string
@@ -32,6 +35,7 @@ func newCreateCommand() *cobra.Command {
 		},
 	}
 	flags := command.Flags()
+	flags.BoolVar(&options.prepareOnly, "prepare-only", false, "attach template disks for an external Firecracker lifecycle owner")
 	flags.StringVarP(&options.templateFile, "file", "f", "", "path to template.json (required)")
 	flags.StringVar(&options.kernel, "kernel", "", "override the resolved vmlinux path")
 	flags.StringVar(&options.network, "network", networkNone, "network provider (only 'none' is supported)")
@@ -84,7 +88,7 @@ func (r *rollback) run() error {
 
 func (r *rollback) disarm() { r.steps = nil }
 
-func runCreate(ctx context.Context, options *createOptions) error {
+func runCreate(ctx context.Context, options *createOptions) error { //nolint:gocognit // ordered device transaction keeps rollback ownership visible
 	provider, err := selectNetworkProvider(options.network)
 	if err != nil {
 		return err
@@ -104,6 +108,9 @@ func runCreate(ctx context.Context, options *createOptions) error {
 	if err := ublkd.Ping(ctx); err != nil {
 		return err
 	}
+	if err := resolveTemplate(ctx, &template, dockerAuth); err != nil {
+		return err
+	}
 
 	release, err := lockSandbox(template.SandboxID)
 	if err != nil {
@@ -116,15 +123,16 @@ func runCreate(ctx context.Context, options *createOptions) error {
 		return err
 	}
 	state := &sandboxState{
-		SandboxID:    template.SandboxID,
-		Phase:        phaseCreating,
-		RootfsRef:    template.rootfsRef(),
-		SnapfilesRef: template.snapfilesRef(),
-		Network:      provider.Name(),
-		MountPoint:   layout.mountPoint,
-		APISocket:    layout.apiSocket,
-		SerialLog:    layout.serialLog,
-		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		SandboxID:        template.SandboxID,
+		Phase:            phaseCreating,
+		RootfsRef:        template.rootfsRef(),
+		SnapfilesRef:     template.snapfilesRef(),
+		TemplateMetadata: template.Metadata,
+		Network:          provider.Name(),
+		MountPoint:       layout.mountPoint,
+		APISocket:        layout.apiSocket,
+		SerialLog:        layout.serialLog,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
 	// The creating record is the first durable write: from here on a crash
 	// leaves state.json behind, and delete reclaims whatever was allocated.
@@ -148,16 +156,7 @@ func runCreate(ctx context.Context, options *createOptions) error {
 	}()
 	persist := func() error { return writeState(layout.home, state) }
 
-	// Step 2: resolve both manifests into ordered lower-layer lists.
-	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
-	if err != nil {
-		return err
-	}
-	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
-	if err != nil {
-		return err
-	}
-
+	// Synchronize credentials before resolving manifests, including failed creates.
 	// Step 3: hand the credential to overlaybd's global cred.json before any
 	// device add, or overlaybd's on-demand pulls fail with 401.
 	handoff, err := overlaybdCredentials(dockerAuth, state.RootfsRef, state.SnapfilesRef)
@@ -168,8 +167,18 @@ func runCreate(ctx context.Context, options *createOptions) error {
 		return err
 	}
 
+	// Step 2: resolve both manifests into ordered lower-layer lists.
+	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
+	if err != nil {
+		return err
+	}
+	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
+	if err != nil {
+		return err
+	}
+
 	// Step 4/5: the snapfiles device is attached and mounted first (a minor
-	// reordering of the ADR's illustrative sequence) because metadata.json —
+	// reordering of the ADR's illustrative sequence) because manifest.json —
 	// which lives on it — supplies the disk size that sets the rootfs hybrid
 	// upper's virtual size. Attaching snapfiles read-only carries no such
 	// dependency, so it is the safe first step.
@@ -185,18 +194,18 @@ func runCreate(ctx context.Context, options *createOptions) error {
 		return err
 	}
 
-	metadata, err := loadMetadata(filepath.Join(layout.mountPoint, inDiskMetadata))
+	metadata, err := loadManifest(filepath.Join(layout.mountPoint, inDiskManifest))
 	if err != nil {
 		return err
 	}
-	if err := metadata.validate(global.firecrackerBin, options.force); err != nil {
+	if err := validateManifest(metadata, global.firecrackerBin, options.force); err != nil {
 		return err
 	}
-	state.VCPU, state.MemoryMB = metadata.VCPUCount, metadata.MemoryMB
+	state.VCPU, state.MemoryMB = metadata.Machine.VCPUCount, int(metadata.Machine.MemoryMiB)
 
 	// rootfs device: create the hybrid writable upper sized from the
 	// authoritative disk size, then attach it.
-	rootfsConfig, err := writeRootfsConfig(ctx, layout.home, rootfsImage, metadata.DiskSizeMB)
+	rootfsConfig, err := writeRootfsConfig(ctx, layout.home, rootfsImage, int(metadata.Machine.RootfsSizeMiB))
 	if err != nil {
 		return err
 	}
@@ -205,10 +214,14 @@ func runCreate(ctx context.Context, options *createOptions) error {
 		return err
 	}
 
+	if options.prepareOnly {
+		created = true
+		return nil
+	}
 	// Step 6: resolve the kernel path (ADR-004). Firecracker snapshot restore
 	// carries the guest kernel in the memory state, but the ADR requires the
 	// host-local vmlinux to be present and version-matched.
-	if _, err := resolveKernel(global.kernelDir, metadata.KernelVersion, options.kernel); err != nil {
+	if _, err := resolveKernel(global.kernelDir, metadata.Kernel.Version, options.kernel); err != nil {
 		return err
 	}
 
@@ -287,7 +300,7 @@ func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, re
 // first API call (v1.16 rejects prior device/machine config) and opens the
 // rootfs drive through the relative rootfs.dev link; the network is then
 // acquired and the VM resumed (ADR create flow §7).
-func resumeVM(ctx context.Context, layout sandboxLayout, metadata vmMetadata, provider networkProvider) error {
+func resumeVM(ctx context.Context, layout sandboxLayout, metadata artifacts.VMManifest, provider networkProvider) error {
 	client := newFirecrackerClient(layout.apiSocket)
 	defer client.close()
 
@@ -323,15 +336,20 @@ func resumeVM(ctx context.Context, layout sandboxLayout, metadata vmMetadata, pr
 	return nil
 }
 
-// resolveKernel maps metadata.kernel_version to a host-local vmlinux path
+// resolveKernel maps manifest.kernel.version to a host-local vmlinux path
 // (ADR-004). An explicit override wins; a missing file is a hard error.
 func resolveKernel(kernelDir, kernelVersion, override string) (string, error) {
 	path := override
 	if path == "" {
-		path = filepath.Join(kernelDir, "vmlinux-"+kernelVersion)
+		name := "vmlinux-" + kernelVersion
+		// The standard Builder records its unversioned default filename.
+		if kernelVersion == "vmlinux.bin" {
+			name = kernelVersion
+		}
+		path = filepath.Join(kernelDir, name)
 	}
 	if _, err := os.Stat(path); err != nil {
-		return "", fmt.Errorf("kernel %s not found (kernel_version %q): %w", path, kernelVersion, err)
+		return "", fmt.Errorf("kernel %s not found (kernel.version %q): %w", path, kernelVersion, err)
 	}
 	return path, nil
 }

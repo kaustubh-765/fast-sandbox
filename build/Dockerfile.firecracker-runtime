@@ -7,6 +7,7 @@
 # external dependencies, Apache-2.0); the pin is recorded in the image
 # label com.fast-sandbox.dart-rev and the version file below.
 
+ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
 ARG DART_REV=a85f39f13d81241b3d57f7f7fe7b7c84d58b7aa2
 
 # Firecracker assets baked in (fc-assets stage below): the hostready
@@ -14,6 +15,9 @@ ARG DART_REV=a85f39f13d81241b3d57f7f7fe7b7c84d58b7aa2
 # match hostready.DefaultFCVersion (asserted by assets_test.go). No guest
 # kernel: snapshots bake their own and restore never boots one (#84).
 ARG FC_VERSION=v1.16.1
+
+# --- shared OCI artifacts ------------------------------------------------
+FROM ${OCI_TOOLS_IMAGE} AS oci-tools
 
 # --- dart (P2P daemon, pinned) ------------------------------------------------
 FROM golang:1.25 AS dart-build
@@ -49,8 +53,13 @@ RUN apk add --no-cache curl \
     && sha256sum -c SHA256SUMS
 
 # --- runtime image -----------------------------------------------------------
-FROM alpine:3.19
-RUN apk add --no-cache curl
+FROM ubuntu:22.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates curl util-linux coreutils libaio1 libcurl4 libssl3 libzstd1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=oci-tools /bundle /usr/local/share/fast-sandbox/oci-tools
+COPY build/oci/install-tools.sh /usr/local/bin/install-oci-tools
+COPY build/oci/node-daemon.sh /usr/local/bin/overlaybd-node
 
 ARG DART_REV
 COPY --from=dart-build /out/dart /usr/local/bin/dart

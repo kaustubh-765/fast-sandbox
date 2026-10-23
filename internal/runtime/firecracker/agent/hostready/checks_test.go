@@ -1,6 +1,7 @@
 package hostready
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,6 +35,7 @@ func (f fakeProbes) probes(assetsDir string) Probes {
 		}
 	}
 	return Probes{
+		CheckOCI:      func(context.Context) error { return nil },
 		OpenDevice:    f.openDevice,
 		StatFS:        f.statFS,
 		KernelRelease: f.kernelRelease,
@@ -205,6 +207,43 @@ func TestRunChecksRequiresXFSAndReflink(t *testing.T) {
 	}
 }
 
+func TestOCIReadinessSkipsXFSAndReflinkWithWarning(t *testing.T) {
+	for _, fsType := range []string{"ext4", "btrfs", "xfs"} {
+		t.Run(fsType, func(t *testing.T) {
+			probes, assets := healthyProbes(t)
+			probes.statFS = func(string) (FsStat, error) {
+				return FsStat{Type: fsType, FreeBytes: 100 << 30, TotalBytes: 200 << 30}, nil
+			}
+			probes.reflinkProbe = func(string) (bool, error) {
+				t.Fatal("OCI readiness must skip the reflink probe")
+				return false, nil
+			}
+			report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets, OCIEnabled: true}, probes.probes(assets))
+			require.True(t, report.Ready, report.String())
+			check := checkByName(report, "stateroot-filesystem")
+			require.Equal(t, StatusWarn, check.Status)
+			require.Contains(t, check.Detail, "skipping XFS/reflink validation")
+			require.Contains(t, check.Detail, "native template")
+			require.Contains(t, check.Detail, "snapshot pause")
+		})
+	}
+}
+
+func TestOCIReadinessStillRequiresFilesystemAndFreeSpace(t *testing.T) {
+	for _, brokenStat := range []bool{false, true} {
+		probes, assets := healthyProbes(t)
+		probes.statFS = func(string) (FsStat, error) {
+			if brokenStat {
+				return FsStat{}, errors.New("statfs failed")
+			}
+			return FsStat{Type: "ext4", FreeBytes: 1 << 30, TotalBytes: 100 << 30}, nil
+		}
+		report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets, OCIEnabled: true}, probes.probes(assets))
+		require.False(t, report.Ready)
+		require.Equal(t, StatusFail, checkByName(report, "stateroot-filesystem").Status)
+	}
+}
+
 func TestRunChecksAssetsMissing(t *testing.T) {
 	probes, assets := healthyProbes(t)
 	missing := filepath.Join(t.TempDir(), "assets")
@@ -272,6 +311,19 @@ func TestParseBytes(t *testing.T) {
 	for _, value := range []string{"", "abc", "10TB"} {
 		if _, err := ParseBytes(value); err == nil {
 			t.Fatalf("ParseBytes(%q) must fail", value)
+		}
+	}
+}
+
+func TestOCIDaemonFailureBlocksOnlyEnabledNodes(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		fake, assets := healthyProbes(t)
+		probes := fake.probes(assets)
+		probes.CheckOCI = func(context.Context) error { return errors.New("daemon unavailable") }
+		report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets, OCIEnabled: enabled}, probes)
+		require.Equal(t, !enabled, report.Ready, report.String())
+		if enabled {
+			require.Equal(t, StatusFail, checkByName(report, "oci-runtime").Status)
 		}
 	}
 }

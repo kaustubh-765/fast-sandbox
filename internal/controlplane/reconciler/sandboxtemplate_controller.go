@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +29,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
+	"fast-sandbox/internal/ocitemplate"
 )
 
 const (
@@ -57,6 +59,9 @@ const (
 // builderImageEnv is the environment variable carrying the serialized
 // SandboxTemplate spec into the build Pod.
 const builderImageEnv = "SANDBOX_TEMPLATE_SPEC"
+
+// Persist the pair ID in the build Pod so reconciler retries reuse it.
+const buildIDEnvName = "SANDBOX_TEMPLATE_BUILD_ID"
 
 // sandboxTemplateBuildLabel links a build Pod to its SandboxTemplate (name
 // and namespace; the Pod also carries an owner reference — the labels let
@@ -507,6 +512,21 @@ var errArtifactStoreUnconfigured = errors.New("no platform artifact store is con
 // publishing where no node agent reads. Trailing slashes are ignored in the
 // comparison because the builder strips them when naming objects.
 func (r *SandboxTemplateReconciler) effectiveOutput(output apiv1alpha2.OutputSpec, storeRoot string) (apiv1alpha2.OutputSpec, error) {
+	if strings.HasPrefix(output.Publish, "oci://") {
+		if output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
+			return output, fmt.Errorf("OCI templates require overlaybd format")
+		}
+		if err := ocitemplate.ValidatePublishRepository(output.Publish); err != nil {
+			return output, err
+		}
+		if output.PublishSecretRef == nil || strings.TrimSpace(output.PublishSecretRef.Name) == "" {
+			return output, fmt.Errorf("OCI templates require output.publishSecretRef with a Secret name containing .dockerconfigjson")
+		}
+		return output, nil
+	}
+	if output.Format != apiv1alpha2.ArtifactFormatNative {
+		return output, fmt.Errorf("object-store templates require output.format=native; overlaybd requires output.publish=oci://...")
+	}
 	if output.Publish == "" {
 		if storeRoot == "" {
 			return output, fmt.Errorf("%w: spec.output.publish is empty (set output.publish or configure the controller artifact store)", errArtifactStoreUnconfigured)
@@ -523,7 +543,7 @@ func (r *SandboxTemplateReconciler) effectiveOutput(output apiv1alpha2.OutputSpe
 // createBuildPod launches the builder Pod that executes the pipeline. The
 // template spec — with the effective (platform-defaulted) output — is
 // serialized into the environment; the builder image runs the stages
-// (convert → validate-boot → snapshot → package) and publishes the
+// (native object-store build or OverlayBD OCI build) and publishes the
 // artifacts. The Pod runs in the template's namespace (so it can carry
 // an owner reference and the publish secret can be SecretKeyRef'd from the
 // same namespace) and has a deterministic name (<template>-build-<gen>) so
@@ -580,6 +600,11 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 				Path: "/dev/net/tun", Type: ptr(corev1.HostPathCharDev),
 			}},
 		},
+	}
+	if strings.HasPrefix(output.Publish, "oci://") {
+		env = append(env, corev1.EnvVar{Name: buildIDEnvName, Value: uuid.NewString()})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "host-dev", MountPath: "/dev"})
+		volumes = append(volumes, corev1.Volume{Name: "host-dev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr(corev1.HostPathDirectory)}}})
 	}
 	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
 		env = append(env, corev1.EnvVar{Name: publishCredentialsDirEnv, Value: sandboxTemplatePublishSecretDir})

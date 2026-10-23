@@ -223,8 +223,10 @@ Rules to surface in your API:
 - After `Failed`, issue a new snapshot with a new `request_id`; nothing the
   failed attempt produced is addressable.
 - `DeleteSandboxSnapshot` removes the object (idempotent; `expected_uid`
-  fenced) but **never unpublishes the artifacts** — store lifecycle is
-  managed out of band.
+  fenced). For OCI snapshots, its finalizer deletes both published image
+  manifests before removing the CR; deletion failures are retried. Shared
+  blobs are left to registry GC. Native + S3 keeps its existing out-of-band
+  artifact lifecycle.
 
 ### Boot from the snapshot
 

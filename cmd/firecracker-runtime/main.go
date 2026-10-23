@@ -23,6 +23,7 @@ import (
 
 	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/observability"
+	"fast-sandbox/internal/ocitemplate"
 	"fast-sandbox/internal/registryconfig"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentdart "fast-sandbox/internal/runtime/firecracker/agent/dart"
@@ -251,6 +252,9 @@ func (l *livePullClient) current() (*agentpull.Client, error) {
 
 // PullImage pulls one image with a client built from the current config.
 func (l *livePullClient) PullImage(ctx context.Context, stateRoot, image string) error {
+	if strings.HasPrefix(image, ocitemplate.Prefix) {
+		return fmt.Errorf("OCI storage must be prepared by fsb-vm with Fastlet registry credentials")
+	}
 	client, err := l.current()
 	if err != nil {
 		return err
@@ -403,6 +407,7 @@ func readinessSettings(configPath, stateRoot string) func() (agenthostready.Sett
 		return agenthostready.Settings{
 			Check: agenthostready.CheckConfig{
 				StateRoot:    stateRoot,
+				OCIEnabled:   getEnv("FAST_SANDBOX_OCI_ENABLED", "false") == "true",
 				AssetsDir:    readiness.AssetsDir,
 				MinFreeBytes: minFree,
 				MinMemBytes:  minMemory,

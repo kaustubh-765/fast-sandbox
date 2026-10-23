@@ -92,6 +92,8 @@ func TestCreateSandboxSnapshotPersistsTriggersAndProjects(t *testing.T) {
 	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseCreating, persisted.Status.Phase)
 	require.Equal(t, "fastlet-a", persisted.Status.FastletName)
 	require.NotEmpty(t, persisted.Status.SnapshotID)
+	require.Contains(t, persisted.Finalizers, assignment.SnapshotCleanupFinalizer, "protect artifacts before the direct Fastlet trigger")
+	require.Equal(t, "pool-a", persisted.Annotations[assignment.AnnotationSnapshotPoolRef])
 }
 
 func TestCreateSandboxSnapshotReplaysIdempotently(t *testing.T) {
@@ -104,6 +106,30 @@ func TestCreateSandboxSnapshotReplaysIdempotently(t *testing.T) {
 	var list apiv1alpha2.SandboxSnapshotList
 	require.NoError(t, k8sClient.Client.List(context.Background(), &list, client.InNamespace("default")))
 	require.Len(t, list.Items, 1, "replay must not persist a second object")
+}
+
+func TestCreateOCISnapshotWithoutTemplateName(t *testing.T) {
+	server, k8sClient, _ := newSnapshotServer(t)
+	for _, name := range []string{"sandbox-a", "sandbox-b"} {
+		var sandbox apiv1alpha2.Sandbox
+		require.NoError(t, k8sClient.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: name}, &sandbox))
+		sandbox.Spec.Image = "oci://r.example/ns/template:base"
+		require.NoError(t, k8sClient.Update(t.Context(), &sandbox))
+		request := snapshotCreateRequest("snapshot-"+name, "")
+		request.Sandbox.NamespacedName.Name = name
+		request.Sandbox.ExpectedUid = string(sandbox.UID)
+		response, err := server.CreateSandboxSnapshot(t.Context(), request)
+		require.NoError(t, err, "independent unnamed OCI snapshots must not share a template-name fence")
+		require.NotEmpty(t, response.Snapshot.SnapshotId)
+		require.Empty(t, response.Snapshot.TemplateName)
+	}
+}
+
+func TestNativeSnapshotStillRequiresTemplateName(t *testing.T) {
+	server, _, _ := newSnapshotServer(t)
+	_, err := server.CreateSandboxSnapshot(t.Context(), snapshotCreateRequest("snapshot-a", ""))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, "template_name is required for a native snapshot")
 }
 
 func TestCreateSandboxSnapshotOmittedNamespaceReplayMatchesExplicit(t *testing.T) {
@@ -318,7 +344,10 @@ func TestGetAndDeleteSandboxSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	var list apiv1alpha2.SandboxSnapshotList
 	require.NoError(t, server.K8sClient.List(context.Background(), &list, client.InNamespace("default")))
-	require.Empty(t, list.Items)
+	require.Len(t, list.Items, 1)
+	require.NotNil(t, list.Items[0].DeletionTimestamp, "finalizer must wait for cleanup")
+	_, err = server.CreateSandboxSnapshot(t.Context(), snapshotCreateRequest("snap-a", "app-v2"))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err), "a deleting snapshot cannot restart publication")
 
 	_, err = server.DeleteSandboxSnapshot(context.Background(), &fastpathv2.DeleteSandboxSnapshotRequest{
 		Snapshot: &fastpathv2.SandboxReference{NamespacedName: &fastpathv2.NamespacedName{Name: "snap-a", Namespace: "default"}},

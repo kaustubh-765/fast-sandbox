@@ -14,9 +14,12 @@ type templateFile struct {
 	Metadata  json.RawMessage `json:"metadata,omitempty"`
 }
 
-// templateRef identifies the remote template: repo + template_id name the
-// image pair, and auth carries the registry credential.
+// templateRef accepts a platform reference or an explicit image pair.
+// Existing repo + template_id inputs name the pair by convention.
 type templateRef struct {
+	Reference  string       `json:"reference,omitempty"`
+	Rootfs     string       `json:"rootfs,omitempty"`
+	Snapfiles  string       `json:"snapfiles,omitempty"`
 	Repo       string       `json:"repo"`
 	TemplateID string       `json:"template_id"`
 	Auth       templateAuth `json:"auth"`
@@ -33,12 +36,18 @@ type templateAuth struct {
 // rootfsRef returns the overlaybd rootfs image reference
 // (${repo}:${template_id}_rootfs).
 func (t templateFile) rootfsRef() string {
+	if t.Template.Rootfs != "" {
+		return t.Template.Rootfs
+	}
 	return fmt.Sprintf("%s:%s_rootfs", t.Template.Repo, t.Template.TemplateID)
 }
 
 // snapfilesRef returns the overlaybd snapfiles image reference
 // (${repo}:${template_id}_snapfiles).
 func (t templateFile) snapfilesRef() string {
+	if t.Template.Snapfiles != "" {
+		return t.Template.Snapfiles
+	}
 	return fmt.Sprintf("%s:%s_snapfiles", t.Template.Repo, t.Template.TemplateID)
 }
 
@@ -64,6 +73,15 @@ func loadTemplate(path string) (templateFile, error) {
 	// The id names directories under the state and runtime roots.
 	if err := validateSandboxID(template.SandboxID); err != nil {
 		return templateFile{}, fmt.Errorf("template %s: %w", path, err)
+	}
+	if template.Template.Reference != "" {
+		if template.Template.Rootfs != "" || template.Template.Snapfiles != "" || template.Template.Repo != "" || template.Template.TemplateID != "" {
+			return templateFile{}, fmt.Errorf("template.reference cannot be combined with explicit pair references")
+		}
+		return template, nil
+	}
+	if template.Template.Rootfs != "" && template.Template.Snapfiles != "" {
+		return template, nil
 	}
 	if strings.TrimSpace(template.Template.Repo) == "" {
 		return templateFile{}, fmt.Errorf("template %s: template.repo is required", path)

@@ -1,13 +1,19 @@
 package hostready
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
+
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 )
 
 // FsStat is the filesystem summary of one directory.
@@ -25,6 +31,8 @@ type FsStat struct {
 // selects the real platform probes; tests inject fakes so the suite runs on
 // any OS without /dev/kvm or /proc.
 type Probes struct {
+	// CheckOCI checks the node-installed tool bundle and daemon socket.
+	CheckOCI func(context.Context) error
 	// OpenDevice opens a device path for reading and writing (KVM, TUN).
 	OpenDevice func(path string) error
 	// StatFS summarizes the filesystem holding path.
@@ -69,6 +77,8 @@ func verifyBinary(path string) error {
 type CheckConfig struct {
 	// StateRoot is the agent state root (directories are created here).
 	StateRoot string
+	// OCIEnabled skips the XFS/reflink requirement with a performance warning.
+	OCIEnabled bool
 	// AssetsDir is the Firecracker asset directory (binary/jailer).
 	AssetsDir string
 	// MinFreeBytes is the minimum free space on the StateRoot filesystem.
@@ -114,6 +124,20 @@ func RunChecks(config CheckConfig, probes Probes) Report {
 	checkStateRootDirs(&report, config)
 	checkStateRootFS(&report, probes, config)
 	checkAssets(&report, config, probes)
+	if config.OCIEnabled {
+		probe := probes.CheckOCI
+		if probe == nil {
+			probe = CheckOCI
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := probe(ctx)
+		cancel()
+		if err != nil {
+			report.fail("oci-runtime", err.Error())
+		} else {
+			report.pass("oci-runtime", "node tools and ublkd are ready")
+		}
+	}
 	report.summarize()
 	return report
 }
@@ -276,7 +300,7 @@ func checkStateRootDirs(report *Report, config CheckConfig) {
 
 // checkStateRootFS reports the StateRoot filesystem type, verifies the free
 // space floor, and probes reflink support (CoW rootfs copies turn a ~2.5s
-// clone into ~1ms on XFS). Non-XFS or failed reflink checks block readiness.
+// clone into ~1ms on XFS). OCI mode skips XFS/reflink validation with a warning.
 func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 	fs, err := probes.StatFS(config.StateRoot)
 	if err != nil {
@@ -284,12 +308,16 @@ func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 		return
 	}
 	free := fmt.Sprintf("%d GiB free of %d GiB", fs.FreeBytes>>30, fs.TotalBytes>>30)
-	if fs.Type != "xfs" {
-		report.fail("stateroot-filesystem", fmt.Sprintf("StateRoot %s must use XFS with reflink=1; found type %s", config.StateRoot, fs.Type))
-		return
-	}
 	if fs.FreeBytes < config.MinFreeBytes {
 		report.fail("stateroot-filesystem", fmt.Sprintf("type %s, %s (minimum %d GiB)", fs.Type, free, config.MinFreeBytes>>30))
+		return
+	}
+	if config.OCIEnabled {
+		report.warn("stateroot-filesystem", fmt.Sprintf("type %s, %s; FAST_SANDBOX_OCI_ENABLED=true: skipping XFS/reflink validation; native template rootfs copies may take longer and extend snapshot pause windows", fs.Type, free))
+		return
+	}
+	if fs.Type != "xfs" {
+		report.fail("stateroot-filesystem", fmt.Sprintf("StateRoot %s must use XFS with reflink=1; found type %s", config.StateRoot, fs.Type))
 		return
 	}
 	reflinked, reflinkErr := probes.ReflinkProbe(config.StateRoot)
@@ -348,4 +376,35 @@ func ParseBytes(value string) (int64, error) {
 		return 0, fmt.Errorf("parse %q: expected a byte size like 10GiB", value)
 	}
 	return number, nil
+}
+
+// CheckOCI verifies tools and the node daemon independently of the agent API.
+func CheckOCI(ctx context.Context) error {
+	root := filepath.Join(runtimecatalog.OCIToolsDir, "current")
+	for _, name := range []string{"bin/fsb-vm", "bin/overlaybd-create", "bin/overlaybd-commit", "bin/overlaybd-resize", "bin/overlaybd-import-raw"} {
+		info, err := os.Stat(filepath.Join(root, name))
+		if err != nil {
+			return fmt.Errorf("OCI tool %s: %w", name, err)
+		}
+		if info.Mode()&0111 == 0 {
+			return fmt.Errorf("OCI tool %s is not executable", name)
+		}
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"))
+	}}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://ublkd/v1/ping", nil)
+	if err != nil {
+		return err
+	}
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		return fmt.Errorf("node ublkd: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("node ublkd ping returned %s", response.Status)
+	}
+	return nil
 }

@@ -137,8 +137,10 @@ Common global options:
 | --- | --- | --- |
 | `--ublkd-socket` | `/var/run/overlaybd-ublk/ublkd.sock` | ublkd control socket |
 | `--cred-file` | `/opt/overlaybd/cred.json` | OverlayBD global credential file |
+| `--reject-credential-conflicts` | `false` | Reject account changes in a shared daemon credential file |
 | `--kernel-dir` | `/opt/fsb-vm/kernels` | Default directory for `vmlinux-<version>` during create |
 | `--state-dir` | `/var/lib/fsb-vm/sandboxes` | Persistent sandbox state root |
+| `--manifest-cache-dir` | `<state-dir>/.manifest-cache` | Immutable registry metadata cache; may be shared independently of sandbox state |
 | `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket and serial-log root |
 | `--firecracker` | `firecracker` | Firecracker executable |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
@@ -153,6 +155,21 @@ sudo "$FSB_VM" --plain-http --state-dir "$STATE_DIR" list
 ```
 
 ## 4. Build a template
+
+For Kubernetes SandboxTemplate builds, set `spec.output.publish` to the repository
+only, for example `oci://registry.example.com/team/templates`, without a tag or
+digest. The controller assigns a random UUID to each build Pod; the builder
+publishes `<uuid>_rootfs` and `<uuid>_snapfiles` and returns the immutable
+snapfiles digest in `status.manifestRef`. A new spec generation receives a new
+UUID, while reconciliation retries reuse the existing Pod's UUID. Applying an
+unchanged spec does not rebuild. See [OCI template rebuilds](overlaybd-oci-sandboxes.md#rebuilds-and-generated-tags)
+for migration from tagged publish addresses.
+
+The standard `SandboxTemplate` builder image includes `fsb-vm`, the convertor and OverlayBD tools. For `oci://` output, the builder starts ublkd, reads the source manifest/config to pin the linux/amd64 image digest and prepare environment variables and runtime injections, then passes the remote digest reference directly to `fsb-vm build`. The `fsb-vm` build flow reads the source layers; the builder does not stage an OCI layout or start a local registry. The `format: native` object-store path retains `pullOCILayout → oci2rootfs`. OverlayBD is supported only with OCI publication, not S3. `SANDBOX_TEMPLATE_IMAGE_TAR` is supported only on that object-store path and is rejected for OCI output. OCI builds require access to both source and destination registries.
+
+The standard Fastlet image built with `build/Dockerfile.fastlet` includes the OCI runtime tools. Set `FAST_SANDBOX_OCI_ENABLED=true` in an OCI Firecracker Pool to start ublkd; it is disabled by default so other runtime deployments do not require ublk. The standard builder uses `auto` mode so non-OCI builds do not require ublk. OCI registry access supports anonymous or username/password authentication, including Docker config `auth` entries. Identity-token-only credentials are rejected; when both are present, username/password credentials are used. The public registry credential fields and other runtimes are unchanged.
+
+Checkpoints default to the source template repository; `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY=registry/repository` overrides the destination. The selected destination credential must allow push (use the registry rule's `writeSecretRef` for a separate write account). Checkpoint publication selects parent-read and destination-write credentials by full repository reference; configure both in the Pool when they differ. OCI GuestCopy mounts ublk devices directly; regular rootfs image files continue to use loop mounts.
 
 Minimal invocation:
 
@@ -177,6 +194,7 @@ Common build options:
 | `--disk-size-gb` | `20` | Rootfs virtual disk size in GiB; must be positive |
 | `--snapfiles-size-mb` | derived | Snapfiles virtual disk size |
 | `--kernel-version` | derived from `vmlinux-<version>` | Kernel version recorded in template metadata |
+| `--manifest-extra-file` | empty | Optional guestNetwork, lineage and platform fields that supplement the generated VM manifest; core VM fields cannot be overridden |
 | `--init-script-file` | built-in Redis init | Script injected into the guest and run as PID 1 |
 | `--ready-pattern` | `Ready to accept connections` | Serial-log text that marks workload readiness |
 | `--ready-timeout` | `3m` | Readiness timeout |
@@ -267,6 +285,27 @@ For a plain HTTP registry, place this global option before the subcommand:
 sudo "$FSB_VM" --plain-http build ...
 ```
 
+### Immutable manifest cache
+
+`create` caches rootfs and snapfiles image manifests referenced by `@sha256:...`
+under `<state-dir>/.manifest-cache/`. Later creates verify the local SHA256 and
+manifest descriptors before reuse, avoiding registry manifest requests and their
+authentication token requests on a hit. Entries are scoped by registry,
+repository, HTTP/HTTPS, and the current credential; credentials are not stored.
+With `template.reference`, the same directory also caches the resolved immutable
+pair and checkpoint ownership. That addressing envelope is recorded in the sandbox's
+`state.json.template_metadata`; platform metadata is read from mounted `manifest.json`.
+Deleting one sandbox preserves this shared cache. Set `--manifest-cache-dir` to share it across separate sandbox state roots on one node. Fastlet uses `<StateRoot>/oci/manifest-cache`, so replacing a Pod does not require fetching cached registry manifests again. The cache evicts least recently used entries above 128 MiB or 4,096 files; credential scopes remain isolated and mutable tags still resolve remotely.
+
+Missing or corrupt entries are fetched again and written atomically. Cache write
+failures do not prevent using a verified remote manifest. Mutable tags always
+resolve remotely; digest references to multi-platform indexes retain the existing
+platform selection flow. Remove `.manifest-cache/` to clear cached manifests.
+This is separate from OverlayBD's block cache: each sandbox still gets its own
+writable upper and devices, and uncached blocks are read on demand by OverlayBD.
+
+Fastlet reads platform metadata from `manifest.json` in the mounted snapfiles filesystem. FastPath uses the create-request bindings and never queries the OCI registry for recorded policy. Opaque `policy.json` and `vault.json` remain node-side state imports.
+
 ### 4.4 Disk size
 
 The default rootfs size is 20 GiB. Specify another positive integer GiB value with:
@@ -314,7 +353,9 @@ registry.example.com/team/application:v1_snapfiles
 
 The publishing process must upload every `blobs/sha256/*` object referenced by the two manifests before uploading the rootfs and snapfiles manifests under their tags. `manifest/index.json` records their filenames and digests for a publishing script.
 
-The CLI does not currently have a `push` subcommand. See the [publication contract](../design/adr-fsb-vm-cli.en.md#adr-012-build-artifact-layout-and-publish-contract-build-iteration) for artifact layout and upload ordering. A production publishing process must preserve the OCI manifest and OverlayBD layer media types.
+For a plain HTTP registry, use `fsb-vm --plain-http push ...`. The setting applies to the destination and remote parent-layer reads for incremental artifacts; HTTPS remains the default.
+
+`fsb-vm push` accepts `--artifact-dir`, `--destination registry/repository:tag`, `--metadata-file` and `--auth-file`. It publishes only `<tag>_rootfs` and `<tag>_snapfiles`, uploading rootfs first and snapfiles last. Platform metadata lives in `snapfiles/manifest.json`; only pair identity and checkpoint owner annotations live on the OCI manifest. `fsb-vm build` always generates the single `snapfiles/manifest.json`, including core VM fields, even without platform input. Use optional `--manifest-extra-file <manifest-extra.json>` to supplement guest networking, lineage and platform fields; it cannot replace the core contract. See the [shared manifest schema](artifact-manifest-reference.md). `push --metadata-file` is optional and only extracts checkpoint ownership; it cannot add files to sealed snapfiles. The returned `manifestRef` and `artifactDigest` identify the snapfiles manifest. The two images are paired by ID, so IDs must be immutable; the publisher rejects overwriting a tag with different contents. Rebuild historical OCI and S3 templates using the unified schemaVersion 1; dual-file metadata and the previous manifest layout are not supported. The OCI `SandboxTemplate` builder runs this step automatically, composing the destination from the repository-only `output.publish` and the system-assigned UUID. Explicit `--destination repository:tag` remains the standalone CLI contract. See the [publication contract](../design/adr-fsb-vm-cli.en.md#adr-012-build-artifact-layout-and-publish-contract-build-iteration) for layout and ordering.
 
 ## 6. Prepare template.json
 
@@ -341,8 +382,14 @@ Fields:
 | `sandbox_id` | Host-unique sandbox ID and state/runtime directory name |
 | `template.repo` | Registry repository without a tag |
 | `template.template_id` | Template ID; the tool pulls `<id>_rootfs` and `<id>_snapfiles` |
+| `template.reference` | Platform `oci://repository@sha256:...` reference or logical tag; an alternative to repo/template_id or explicit rootfs/snapfiles |
 | `template.auth.dockerAuth` | Docker config JSON encoded as a string; use an empty string for anonymous access |
 | `metadata` | Reserved pass-through field; optional |
+
+Fastlet uses `template.reference` with `create --prepare-only`. The CLI resolves
+the pair and annotations, reuses its cache, and prepares devices without a prior
+node-agent OCI metadata query. In this mode, the resolved pair/ownership envelope replaces
+the input `metadata`; the existing repo/template_id input remains supported.
 
 For a private registry, `dockerAuth` is a JSON **string**, not a nested object. Given this Docker config:
 
@@ -384,7 +431,7 @@ sudo "$FSB_VM" \
 3. creates `rootfs.dev` in the runtime directory and loads the snapshot with that cwd;
 4. resumes the VM and changes `state.json` to `running`.
 
-By default, it checks `/opt/fsb-vm/kernels/vmlinux-<version>` using `kernel_version` from template metadata. Override the path when necessary:
+By default, it checks `/opt/fsb-vm/kernels/vmlinux-<version>` using `kernel.version` from template metadata. When the standard Builder uses `vmlinux.bin`, that literal `kernel.version` selects `vmlinux.bin` in the same directory without adding the `vmlinux-` prefix. Override the path when necessary:
 
 ```bash
 sudo "$FSB_VM" \
@@ -465,3 +512,9 @@ sudo curl -fsS \
 - create/delete state is local host state, not a distributed control-plane resource.
 
 For build/create sequencing and artifact ownership, see the [fsb-vm design](../design/adr-fsb-vm-cli.en.md).
+
+OCI Fastlets share host `/dev` so dynamically created ublk devices remain visible. A node ublkd container in the runtime-agent DaemonSet serves every Fastlet on that node. fsb-vm connects directly to its shared Unix socket; runtime-agent installs the tools and checks health without forwarding device requests. OCI jailers bind the configured snapshot spill directory before launch.
+
+After interrupted checkpoint packaging, retry and staging deletion first recover pack devices by their config paths. Cleanup failures retain backing files. Standalone fsb-vm synchronizes credentials for the actual rootfs/snapfiles repositories; anonymous access replaces that repository’s old credential without deleting other repositories. Fastlets enable `--reject-credential-conflicts` for the node daemon, so differing accounts or an anonymous replacement for the same repository are rejected. This does not promise immediate revocation for already running VMs.
+
+Build the Fastlet with `make images COMPONENT=fastlet FASTLET_IMAGE=opensandbox/fsb-fastlet:dev`, then push it and select that image in the Pool. This is a build example, not a claim that the tag is published. Fastlet uses an Ubuntu 22.04 runtime stage without the Go toolchain or OverlayBD build stage. The runtime-agent image installs fsb-vm and OverlayBD tools on the node; Fastlet mounts them read-only and retains their required system libraries and basic runtime tools. Enable OCI on both the node agent/daemon and the Pool with `FAST_SANDBOX_OCI_ENABLED=true`; see the [OCI deployment guide](overlaybd-oci-sandboxes.md) for paths, cache sizing, credentials, and upgrade requirements. On filesystems without extent seeking, upper copying scans zero blocks to preserve sparsity; scanning can take longer than reflink or extent copying.

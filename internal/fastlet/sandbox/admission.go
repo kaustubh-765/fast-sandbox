@@ -38,9 +38,34 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *fastletapi.Crea
 	ctx = withCreateIdentity(ctx, req)
 	ctx, span := observability.Start(ctx, "fastlet.create Sandbox")
 	started := time.Now()
+	var (
+		tAdmitted time.Time
+		tBindings time.Time
+		tRuntime  time.Time
+		tCommit   time.Time
+		tHooks    time.Time
+		bindings  int
+	)
 	defer func() {
 		observability.End(span, resultErr)
 		recordAdmission("create", resultErr)
+		if req == nil {
+			return
+		}
+		phase := func(from, to time.Time) int64 {
+			if from.IsZero() || to.IsZero() || to.Before(from) {
+				return 0
+			}
+			return to.Sub(from).Milliseconds()
+		}
+		readyWait := int64(0)
+		if !tHooks.IsZero() {
+			readyWait = time.Since(tHooks).Milliseconds()
+		}
+		klog.Infof("fastlet create timing: sandbox=%s/%s ok=%t total=%dms admission=%dms registerBindings=%dms runtimeEnsure=%dms commitRuntime=%dms dispatchHooks=%dms readyWait=%dms bindings=%d",
+			req.Identity.Namespace, req.Identity.Name, resultErr == nil, time.Since(started).Milliseconds(),
+			phase(started, tAdmitted), phase(tAdmitted, tBindings), phase(tBindings, tRuntime),
+			phase(tRuntime, tCommit), phase(tCommit, tHooks), readyWait, bindings)
 	}()
 	_, finishValidation := startFastletCreateStage(ctx, m.runtimeName, "validation")
 	input, validationFailure := m.prepareCreateInput(req)
@@ -69,12 +94,15 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *fastletapi.Crea
 	if reservation.existing != nil {
 		return m.finishCreate(ctx, req, reservation.existing)
 	}
+	tAdmitted = time.Now()
 	placeholder := reservation.placeholder
 	sandboxUID := input.Sandbox.Identity.SandboxUID
 	m.recordDiagnostic(sandboxUID, "info", "admission", sandboxStateCreating, "Fastlet admission accepted; atomic runtime creation started")
 	if bindingFailure, currentAdmission := m.registerDesiredBindings(placeholder, req); bindingFailure != nil {
 		return createFailureWithDisposition(bindingFailure, currentAdmission, fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
+	tBindings = time.Now()
+	bindings = len(req.ActionBindings)
 	// Async artifact delivery: when the runtime supports it (Firecracker),
 	// a missing image — or, for a resume, a missing checkpoint set — is
 	// delivered in the background instead of blocking this create on the
@@ -93,11 +121,14 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *fastletapi.Crea
 	if err != nil {
 		return m.handleRuntimeCreateFailure(ctx, &input, placeholder, err)
 	}
+	tRuntime = time.Now()
 	status, admission, dataPlaneReady, commitFailure := m.commitRuntimeCreate(req, input, placeholder, metadata)
 	if commitFailure != nil {
 		return createFailure(commitFailure, admission)
 	}
+	tCommit = time.Now()
 	m.recordRuntimeReadyAndDispatchHooks(metadata, req, dataPlaneReady)
+	tHooks = time.Now()
 	m.continueDataPlaneCreation(metadata, started, dataPlaneReady)
 	return m.finishCreate(ctx, req, &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionCreated, Sandbox: &status, Admission: admission})
 }

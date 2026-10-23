@@ -64,6 +64,34 @@ spec:
         # integration test asserts on unload.
         - name: OPENSANDBOX_EGRESS_MODE
           value: "dns+nft"
+        # Recorded-policy directory: POLICY_EXPORT copies the subject's
+        # policy file here (fast-sandbox env convention), the handler-relay
+        # /policy/{uid} surface mutates it in place, and a restart reloads
+        # it. The volume (not the container filesystem) is what makes the
+        # relayed policy survive an egress container restart — the Fastlet's
+        # SET_BINDING replay only re-seeds the bootstrap binding input, and
+        # the file is the truth on top of it.
+        - name: OPENSANDBOX_EGRESS_POLICY_DIR
+          value: /var/lib/opensandbox-egress/policy
+        # Vault persistence (OSEP-0022): VAULT_EXPORT requires it — without
+        # the dir the egress vault store is nil and template snapshots fail
+        # their complete-capture export. Plaintext v1 posture; swap to
+        # medium: Memory (tmpfs) to keep vault files off node disk.
+        - name: OPENSANDBOX_EGRESS_VAULT_DIR
+          value: /var/lib/opensandbox-egress/vault
+        volumeMounts:
+        - name: egress-policy
+          mountPath: /var/lib/opensandbox-egress/policy
+        - name: egress-vault
+          mountPath: /var/lib/opensandbox-egress
+        # State bundle handoff (vault/policy export-import): the transfer
+        # envelope carries the driver's staging path under the runtime state
+        # root — mount the same runtime-injected volume so the path resolves
+        # in this container (the pool controller owns the `firecracker-state`
+        # hostPath; without it POLICY_EXPORT fails "validate-directory: no
+        # such file or directory").
+        - name: firecracker-state
+          mountPath: /var/lib/fast-sandbox/firecracker
         # Egress installs nft/iptables rules (DNS redirect + per-subject
         # sets) and marks sockets; NET_ADMIN covers nft/iptables/SO_MARK,
         # NET_RAW covers the raw sockets used for DNS response spoofing.
@@ -91,6 +119,18 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 2Gi
+      # Recorded-policy state of the egress container (survives egress
+      # restarts within the Pod; recorded policies are ≈KiB-scale, the egress
+      # caps a single file at MaxEncodedPolicyFileBytes ≈ 68 KiB).
+      - name: egress-policy
+        emptyDir:
+          sizeLimit: 16Mi
+      # Pod-scoped vault volume (OSEP-0022): survives egress container
+      # restarts (the reload path), dies with the Pod. Plaintext v1
+      # posture — medium: Memory would keep the plaintext vault files off
+      # node disk; encryption is the future fix for the storage side.
+      - name: egress-vault
+        emptyDir: {}
       nodeSelector:
         fast-sandbox.io/firecracker-node: "true"
   capacity:
@@ -121,6 +161,20 @@ spec:
   - name: egress
     targetHTTPPort: 18080
     hooks: [sandbox.runtime-ready, sandbox.data-plane-ready]
+  # Recorded-policy usage contract (three channels, one authority order):
+  #   - create: initialize the policy with the Sandbox spec's ActionBinding
+  #     (actionBindings: [{handler: egress, input: <policy JSON>}]) —
+  #     SET_BINDING seeds the subject's bootstrap policy from the CRD; this
+  #     is the durable, restart-safe channel.
+  #   - runtime: make every other mutation through the generic handler
+  #     relay — fastpath InvokeHandlerAction with PUT / GET / DELETE
+  #     /policy/{sandboxUid} (the egress' native semantics, revision
+  #     preconditions). Relay mutations bypass the CRD, so the binding
+  #     input goes stale; the relayed record is the live truth.
+  #   - snapshot/pause: nothing to do — POLICY_EXPORT dumps the relayed
+  #     policy file into the bundle as policy.json and the manifest records
+  #     it as the egress ActionBinding, which is authoritative over the
+  #     stale CRD replay at restore and clone-create.
   sandboxResources:
     cpu: "1"
     memory: 512Mi

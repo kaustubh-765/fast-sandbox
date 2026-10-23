@@ -7,7 +7,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/assignment"
@@ -118,17 +117,6 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 	request := &fastletapi.CreateSnapshotRequest{
 		RequestID: snapshot.Annotations[assignment.AnnotationRequestID], Identity: identity,
 		Snapshot: fastletapi.SnapshotSpec{TemplateName: snapshot.Spec.TemplateName},
-	}
-	// The source Sandbox's bindings ride along: the driver records them in
-	// the published manifest, making the artifact set self-contained (the
-	// CR annotation is only the in-cluster auto-apply path and may be gone
-	// by restore time).
-	if bindings, bindErr := compileActionBindings(sandbox.Spec.ActionBindings); bindErr == nil {
-		request.ActionBindings = bindings
-	} else {
-		// Publishing without bindings breaks the self-contained artifact
-		// promise; never silent.
-		klog.FromContext(ctx).Error(bindErr, "Failed to compile snapshot action bindings; manifest will lack them", "snapshot", snapshot.Name)
 	}
 	response, callErr := o.FastletClient.CreateSnapshot(ctx, fastlet.PodIP, request)
 	if callErr == nil && response != nil &&

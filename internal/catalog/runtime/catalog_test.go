@@ -57,8 +57,11 @@ func TestBuiltinCatalogProfiles(t *testing.T) {
 	require.Equal(t, ResidualProcessFirecracker, firecracker.ResidualProcess)
 	require.True(t, firecracker.Deployment.RequiresKVM)
 	require.True(t, hasHostPath(firecracker.Deployment.HostPaths, "/dev/kvm"))
+	require.Equal(t, corev1.HostPathDirectory, hostPath(firecracker.Deployment.HostPaths, "/dev").Type)
+	require.Equal(t, "/dev", hostPath(firecracker.Deployment.HostPaths, "/dev").MountPath)
 	require.True(t, hasHostPath(firecracker.Deployment.HostPaths, "/dev/net/tun"))
 	require.True(t, hasHostPath(firecracker.Deployment.HostPaths, "/usr/local/bin/firecracker"))
+	require.False(t, hasHostPath(firecracker.Deployment.HostPaths, "/var/lib/fast-sandbox/firecracker/overlaybd-cache"))
 	require.Equal(t, "/usr/local/bin/firecracker", firecracker.Firecracker.BinaryPath)
 	// No node-side guest kernel: snapshots bake their own and restore
 	// never boots one (#84); direct boot pins an operator kernelPath.

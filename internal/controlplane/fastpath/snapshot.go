@@ -4,19 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
-	"sync"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,13 +22,11 @@ import (
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
-	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/controlplane/assignment"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/observability"
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
-	"fast-sandbox/internal/registryconfig"
-	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 )
 
 // templateNamePattern mirrors the SandboxSnapshot CRD templateName validation
@@ -77,7 +71,8 @@ func snapshotFromCreateRequest(request *fastpathv2.CreateSandboxSnapshotRequest,
 	return &apiv1alpha2.SandboxSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: request.RequestId, Namespace: sandbox.Namespace, Labels: labels,
-			Annotations: map[string]string{assignment.AnnotationRequestID: request.RequestId, assignment.AnnotationCreateSpecHash: specHash},
+			Finalizers:  []string{assignment.SnapshotCleanupFinalizer},
+			Annotations: map[string]string{assignment.AnnotationRequestID: request.RequestId, assignment.AnnotationCreateSpecHash: specHash, assignment.AnnotationSnapshotPoolRef: sandbox.Spec.PoolRef},
 		},
 		Spec: apiv1alpha2.SandboxSnapshotSpec{
 			SandboxRef: apiv1alpha2.SandboxRef{
@@ -95,8 +90,10 @@ func (s *Server) CreateSandboxSnapshot(ctx context.Context, request *fastpathv2.
 	if err := ValidateRequestID(request.RequestId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if err := validateTemplateName(request.TemplateName); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	if request.TemplateName != "" {
+		if err := validateTemplateName(request.TemplateName); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 	}
 	if err := validateMetadata(request.Metadata); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -110,6 +107,9 @@ func (s *Server) CreateSandboxSnapshot(ctx context.Context, request *fastpathv2.
 	sandbox, err := s.sandboxFromReference(ctx, request.Sandbox)
 	if err != nil {
 		return nil, err
+	}
+	if request.TemplateName == "" && !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
+		return nil, status.Error(codes.InvalidArgument, "template_name is required for a native snapshot")
 	}
 	ctx = observability.WithIdentity(ctx, observability.Identity{
 		RequestID: request.RequestId, Namespace: sandbox.Namespace, SandboxName: sandbox.Name, SandboxUID: string(sandbox.UID),
@@ -177,7 +177,7 @@ func (s *Server) checkSnapshotReentrancy(ctx context.Context, sandbox *apiv1alph
 		}
 		// The template-name fence holds to terminal: concurrent publishers
 		// of one index key would race last-writer-wins on the store.
-		if item.Spec.TemplateName == templateName {
+		if templateName != "" && item.Spec.TemplateName == templateName {
 			return status.Errorf(codes.FailedPrecondition, "template name %q is held by snapshot %s/%s in phase %q; retry after it terminates", templateName, item.Namespace, item.Name, item.Status.Phase)
 		}
 	}
@@ -185,187 +185,6 @@ func (s *Server) checkSnapshotReentrancy(ctx context.Context, sandbox *apiv1alph
 }
 
 func snapshotSelfKey(namespace, name string) string { return namespace + "/" + name }
-
-// ManifestPolicySource resolves snapshot-recorded action bindings for an
-// image from the artifact store. The manifest is the ONLY policy record:
-// it outlives the SandboxSnapshot CR (deleting the CR keeps the
-// artifacts), so checkpoint and restore treat the artifact set as
-// self-contained.
-type ManifestPolicySource interface {
-	ActionBindings(ctx context.Context, pool *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error)
-}
-
-// policyCacheTTL bounds index freshness: a republished template name moves
-// the index to a new digest namespace; entries re-resolve after the TTL.
-const policyCacheTTL = time.Minute
-
-type policyCacheEntry struct {
-	bindings  []apiv1alpha2.ActionBinding
-	fetchedAt time.Time
-}
-
-// storePolicySource is the default ManifestPolicySource: per-pool artifact
-// read clients built from the pool's compiled registry secret (read-only
-// pair) with a short-TTL resolution cache. Resolution is two tiny GETs
-// (index + manifest, both small); the immutable manifest needs no
-// long-lived state.
-type storePolicySource struct {
-	Client client.Client
-	// Config reads the store address from the mounted
-	// fast-sandbox-artifact-store ConfigMap on every call, so a ConfigMap
-	// edit applies to the next create without a restart. Endpoint matters:
-	// pool-compiled credentials carry no endpoint (the registry rule has
-	// none), so without the override the client would default to https
-	// against a plain-HTTP store.
-	Config artifactstore.Loader
-
-	mu      sync.Mutex
-	clients map[string]*agentpull.Client
-	cache   map[string]policyCacheEntry
-}
-
-// NewStorePolicySource builds the default policy source over the pool
-// registry secrets and the configured artifact store (same store the node
-// agents pull from; endpoint empty derives from the credential host).
-func NewStorePolicySource(reader client.Client, config artifactstore.Loader) ManifestPolicySource {
-	return &storePolicySource{
-		Client:  reader,
-		Config:  config,
-		clients: map[string]*agentpull.Client{},
-		cache:   map[string]policyCacheEntry{},
-	}
-}
-
-// poolRegistryClient returns the artifact-store read client for a pool,
-// rebuilding it when the resolved store configuration changed (the cache key
-// carries the address so a ConfigMap edit never reuses an old endpoint).
-func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1alpha2.SandboxPool, config artifactstore.Config) (*agentpull.Client, error) {
-	key := pool.Namespace + "/" + pool.Name + "\x00" + config.Store + "\x00" + config.Endpoint
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cached, ok := s.clients[key]; ok {
-		return cached, nil
-	}
-	var secret corev1.Secret
-	if err := s.Client.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: poolRegistrySecretName(pool.Name)}, &secret); err != nil {
-		return nil, err
-	}
-	compiled, parseErr := registryconfig.ParseCompiled(secret.Data[registryconfig.SecretKey])
-	if parseErr != nil {
-		return nil, parseErr
-	}
-	if len(compiled.Credentials) == 0 {
-		return nil, fmt.Errorf("pool %s registry secret carries no credentials", pool.Name)
-	}
-	var options []agentpull.Option
-	if config.Endpoint != "" {
-		options = append(options, agentpull.WithEndpoint(config.Endpoint))
-	}
-	pull, clientErr := agentpull.NewClient(config.Store, compiled.Credentials[0], options...)
-	if clientErr != nil {
-		return nil, clientErr
-	}
-	s.clients[key] = pull
-	return pull, nil
-}
-
-// poolRegistrySecretName mirrors the reconciler's compiled-secret naming
-// (pool name + "-registry", truncated to a valid secret name).
-func poolRegistrySecretName(poolName string) string {
-	const suffix = "-registry"
-	if len(poolName) > 253-len(suffix) {
-		poolName = strings.TrimRight(poolName[:253-len(suffix)], "-.")
-	}
-	return poolName + suffix
-}
-
-func (s *storePolicySource) ActionBindings(ctx context.Context, pool *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
-	config, err := s.Config.Load()
-	if err != nil {
-		return nil, err
-	}
-	if config.Store == "" {
-		return nil, errors.New("artifact store is not configured")
-	}
-	// The store address is part of the cache key: after a ConfigMap edit an
-	// entry resolved from the old store must not be served.
-	key := image + "@" + pool.Namespace + "/" + pool.Name + "@" + config.Store + "\x00" + config.Endpoint
-	s.mu.Lock()
-	entry, ok := s.cache[key]
-	s.mu.Unlock()
-	if ok && time.Since(entry.fetchedAt) < policyCacheTTL {
-		return entry.bindings, nil
-	}
-	pull, err := s.poolRegistryClient(ctx, pool, config)
-	if err != nil {
-		return nil, err
-	}
-	payload, err := pull.ReadImageManifest(ctx, image)
-	if err != nil {
-		return nil, err
-	}
-	bindings := decodeManifestActionBindings(payload)
-	s.mu.Lock()
-	s.cache[key] = policyCacheEntry{bindings: bindings, fetchedAt: time.Now()}
-	s.mu.Unlock()
-	return bindings, nil
-}
-
-// decodeManifestActionBindings reads the optional actionBindings field;
-// manifests without it (every golden-image build) resolve to nil.
-func decodeManifestActionBindings(manifest []byte) []apiv1alpha2.ActionBinding {
-	var document struct {
-		ActionBindings []apiv1alpha2.ActionBinding `json:"actionBindings"`
-	}
-	if err := json.Unmarshal(manifest, &document); err != nil {
-		return nil
-	}
-	return document.ActionBindings
-}
-
-// applyManifestRecordedBindings merges the snapshot-recorded bindings of
-// the create's image into the initial set: explicit request bindings win
-// per handler, and recorded handlers the target Pool does not declare are
-// dropped (they could not take effect there). The spec hash stays over the
-// caller's own request, so a policy change between retries never conflicts
-// an idempotent replay. Store resolution is best-effort: an unreachable
-// store or an image unknown to it proceeds without recorded policy.
-func (s *Server) applyManifestRecordedBindings(ctx context.Context, request *fastpathv2.CreateSandboxRequest, explicit []apiv1alpha2.ActionBinding, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, error) {
-	if s.ManifestPolicy == nil || request.Image == "" || len(pool.Spec.ActionHandlers) == 0 {
-		return explicit, nil
-	}
-	bindings, err := s.ManifestPolicy.ActionBindings(ctx, pool, request.Image)
-	if err != nil {
-		klog.FromContext(ctx).Error(err, "Snapshot-recorded policy unavailable; proceeding without it", "image", request.Image)
-		return explicit, nil
-	}
-	if len(bindings) == 0 {
-		return explicit, nil
-	}
-	handlers := make(map[string]struct{}, len(pool.Spec.ActionHandlers))
-	for _, handler := range pool.Spec.ActionHandlers {
-		handlers[handler.Name] = struct{}{}
-	}
-	overrides := make(map[string]struct{}, len(explicit))
-	for _, binding := range explicit {
-		overrides[binding.Handler] = struct{}{}
-	}
-	merged := explicit
-	for _, binding := range bindings {
-		if _, done := overrides[binding.Handler]; done {
-			continue
-		}
-		if _, declared := handlers[binding.Handler]; !declared {
-			continue
-		}
-		merged = append(merged, binding)
-	}
-	if len(merged) != len(explicit) {
-		klog.FromContext(ctx).Info("re-applying snapshot-recorded action bindings",
-			"image", request.Image, "recorded", len(bindings), "applied", len(merged)-len(explicit))
-	}
-	return merged, nil
-}
 
 // acceptSnapshotIntent persists the snapshot intent idempotently: an
 // AlreadyExists with the same request-id and spec hash replays the persisted
@@ -401,6 +220,9 @@ func (s *Server) triggerSnapshot(ctx context.Context, snapshot *apiv1alpha2.Sand
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	response := &fastpathv2.CreateSandboxSnapshotResponse{Snapshot: snapshotInfo(snapshot)}
+	if snapshot.DeletionTimestamp != nil {
+		return nil, status.Error(codes.FailedPrecondition, "SandboxSnapshot is being deleted")
+	}
 	if snapshot.Status.Phase.Terminal() {
 		// One-shot semantics: a replayed request never re-triggers a
 		// terminated snapshot.
@@ -594,6 +416,7 @@ func snapshotInfo(snapshot *apiv1alpha2.SandboxSnapshot) *fastpathv2.SandboxSnap
 		ManifestRef:    snapshot.Status.ManifestRef,
 		ArtifactDigest: snapshot.Status.ArtifactDigest,
 		SizeBytes:      snapshot.Status.SizeBytes,
+		SnapshotId:     snapshot.Status.SnapshotID,
 	}
 	if !snapshot.CreationTimestamp.IsZero() {
 		info.CreatedUnixSeconds = snapshot.CreationTimestamp.Unix()

@@ -1,0 +1,42 @@
+# Build-only OCI artifacts shared by Builder and the node runtime image.
+# Native binaries target the Ubuntu 22.04 ABI; no compiler enters the output.
+FROM ubuntu:22.04 AS overlaybd-build
+
+ARG OVERLAYBD_REV
+COPY build/oci/build-overlaybd.sh build/sandboxtemplate-builder/overlaybd-import-raw.cpp /build-tools/
+RUN sh /build-tools/build-overlaybd.sh /out
+
+FROM golang:1.26.3 AS convertor-build
+ARG CONVERTOR_REV=a00e366f9bfc970ec4aaa00887541c4c1d9f9dab
+RUN git init /src/convertor \
+    && cd /src/convertor \
+    && git remote add origin https://github.com/containerd/accelerated-container-image.git \
+    && git fetch --depth 1 origin "$CONVERTOR_REV" \
+    && git checkout --detach FETCH_HEAD \
+    && CGO_ENABLED=0 go build -o /out/convertor ./cmd/convertor
+
+FROM --platform=$BUILDPLATFORM golang:1.25 AS fsb-build
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY api ./api
+COPY cmd ./cmd
+COPY internal ./internal
+COPY pkg ./pkg
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/fsb-vm ./cmd/fsb-vm
+
+FROM overlaybd-build AS oci-tools
+COPY --from=fsb-build /out/fsb-vm /fsb-vm
+COPY build/oci/package-tools.sh /package-tools.sh
+RUN sh /package-tools.sh /out /fsb-vm /bundle
+
+# The complete build toolchain and the smaller node bundle share these builds.
+FROM scratch
+COPY --from=overlaybd-build /out/ /opt/overlaybd/
+COPY --from=convertor-build /out/convertor /usr/local/bin/convertor
+COPY --from=fsb-build /out/fsb-vm /usr/local/bin/fsb-vm
+COPY --from=oci-tools /bundle /bundle

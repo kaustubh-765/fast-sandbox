@@ -1,6 +1,7 @@
 package artifacts
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 )
@@ -240,5 +241,52 @@ func TestParseCPUIdentityUnparsable(t *testing.T) {
 	duplicated := parseCPUIdentity([]byte("vendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\nmodel name\t: first\nvendor_id\t: AuthenticAMD\ncpu family\t: 25\nmodel\t\t: 17\nmodel name\t: second\n"))
 	if duplicated.Vendor != "GenuineIntel" || duplicated.Family != 6 || duplicated.Model != 85 || duplicated.ModelName != "first" {
 		t.Fatalf("identity = %+v, want the first block only", duplicated)
+	}
+}
+
+func TestVMManifestContract(t *testing.T) {
+	valid := VMManifest{SchemaVersion: VMManifestVersion, Runtime: "firecracker", Machine: VMMachine{VCPUCount: 2, MemoryMiB: 1024, RootfsSizeMiB: 20480, RootfsDriveID: "rootfs", RootfsDrivePath: VMRootfsDrivePath}, Kernel: VMKernel{Version: "6.1.177"}, Compatibility: SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: CPUTemplateNone, Vendor: VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7}}
+	raw, err := MarshalVMManifest(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeVMManifest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Machine != valid.Machine || decoded.Platform != nil {
+		t.Fatalf("standalone contract changed: %+v", decoded)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*VMManifest)
+	}{
+		{"unsupported version", func(m *VMManifest) { m.SchemaVersion = 99 }},
+		{"missing version", func(m *VMManifest) { m.SchemaVersion = 0 }},
+		{"runtime", func(m *VMManifest) { m.Runtime = "other" }},
+		{"cpu", func(m *VMManifest) { m.Machine.VCPUCount = 0 }},
+		{"memory", func(m *VMManifest) { m.Machine.MemoryMiB = 0 }},
+		{"disk", func(m *VMManifest) { m.Machine.RootfsSizeMiB = 0 }},
+		{"overflow", func(m *VMManifest) { m.Machine.RootfsSizeMiB = 1 << 60 }},
+		{"drive", func(m *VMManifest) { m.Machine.RootfsDrivePath = "/dev/ublkb0" }},
+		{"kernel", func(m *VMManifest) { m.Kernel.Version = "" }},
+		{"arch", func(m *VMManifest) { m.Compatibility.CPUArch = "" }},
+		{"version", func(m *VMManifest) { m.Compatibility.FirecrackerVersion = "unknown" }},
+		{"cpu identity", func(m *VMManifest) { m.Compatibility.Vendor = "unknown" }},
+		{"cpu template", func(m *VMManifest) { m.Compatibility.CPUTemplate = "other" }},
+		{"network", func(m *VMManifest) { m.GuestNetwork = &VMGuestNetwork{Iface: "eth0"} }},
+		{"owner", func(m *VMManifest) { m.Platform = &VMPlatform{Checkpoint: &CheckpointOwner{SandboxUID: "owner"}} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			doc := valid
+			test.change(&doc)
+			raw, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = DecodeVMManifest(raw); err == nil {
+				t.Fatal("invalid contract accepted")
+			}
+		})
 	}
 }

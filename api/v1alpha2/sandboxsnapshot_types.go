@@ -26,7 +26,7 @@ const (
 	// the artifact set is being uploaded to the artifact store.
 	SandboxSnapshotPhasePublishing SandboxSnapshotPhase = "Publishing"
 	// SandboxSnapshotPhaseSucceeded means the artifact set is published and
-	// addressable under spec.templateName.
+	// addressable by status.manifestRef (or spec.templateName for native sets).
 	SandboxSnapshotPhaseSucceeded SandboxSnapshotPhase = "Succeeded"
 	// SandboxSnapshotPhaseFailed means the attempt terminated; local
 	// staging is discarded and nothing was published. Retry with a new
@@ -74,8 +74,8 @@ type SandboxSnapshotSpec struct {
 	// +kubebuilder:validation:Required
 	SandboxRef SandboxRef `json:"sandboxRef"`
 
-	// TemplateName is the artifact-store index key the artifact set is
-	// published under: publish writes index/<sha256(templateName)>.json, and
+	// TemplateName is required for native snapshots and selects the artifact-store
+	// index key the artifact set is published under: publish writes index/<sha256(templateName)>.json, and
 	// a later Sandbox create with image=TemplateName boots from the
 	// snapshot through the standard pull/restore chain. Unlike a
 	// SandboxTemplate build, no default sha256(image) index is written.
@@ -83,10 +83,12 @@ type SandboxSnapshotSpec struct {
 	// snapshots with the same TemplateName overwrite each other's artifacts
 	// (last writer wins), and FastPath's pre-check therefore rejects a
 	// non-terminal holder of a name cluster-wide.
-	// +kubebuilder:validation:Required
+	// OCI snapshots may omit it: their two images use a random snapshotID,
+	// and new Sandboxes boot from status.manifestRef without a name index.
+	// +optional
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*(/[a-zA-Z0-9._-]+)*(:[a-zA-Z0-9._-]{1,127})?$`
 	// +kubebuilder:validation:MaxLength=255
-	TemplateName string `json:"templateName"`
+	TemplateName string `json:"templateName,omitempty"`
 }
 
 // SnapshotTrigger pins the target placement a snapshot was triggered
@@ -145,8 +147,8 @@ type SandboxSnapshotStatus struct {
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
 
-	// ManifestRef is the s3:// URI of the published manifest.json
-	// (Succeeded only).
+	// ManifestRef is the published s3:// manifest.json or immutable oci://
+	// snapfiles manifest reference (Succeeded only).
 	// +optional
 	ManifestRef string `json:"manifestRef,omitempty"`
 	// ArtifactDigest is the sha256 of the published manifest document.
@@ -172,8 +174,9 @@ type SandboxSnapshotStatus struct {
 // +kubebuilder:subresource:status
 
 // SandboxSnapshot is a one-shot snapshot of a running Sandbox: the artifacts
-// (rootfs, vmstate, memory) are published to the artifact store in the
-// SandboxTemplate layout, addressable under spec.templateName. The object is
+// (rootfs, vmstate, memory) are published to the native artifact store or an
+// OCI registry, addressable by status.manifestRef. Native snapshots also
+// publish an image-name index under spec.templateName. The object is
 // created by fastpath (CreateSandboxSnapshot) and driven to completion by
 // the controller; a Sandbox (or template name) with a non-terminal snapshot
 // rejects further snapshot requests.

@@ -192,3 +192,7 @@ For every runtime and node image revision:
 6. create and delete twice, then verify that no task, container, snapshot,
    network namespace, Infra state, or VMM process remains;
 7. roll back the node image/runtime environment if any gate fails.
+
+## Firecracker OCI tools and node cache
+
+The runtime-agent DaemonSet installs fsb-vm and OverlayBD tools on the node and runs one optional ublkd container per node. Fastlet executes the shared tools locally and connects directly to the daemon socket. See the [OverlayBD OCI guide](overlaybd-oci-sandboxes.md) for installation paths, activation, shared-cache sizing, credential restrictions, and drain-before-upgrade requirements. Standalone fsb-vm remains usable with its existing tool and socket flags; Kubernetes and runtime-agent are not required.

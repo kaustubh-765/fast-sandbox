@@ -67,6 +67,7 @@ func TestStateRootStorageProbeCleansUp(t *testing.T) {
 }
 
 func TestInitializeStorageFailureDoesNotStartRuntime(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "false")
 	fixture := newDriverFixture(t)
 	want := errors.New("StateRoot must use XFS with reflink=1")
 	checks := 0
@@ -86,4 +87,30 @@ func TestInitializeStorageFailureDoesNotStartRuntime(t *testing.T) {
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 	require.True(t, fixture.driver.initialized)
 	t.Cleanup(func() { _ = fixture.driver.Close() })
+}
+
+func TestInitializeSkipsXFSValidationOnlyWhenOCIEnabled(t *testing.T) {
+	for _, enabled := range []string{"true", "false", "", "invalid"} {
+		t.Run("enabled="+enabled, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_ENABLED", enabled)
+			fixture := newDriverFixture(t)
+			storageErr := errors.New("non-XFS storage")
+			called := false
+			fixture.driver.checkStorage = func(context.Context, string) error {
+				called = true
+				return storageErr
+			}
+			err := fixture.driver.Initialize(context.Background(), "")
+			if enabled == "true" {
+				require.NoError(t, err)
+				require.False(t, called)
+				require.True(t, fixture.driver.initialized)
+				t.Cleanup(func() { _ = fixture.driver.Close() })
+			} else {
+				require.ErrorIs(t, err, storageErr)
+				require.True(t, called)
+				require.False(t, fixture.driver.initialized)
+			}
+		})
+	}
 }

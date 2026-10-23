@@ -104,19 +104,27 @@ func testS3Client(t *testing.T, store *fakeStore) *s3Client {
 
 // testManifest assembles a manifest document in the publisher's shape for a
 // set of artifacts, returning the exact bytes a download would carry.
-func testManifest(artifacts map[string][]byte) []byte {
+func testManifest(contents map[string][]byte) []byte {
 	files := map[string]any{}
-	for name, content := range artifacts {
+	for name, content := range contents {
 		files[name] = map[string]any{
 			"sha256":    sha256Hex(content),
 			"sizeBytes": len(content),
 		}
 	}
-	document := map[string]any{
-		"schemaVersion": 1,
-		"runtime":       "firecracker",
-		"lineage":       map[string]any{"image": testImage},
-		"files":         files,
+	document := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "6.1.177", "/missing/firecracker", artifacts.CPUTemplateNone)
+	document.Compatibility.FirecrackerVersion = "1.16.1"
+	document.Lineage = &artifacts.VMLineage{Image: testImage}
+	document.Files = map[string]artifacts.ManifestFile{}
+	document.Platform = &artifacts.VMPlatform{StateFiles: map[string]artifacts.ManifestFile{}}
+	for name, entry := range files {
+		fields := entry.(map[string]any)
+		file := artifacts.ManifestFile{SHA256: fields["sha256"].(string), SizeBytes: int64(fields["sizeBytes"].(int))}
+		if name == "policy.json" || name == "vault.json" {
+			document.Platform.StateFiles[name] = file
+		} else {
+			document.Files[name] = file
+		}
 	}
 	payload, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
@@ -182,6 +190,30 @@ func TestPullImageFullFlow(t *testing.T) {
 		sha256Hex(manifestPayload)[:16] + "/memory.snap",
 	}
 	require.ElementsMatch(t, expected, store.requested())
+}
+
+func TestPullImageRequiresNativeFileListBeforeDownloadingFiles(t *testing.T) {
+	store, client, original, _ := publishFixture(t)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(original, &document))
+	delete(document, "files")
+	payload, err := json.Marshal(document)
+	require.NoError(t, err)
+	manifestKey := sha256Hex(original)[:16] + "/manifest.json"
+	indexKey := "index/" + imageKey(testImage) + ".json"
+	var index imageIndex
+	require.NoError(t, json.Unmarshal(store.objects[indexKey], &index))
+	index.ArtifactDigest = sha256Hex(payload)
+	indexPayload, err := json.Marshal(index)
+	require.NoError(t, err)
+	store.objects[manifestKey] = payload
+	store.objects[indexKey] = indexPayload
+
+	root := t.TempDir()
+	err = (&Client{s3: client}).PullImage(context.Background(), root, testImage)
+	require.ErrorContains(t, err, "no native files")
+	require.ElementsMatch(t, []string{indexKey, manifestKey}, store.requested())
+	require.NoFileExists(t, filepath.Join(imageDir(root, testImage), manifestName))
 }
 
 func TestPullImageIdempotent(t *testing.T) {
@@ -453,14 +485,9 @@ func TestPullCheckpointMaterializesOptionalVaultBundle(t *testing.T) {
 	delete(store.objects, "index/"+imageKey(testImage)+".json")
 	buildDir := sha256Hex(manifestPayload)[:16]
 	store.objects[buildDir+"/"+publishVaultName] = vaultContent
-	files := map[string]any{}
-	for name, content := range nativeBodies {
-		files[name] = map[string]any{"sha256": sha256Hex(content), "sizeBytes": len(content)}
-	}
-	files[publishVaultName] = map[string]any{"sha256": sha256Hex(vaultContent), "sizeBytes": len(vaultContent)}
-	withVault, err := json.MarshalIndent(map[string]any{
-		"schemaVersion": 1, "runtime": "firecracker", "files": files,
-	}, "", "  ")
+	nativeBodies[publishVaultName] = vaultContent
+	withVault := testManifest(nativeBodies)
+	var err error
 	require.NoError(t, err)
 	digest := sha256Hex(withVault)
 	store.objects[buildDir+"/manifest.json"] = withVault

@@ -63,17 +63,17 @@ func hexSHA256Bytes(payload []byte) string {
 
 // publishE2EFixture publishes index + manifest + artifacts into the store,
 // mirroring the builder's publish order (files -> manifest -> index).
-func publishE2EFixture(store *fakeS3Store, image string) {
+func publishE2EFixture(t *testing.T, store *fakeS3Store, image string) {
 	rootfs := []byte("e2e-rootfs-content")
 	vmstate := []byte("e2e-vmstate-content")
 	memory := []byte("e2e-memory-content")
-	manifestPayload, _ := json.Marshal(map[string]any{
-		"files": map[string]any{
-			"rootfs.ext4":  map[string]any{"sha256": hexSHA256Bytes(rootfs), "sizeBytes": len(rootfs)},
-			"vmstate.snap": map[string]any{"sha256": hexSHA256Bytes(vmstate), "sizeBytes": len(vmstate)},
-			"memory.snap":  map[string]any{"sha256": hexSHA256Bytes(memory), "sizeBytes": len(memory)},
-		},
-	})
+	document := testManifestDocument(t)
+	document["files"] = map[string]any{
+		"rootfs.ext4":  map[string]any{"sha256": hexSHA256Bytes(rootfs), "sizeBytes": len(rootfs)},
+		"vmstate.snap": map[string]any{"sha256": hexSHA256Bytes(vmstate), "sizeBytes": len(vmstate)},
+		"memory.snap":  map[string]any{"sha256": hexSHA256Bytes(memory), "sizeBytes": len(memory)},
+	}
+	manifestPayload, _ := json.Marshal(document)
 	manifestRef := "s3://" + e2eBucket + "/" + e2ePrefix + "/" + hexSHA256Bytes(manifestPayload)[:16] + "/manifest.json"
 	index, _ := json.Marshal(map[string]any{
 		"image": image, "manifestRef": manifestRef,
@@ -136,7 +136,7 @@ func (s *fakeS3Store) httpClient(t *testing.T) *http.Client {
 
 func TestPullImageFullChainE2E(t *testing.T) {
 	store := &fakeS3Store{objects: make(map[string][]byte)}
-	publishE2EFixture(store, e2eImage)
+	publishE2EFixture(t, store, e2eImage)
 	stateRoot := t.TempDir()
 	socketPath := startE2EAgent(t, stateRoot, store)
 
@@ -185,7 +185,7 @@ func TestPullImageE2ENotPublished(t *testing.T) {
 // client by exercising a direct pull (the real signing path).
 func TestDirectPullReachesStore(t *testing.T) {
 	store := &fakeS3Store{objects: make(map[string][]byte)}
-	publishE2EFixture(store, e2eImage)
+	publishE2EFixture(t, store, e2eImage)
 	stateRoot := t.TempDir()
 	credential := registryconfig.Credential{Host: store.serverURL(t), Username: "ak", Password: "sk"}
 	client, err := agentpull.NewClient("s3://"+e2eBucket+"/"+e2ePrefix, credential,

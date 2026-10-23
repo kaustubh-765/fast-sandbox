@@ -45,7 +45,7 @@ func infraMounts(t *testing.T) []fastletinfra.Mount {
 func TestDeliverGuestInfraCopiesArtifacts(t *testing.T) {
 	runner := &infraRunner{}
 	instance := fastletinfra.PreparedInstance{Mounts: infraMounts(t)}
-	err := deliverGuestInfra(context.Background(), runner, "/var/lib/fast-sandbox/rootfs.img", instance)
+	err := deliverGuestInfra(context.Background(), runner, "/var/lib/fast-sandbox/rootfs.img", instance, false)
 	require.NoError(t, err)
 
 	joined := strings.Join(runner.commands, "\n")
@@ -61,18 +61,27 @@ func TestDeliverGuestInfraCopiesArtifacts(t *testing.T) {
 
 func TestDeliverGuestInfraSkipsEmptyPlan(t *testing.T) {
 	runner := &infraRunner{}
-	require.NoError(t, deliverGuestInfra(context.Background(), runner, "img", fastletinfra.PreparedInstance{}))
+	require.NoError(t, deliverGuestInfra(context.Background(), runner, "img", fastletinfra.PreparedInstance{}, false))
 	require.Empty(t, runner.commands)
 }
 
 func TestDeliverGuestInfraUnmountsOnFailure(t *testing.T) {
 	runner := &infraRunner{failOn: "execd"}
-	err := deliverGuestInfra(context.Background(), runner, "img", fastletinfra.PreparedInstance{Mounts: infraMounts(t)})
+	err := deliverGuestInfra(context.Background(), runner, "img", fastletinfra.PreparedInstance{Mounts: infraMounts(t)}, false)
 	require.Error(t, err)
 	require.Contains(t, strings.Join(runner.commands, "\n"), "umount ")
 }
 
 func TestDeliverGuestInfraRequiresRunner(t *testing.T) {
-	err := deliverGuestInfra(context.Background(), nil, "img", fastletinfra.PreparedInstance{Mounts: infraMounts(t)})
+	err := deliverGuestInfra(context.Background(), nil, "img", fastletinfra.PreparedInstance{Mounts: infraMounts(t)}, false)
 	require.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func TestDeliverGuestInfraMountsOCIDeviceDirectly(t *testing.T) {
+	runner := &infraRunner{}
+	require.NoError(t, deliverGuestInfra(context.Background(), runner, "/dev/ublkb42", fastletinfra.PreparedInstance{Mounts: infraMounts(t)}, true))
+	require.Contains(t, runner.commands[0], "mount /dev/ublkb42 ")
+	for _, command := range runner.commands {
+		require.NotContains(t, command, "loop")
+	}
 }

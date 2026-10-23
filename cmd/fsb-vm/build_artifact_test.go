@@ -326,3 +326,50 @@ func TestValidateLayout(t *testing.T) {
 		t.Error("unparseable manifest must fail")
 	}
 }
+
+func TestTemplatePairValidatesLocalLayersBeforeIndex(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "complete", true: "missing-rootfs"}[missing], func(t *testing.T) {
+			layout, _, err := createStagedArtifactLayout(t.TempDir(), "build")
+			if err != nil {
+				t.Fatal(err)
+			}
+			layer, err := layout.installBytes([]byte("layer"), overlaybdPlainLayerMediaType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			names, err := parseOutput("build:test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if missing {
+				if err := os.Remove(layout.blobPath(layer.Digest)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config, err := layout.installBytes(minimalImageConfig(), ocispec.MediaTypeImageConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, desc, err := assembleManifest(config, []ocispec.Descriptor{layer})
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := fetchedImage{ManifestPath: layout.manifestPath("source.json"), ManifestDesc: desc}
+			if err := os.WriteFile(source.ManifestPath, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err = writeTemplatePair(layout, names, []ocispec.Descriptor{layer}, layer, "source:test", &source)
+			if missing {
+				if err == nil {
+					t.Fatal("missing local layer must fail")
+				}
+				if _, err := os.Stat(layout.manifestPath("index.json")); !os.IsNotExist(err) {
+					t.Fatalf("invalid layout was indexed: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

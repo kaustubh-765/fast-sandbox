@@ -32,6 +32,7 @@ type admissionRuntime struct {
 	deleteCalls   int
 	ensureError   error
 	deleteError   error
+	allocation    fastletapi.RuntimeAllocation
 	ensureEntered chan struct{}
 	ensureBlock   chan struct{}
 	deleteEntered chan struct{}
@@ -118,6 +119,7 @@ func TestInspectUsesProbeInvalidatedActionStatusBeforeControllerProjection(t *te
 	_, _, err = actionManager.Reconcile(context.Background(), fastletaction.Attachment{
 		ID: "attachment-a", SandboxUID: "uid-a", SandboxName: "sandbox-a", Namespace: "default",
 		InstanceGeneration: 1, AssignmentAttempt: 1, RuntimeInstanceID: "runtime-a",
+		IP: "172.30.0.2", Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24", HostVeth: "host-a",
 	}, 1, []fastletaction.DesiredInput{{Handler: "egress", Input: `{}`}})
 	require.NoError(t, err)
 
@@ -214,7 +216,7 @@ func (r *admissionRuntime) EnsureSandbox(_ context.Context, input *fastletapi.En
 	}
 	config := input.Sandbox
 	sandboxUID := config.Identity.SandboxUID
-	metadata := &SandboxMetadata{Config: config, ContainerID: sandboxUID, Phase: "running", CreatedAt: time.Now().Unix()}
+	metadata := &SandboxMetadata{Config: config, Allocation: r.allocation, ContainerID: sandboxUID, Phase: "running", CreatedAt: time.Now().Unix()}
 	r.mu.Lock()
 	r.sandboxes[sandboxUID] = metadata
 	r.mu.Unlock()
@@ -713,6 +715,12 @@ func TestUserDeleteFailureCannotBeResurrectedByCreateRetry(t *testing.T) {
 
 func TestActionDeleteFailureDoesNotBlockRuntimeDeletion(t *testing.T) {
 	runtime := newAdmissionRuntime()
+	// The Binding must reach the Handler before Delete for REMOVE_BINDING to
+	// fire, so the fake runtime materializes a network allocation (#136: an
+	// unattached Binding parks as Pending and is never applied nor removed).
+	runtime.allocation = fastletapi.RuntimeAllocation{Network: fastletapi.NetworkAllocation{
+		IP: "172.30.0.2", Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24",
+	}}
 	caller := &failingDeleteActionCaller{}
 	actionManager, err := fastletaction.NewManager([]apiv1alpha2.ActionHandler{{Name: "egress", TargetHTTPPort: 18080}}, caller)
 	require.NoError(t, err)
@@ -994,14 +1002,24 @@ func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {
 	require.NoError(t, err)
 	_, err = manager.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: request.Identity})
 	require.NoError(t, err)
+	// Settle on the delete-failed observation instead of racing a removal-count
+	// window: a concurrent route publication may legitimately lose the phase
+	// race against this delete and add an extra idempotent RemoveRoute through
+	// the stale-route cleanup in publishDataPlaneRoute, so exact-once removal
+	// is not a system guarantee. Delete-failed is only entered by the gated
+	// asyncDelete after a failed removal, so reaching it proves a removal was
+	// attempted ahead of runtime deletion.
 	require.Eventually(t, func() bool {
-		publisher.mu.Lock()
-		removals := len(publisher.removed)
-		publisher.mu.Unlock()
-		_, deletes := runtime.counts()
-		return removals == 1 && deletes == 0
-	}, time.Second, 10*time.Millisecond)
+		inspected, inspectErr := manager.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: request.Identity})
+		return inspectErr == nil && inspected.Sandbox.DataPlane.State == fastletapi.DataPlaneStateFailed
+	}, 3*time.Second, 5*time.Millisecond)
+	// Stable while removeError stays set: no path can reach the runtime delete.
+	_, deletes := runtime.counts()
+	require.Equal(t, 0, deletes, "runtime deletion must stay gated while route removal fails")
 
+	// Clearing removeError only after delete-failed settled also guarantees
+	// this retry cannot be swallowed by the terminating/deleting idempotency
+	// fence while the first asyncDelete was still in flight.
 	publisher.mu.Lock()
 	publisher.removeError = nil
 	publisher.mu.Unlock()
@@ -1010,7 +1028,7 @@ func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {
 	require.Eventually(t, func() bool {
 		_, deletes := runtime.counts()
 		return deletes == 1
-	}, time.Second, 10*time.Millisecond)
+	}, 3*time.Second, 5*time.Millisecond)
 }
 
 func TestDeleteRemovesRouteWhenRuntimeAccessIsAlreadyAbsent(t *testing.T) {

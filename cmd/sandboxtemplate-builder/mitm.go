@@ -14,6 +14,7 @@ import (
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 )
 
 // guestMITMCertPath is the execd bootstrap contract path the certificate
@@ -27,16 +28,7 @@ const guestMITMTrustGate = "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT"
 // mitmCALineage is one baked certificate's public-key identity for the
 // manifest lineage (lineage.egressMitmCA.certificates[]) — fingerprints
 // only, never key or Secret material.
-type mitmCALineage struct {
-	// CertSHA256 is the SHA-256 of the certificate DER (lowercase hex),
-	// matched against the egress pinned-CA fingerprint on /healthz.
-	CertSHA256 string `json:"certSha256"`
-	// SPKISHA256 is the SHA-256 of the SubjectPublicKeyInfo DER: the key
-	// identity, stable across re-issuance.
-	SPKISHA256 string `json:"spkiSha256"`
-	// NotAfter is the certificate expiry (RFC3339, display-only).
-	NotAfter string `json:"notAfter"`
-}
+type mitmCALineage = artifacts.CertificateFingerprint
 
 // injectEgressMITMCertificate bakes the mounted MITM CA certificates into
 // the guest rootfs at the bootstrap contract path and returns their lineage

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // networkProvider acquires the host network device a restored VM attaches to
@@ -13,7 +15,7 @@ type networkProvider interface {
 	// Acquire prepares the host device for the guest described by metadata
 	// and returns the resolved host device name plus a cleanup callback run
 	// on VM teardown. The none provider returns an empty device and a no-op.
-	Acquire(ctx context.Context, metadata vmMetadata) (hostDevName string, cleanup func() error, err error)
+	Acquire(ctx context.Context, metadata artifacts.VMManifest) (hostDevName string, cleanup func() error, err error)
 	// Name identifies the provider (persisted in state.json).
 	Name() string
 }
@@ -21,7 +23,7 @@ type networkProvider interface {
 // noneProvider skips networking entirely.
 type noneProvider struct{}
 
-func (noneProvider) Acquire(context.Context, vmMetadata) (string, func() error, error) {
+func (noneProvider) Acquire(context.Context, artifacts.VMManifest) (string, func() error, error) {
 	return "", func() error { return nil }, nil
 }
 

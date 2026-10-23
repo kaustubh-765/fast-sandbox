@@ -173,7 +173,8 @@ func applyFirecrackerBinding(config *runtimecatalog.FirecrackerConfig, binding *
 // replaceFirecrackerHostPaths drops the builtin firecracker-* host path
 // requirements from values and appends the ones derived from the resolved
 // configuration, so the fastlet pod mounts exactly the installed paths
-// (binary, jailer, rootfs, state root; the kernel only when pinned).
+// (binary, jailer, rootfs and state root; the kernel only
+// when pinned).
 func replaceFirecrackerHostPaths(values []runtimecatalog.HostPathRequirement, config *runtimecatalog.FirecrackerConfig) []runtimecatalog.HostPathRequirement {
 	kept := values[:0]
 	for _, requirement := range values {

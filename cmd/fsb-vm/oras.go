@@ -17,7 +17,8 @@ import (
 	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
-	"oras.land/oras-go/v2/registry/remote/retry"
+
+	"fast-sandbox/internal/ocitemplate"
 )
 
 // This file is the ORAS-based registry access layer of fsb-vm
@@ -26,13 +27,6 @@ import (
 // the source manifest and every layer blob into the local artifact layout so
 // the build-time rootfs device reads local files only. No docker CLI and no
 // go-containerregistry are involved.
-
-// remoteSource abstracts the registry operations both flows need so tests can
-// substitute an in-memory ORAS store. remote.Repository satisfies it.
-type remoteSource interface {
-	Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error)
-	Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
-}
 
 // canonicalRegistryHost maps the Docker Hub aliases to the real distribution
 // endpoint. The user-facing spelling (registry.hub.docker.com) is the Hub UI
@@ -77,7 +71,7 @@ func (e authEntry) credential() (auth.Credential, error) {
 		return auth.Credential{Username: e.Username, Password: e.Password}, nil
 	}
 	if e.Auth == "" {
-		return auth.EmptyCredential, nil
+		return ocitemplate.BasicCredential("", "", e.IdentityToken)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(e.Auth)
 	if err != nil {
@@ -87,7 +81,7 @@ func (e authEntry) credential() (auth.Credential, error) {
 	if !found {
 		return auth.EmptyCredential, fmt.Errorf("malformed auth token: missing ':'")
 	}
-	return auth.Credential{Username: username, Password: password}, nil
+	return ocitemplate.BasicCredential(username, password, e.IdentityToken)
 }
 
 // credentialFor selects the credential for ref from the docker config,
@@ -133,21 +127,14 @@ func credentialFor(config dockerConfig, ref registry.Reference) (auth.Credential
 
 // newRemoteRepository builds an authenticated ORAS repository handle for ref.
 func newRemoteRepository(ref registry.Reference, config dockerConfig, plainHTTP bool) (*remote.Repository, error) {
-	repository, err := remote.NewRepository(ref.Registry + "/" + ref.Repository)
-	if err != nil {
-		return nil, fmt.Errorf("open repository %s/%s: %w", ref.Registry, ref.Repository, err)
-	}
-	repository.PlainHTTP = plainHTTP
-	client := &auth.Client{Client: retry.DefaultClient, Cache: auth.NewCache()}
-	credential, found, err := credentialFor(config, ref)
+	credential, _, err := credentialFor(config, ref)
 	if err != nil {
 		return nil, err
 	}
-	if found {
-		client.Credential = auth.StaticCredential(ref.Registry, credential)
-	}
-	repository.Client = client
-	return repository, nil
+	repository, _, err := ocitemplate.Repository(ref.String(), func(context.Context, string) (auth.Credential, error) {
+		return credential, nil
+	}, ocitemplate.WithPlainHTTP(plainHTTP))
+	return repository, err
 }
 
 // isIndexMediaType reports whether desc references an OCI image index or a
@@ -180,7 +167,7 @@ func selectPlatformManifest(index ocispec.Index) (ocispec.Descriptor, error) {
 // fetchManifestJSON resolves reference on source and returns the platform
 // manifest, traversing one index level when the tag points at an index. The
 // returned bytes are digest-verified (content.FetchAll checks the descriptor).
-func fetchManifestJSON(ctx context.Context, source remoteSource, reference string) (ocispec.Descriptor, []byte, error) {
+func fetchManifestJSON(ctx context.Context, source ocitemplate.MetadataRepository, reference string) (ocispec.Descriptor, []byte, error) {
 	desc, err := source.Resolve(ctx, reference)
 	if err != nil {
 		return ocispec.Descriptor{}, nil, fmt.Errorf("resolve %q: %w", reference, err)
@@ -239,7 +226,7 @@ func validateManifestDescriptors(manifest ocispec.Manifest, imageRef string) err
 	return nil
 }
 
-func resolveBuildSource(ctx context.Context, source remoteSource, ref registry.Reference) (resolvedBuildSource, error) {
+func resolveBuildSource(ctx context.Context, source ocitemplate.MetadataRepository, ref registry.Reference) (resolvedBuildSource, error) {
 	manifestDesc, raw, err := fetchManifestJSON(ctx, source, ref.Reference)
 	if err != nil {
 		return resolvedBuildSource{}, fmt.Errorf("pull manifest %q: %w", ref.String(), err)
@@ -267,13 +254,20 @@ func resolveImage(ctx context.Context, imageRef string, config dockerConfig) (re
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	repository, err := newRemoteRepository(ref, config, global.plainHTTP)
+	cachePath, err := createManifestCachePath(ref, config)
 	if err != nil {
 		return resolvedImage{}, err
 	}
-	_, raw, err := fetchManifestJSON(ctx, repository, ref.Reference)
-	if err != nil {
-		return resolvedImage{}, fmt.Errorf("pull manifest %q: %w", imageRef, err)
+	raw, cached := readCachedImageManifest(cachePath, ref.Reference)
+	if !cached {
+		repository, err := newRemoteRepository(ref, config, global.plainHTTP)
+		if err != nil {
+			return resolvedImage{}, err
+		}
+		_, raw, err = fetchManifestJSON(ctx, repository, ref.Reference)
+		if err != nil {
+			return resolvedImage{}, fmt.Errorf("pull manifest %q: %w", imageRef, err)
+		}
 	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
@@ -288,6 +282,11 @@ func resolveImage(ctx context.Context, imageRef string, config dockerConfig) (re
 	}
 	if len(lowers) == 0 {
 		return resolvedImage{}, fmt.Errorf("image %q has no layers", imageRef)
+	}
+	if !cached {
+		if err := cacheImageManifest(cachePath, ref.Reference, raw); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cache image manifest: %v\n", err)
+		}
 	}
 	return resolvedImage{Lowers: lowers, RepoBlobURL: repoBlobURL(ref, global.plainHTTP)}, nil
 }
@@ -490,7 +489,7 @@ func downloadBlob(ctx context.Context, fetcher content.Fetcher, desc ocispec.Des
 
 // fetchSourceImage downloads an already-resolved native source manifest,
 // config, and layers into the artifact layout.
-func fetchSourceImage(ctx context.Context, source remoteSource, resolved resolvedBuildSource, layout artifactLayout) (fetchedImage, error) {
+func fetchSourceImage(ctx context.Context, source ocitemplate.MetadataRepository, resolved resolvedBuildSource, layout artifactLayout) (fetchedImage, error) {
 	if err := layout.ensure(); err != nil {
 		return fetchedImage{}, err
 	}

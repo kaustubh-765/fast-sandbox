@@ -10,9 +10,12 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/ocitemplate"
 )
 
 // SetFastletPodUID records the pod identity attached to runtime-agent
@@ -111,6 +114,9 @@ func (d *Driver) forgetLease(sandboxID string) {
 // any) on the runtime-agent. Failures never fail the delete; an unreachable
 // agent leaves the lease to the agent's journaled recovery.
 func (d *Driver) releaseAgentSandbox(ctx context.Context, sandboxID, image string) {
+	if strings.HasPrefix(image, ocitemplate.Prefix) {
+		return // OCI attachments are owned by fsb-vm, not agent pins/leases.
+	}
 	client, err := d.agentClientOrNil()
 	if err != nil || client == nil {
 		return
@@ -122,7 +128,7 @@ func (d *Driver) releaseAgentSandbox(ctx context.Context, sandboxID, image strin
 		d.forgetLease(sandboxID)
 	}
 	if image != "" {
-		if err := client.UnpinImage(ctx, "unpin-"+sandboxID, image); err != nil && !errorsIsAgentUnreachable(err) {
+		if err := client.UnpinImage(ctx, "unpin-"+sandboxID+"-"+imageKey(image), image); err != nil && !errorsIsAgentUnreachable(err) {
 			klog.V(2).InfoS("firecracker runtime-agent UnpinImage failed", "sandboxID", sandboxID, "err", err)
 		}
 	}

@@ -8,6 +8,7 @@
 #
 #   ./scripts/firecracker-host-check.sh
 #   ./scripts/firecracker-host-check.sh --state-root /data/fast-sandbox/firecracker
+#   FAST_SANDBOX_OCI_ENABLED=true ./scripts/firecracker-host-check.sh
 #
 # Checked (hard failures block a node from being labeled ready):
 #   cpu-arch               x86_64 (arm64 not supported yet)
@@ -22,7 +23,7 @@
 # Warned (informational, not blocking):
 #   nested-virtualization  vmx/svm CPU flag (nested VMs cannot run FC without it)
 #   memory-available       MemAvailable >= --min-memory
-#   stateroot-filesystem   fs type + reflink (CoW) support report
+#   stateroot-filesystem   XFS/reflink validation skipped when OCI is enabled
 #
 # Exit code: 0 = every hard check passed (node would be labeled ready),
 # 1 = at least one hard check failed.
@@ -164,6 +165,8 @@ if [[ -z "$FS_FREE" ]]; then
 	fail_check "stateroot-filesystem" "cannot stat the filesystem of $STATE_ROOT"
 elif [[ "$FS_FREE" -lt "$MIN_FREE" ]]; then
 	fail_check "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free (minimum $((MIN_FREE >> 30)) GiB)"
+elif [[ "${FAST_SANDBOX_OCI_ENABLED:-false}" == true ]]; then
+	warn "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free; FAST_SANDBOX_OCI_ENABLED=true: skipping XFS/reflink validation; native template rootfs copies may take longer and extend snapshot pause windows"
 elif [[ "$FS_TYPE" != "xfs" ]]; then
 	fail_check "stateroot-filesystem" "StateRoot $STATE_ROOT must use XFS with reflink=1; found type $FS_TYPE"
 else

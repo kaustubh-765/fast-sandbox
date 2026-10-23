@@ -13,6 +13,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 func TestParseOutput(t *testing.T) {
@@ -231,63 +235,56 @@ func TestKernelVersionFromPath(t *testing.T) {
 	}
 }
 
-func TestBuildSnapfilesMetadata(t *testing.T) {
+func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	options := validBuildOptions(t)
-	options.rootfsDriveID = defaultRootfsDriveID
-	createdAt := time.Date(2025, 6, 1, 12, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	previous := global
+	t.Cleanup(func() { global = previous })
+	binary := filepath.Join(t.TempDir(), "firecracker")
+	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'Firecracker v1.16.1'\n"), 0755))
+	global.firecrackerBin = binary
+	created := time.Date(2025, 6, 1, 12, 30, 0, 0, time.UTC)
+	raw, err := buildSnapfilesManifest(options, created)
+	require.NoError(t, err)
+	document, err := artifacts.DecodeVMManifest(raw)
+	require.NoError(t, err)
+	require.Equal(t, 1, document.SchemaVersion)
+	require.Equal(t, int64(1024), document.Machine.MemoryMiB)
+	require.Equal(t, int64(20480), document.Machine.RootfsSizeMiB)
+	require.Equal(t, "5.10.0", document.Kernel.Version)
+	require.Equal(t, options.source, document.Lineage.Image)
+	require.Equal(t, created.Format(time.RFC3339), document.Lineage.CreatedAt)
+	require.Nil(t, document.Platform, "standalone builds need no platform input")
+	options.manifestExtraFile = filepath.Join(t.TempDir(), "extra.json")
+	require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(`{"platform":{"execd":"execd:v1","future":{"keep":true}}}`), 0600))
+	raw, err = buildSnapfilesManifest(options, created)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"future"`)
+	document, err = artifacts.DecodeVMManifest(raw)
+	require.NoError(t, err)
+	require.Equal(t, "execd:v1", document.Platform.Execd)
+	for _, extra := range []string{`{"machine":{"vcpuCount":9}}`, `{"schemaVersion":9}`, `{"compatibility":{}}`, `null`, `{"guestNetwork":{"ip":"1.2.3.4"}}`, `{"lineage":{"createdAt":"wrong"}}`} {
+		require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(extra), 0600))
+		_, err = buildSnapfilesManifest(options, created)
+		require.Error(t, err, extra)
+	}
+	options.tapName = "tap-test"
+	options.guestMAC = "02:fc:00:00:00:01"
+	require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(`{"guestNetwork":{"ip":"172.30.0.3","mtu":1500}}`), 0600))
+	raw, err = buildSnapfilesManifest(options, created)
+	require.NoError(t, err)
+	document, err = artifacts.DecodeVMManifest(raw)
+	require.NoError(t, err)
+	require.Equal(t, options.guestMAC, document.GuestNetwork.MAC)
+	require.Equal(t, "172.30.0.3", document.GuestNetwork.IP)
+	require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(`{"guestNetwork":{"mac":"02:00:00:00:00:02"}}`), 0600))
+	_, err = buildSnapfilesManifest(options, created)
+	require.ErrorContains(t, err, "conflict")
+}
 
-	payload, err := buildSnapfilesMetadata(options, options.source, createdAt)
-	if err != nil {
-		t.Fatalf("buildSnapfilesMetadata: %v", err)
-	}
-
-	// The consumer schema parses the generated metadata unchanged.
-	var metadata snapfilesMetadata
-	if err := json.Unmarshal(payload, &metadata); err != nil {
-		t.Fatalf("metadata JSON: %v", err)
-	}
-	if metadata.VCPUCount != 1 || metadata.MemoryMB != 1024 || metadata.DiskSizeMB != 20480 {
-		t.Errorf("machine fields = %+v", metadata.vmMetadata)
-	}
-	if metadata.KernelVersion != "5.10.0" {
-		t.Errorf("kernel_version = %q", metadata.KernelVersion)
-	}
-	if metadata.HypervisorType != hypervisorFirecracker {
-		t.Errorf("hypervisor_type = %q", metadata.HypervisorType)
-	}
-	if metadata.SchemaVersion != metadataSchemaVersion {
-		t.Errorf("schema_version = %d", metadata.SchemaVersion)
-	}
-	if metadata.SourceImage != options.source || metadata.RootfsDriveID != defaultRootfsDriveID {
-		t.Errorf("provenance = %q / %q", metadata.SourceImage, metadata.RootfsDriveID)
-	}
-	if metadata.CreatedAt != createdAt.UTC().Format(time.RFC3339) {
-		t.Errorf("created_at = %q, want UTC", metadata.CreatedAt)
-	}
-	if metadata.DefaultWorkdir != "/data" {
-		t.Errorf("default_workdir = %q", metadata.DefaultWorkdir)
-	}
-
-	// loadMetadata (consumer path) accepts the same payload.
-	var consumer vmMetadata
-	if err := json.Unmarshal(payload, &consumer); err != nil {
-		t.Fatalf("consumer parse: %v", err)
-	}
-	if consumer.VCPUCount != 1 || consumer.KernelVersion != "5.10.0" {
-		t.Errorf("consumer view = %+v", consumer)
-	}
-
-	options.diskSizeGiB = 30
-	payload, err = buildSnapfilesMetadata(options, options.source, createdAt)
-	if err != nil {
-		t.Fatalf("custom size metadata: %v", err)
-	}
-	if err := json.Unmarshal(payload, &metadata); err != nil {
-		t.Fatal(err)
-	}
-	if metadata.DiskSizeMB != 30720 {
-		t.Errorf("30 GiB metadata = %d MiB", metadata.DiskSizeMB)
-	}
+func testVMManifest() artifacts.VMManifest {
+	document := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: rootfsDriveLink}, "5.10.0", "/missing/firecracker", artifacts.CPUTemplateNone)
+	document.Compatibility.FirecrackerVersion = "1.16.1"
+	return document
 }
 
 func TestParseExt4Size(t *testing.T) {

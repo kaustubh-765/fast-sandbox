@@ -25,15 +25,14 @@
 #     e2fsprogs, jq (manifest display/assertions)
 #
 # Usage:
-#   ./scripts/sandboxtemplate-e2e.sh [--image <ref|tar>] [--format native|overlaybd] [--local]
+#   ./scripts/sandboxtemplate-e2e.sh [--image <ref|tar>] [--format native] [--local]
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${WORK:-$PWD/.sandboxtemplate-e2e}"
 IMAGE="${SANDBOX_TEMPLATE_IMAGE:-opensandbox/fsb-sandbox-golden:latest}"
-# Formats to exercise; defaults to both. --format may be repeated or a
-# comma-separated list to run a subset.
+# This local file-set E2E exercises native output only; OverlayBD requires OCI.
 FORMATS=()
 BUILDER_IMAGE="${SANDBOX_TEMPLATE_BUILDER_IMAGE:-sandboxtemplate-builder:e2e}"
 KERNEL_URL="${SANDBOX_TEMPLATE_KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260729-c69d0c0490e6-0/x86_64/vmlinux-6.18.36}"
@@ -49,7 +48,7 @@ while [[ $# -gt 0 ]]; do
             value="${2:?--format requires a value}"; shift 2
             IFS=',' read -r -a parts <<< "$value"
             for part in "${parts[@]}"; do
-                [[ "$part" == "native" || "$part" == "overlaybd" ]] || die "--format must be native or overlaybd, got $part"
+                [[ "$part" == "native" ]] || die "this file-set E2E supports only --format native; OverlayBD requires OCI publication"
                 FORMATS+=("$part")
             done ;;
         --local) LOCAL_MODE=1; shift ;;
@@ -57,7 +56,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ ${#FORMATS[@]} -eq 0 ]]; then
-    FORMATS=(native overlaybd)
+    FORMATS=(native)
 fi
 
 # --- re-invoke as root -------------------------------------------------------
@@ -136,9 +135,6 @@ fi
 if [[ "$LOCAL_MODE" -eq 1 ]]; then
     command -v oci2rootfs >/dev/null || die "missing oci2rootfs on PATH (or use the docker mode)"
     command -v firecracker >/dev/null || die "missing firecracker on PATH (or use the docker mode)"
-    if [[ "${FORMATS[*]}" == *overlaybd* ]]; then
-        command -v overlaybd-import-raw >/dev/null || die "missing overlaybd-import-raw on PATH (needed for format=overlaybd; use the docker mode)"
-    fi
     log "building sandboxtemplate-builder (local mode)"
     (cd "$REPO_ROOT" && GOTOOLCHAIN=local go build -o "$WORK/sandboxtemplate-builder" ./cmd/sandboxtemplate-builder/)
     run_pipeline() {
@@ -152,8 +148,9 @@ if [[ "$LOCAL_MODE" -eq 1 ]]; then
     }
 else
     log "building builder image from build/Dockerfile.sandboxtemplate-builder"
-    docker build --progress=plain --build-arg "KERNEL_URL=$KERNEL_URL" -t "$BUILDER_IMAGE" \
-        -f "$REPO_ROOT/build/Dockerfile.sandboxtemplate-builder" "$REPO_ROOT" || die "docker build failed"
+    (cd "$REPO_ROOT" && make images COMPONENT=sandboxtemplate-builder \
+        SANDBOX_TEMPLATE_BUILDER_IMAGE="$BUILDER_IMAGE" \
+        DOCKER_BUILD_FLAGS="--progress=plain --build-arg KERNEL_URL=$(printf '%q' "$KERNEL_URL")") || die "docker build failed"
     run_pipeline() {
         local fmt_dir=$1
         docker run --rm \
@@ -255,10 +252,6 @@ for fmt in "${FORMATS[@]}"; do
     sed 's/^/    /' "$guest_env"
     log "live guest env (entrypoint console echo):"
     grep -h "E2E_ENV" "$BUILD/boot.console.log" | sed 's/^/    /' || true
-    fi
-    if [[ "$fmt" == "overlaybd" ]]; then
-        assert "overlaybd rootfs layer exists" test -s "$BUILD/overlaybd/rootfs/layer.lsmt"
-        assert "overlaybd memory layer exists" test -s "$BUILD/overlaybd/memory/layer.lsmt"
     fi
 
     # Cross-check the builder's sparse-aware digests against sha256sum so a

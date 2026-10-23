@@ -46,13 +46,13 @@ func ensureLoopDevices() error {
 	return nil
 }
 
-// deliverGuestInfra performs the GuestCopy Infra delivery by loop-mounting the
+// deliverGuestInfra performs the GuestCopy Infra delivery by mounting the
 // per-instance rootfs and copying every prepared artifact to its guest
 // destination (sandbox-init, infra.json, component mappings).
 // Kernel-journaled writes survive the guest's later read-write mount, which
-// non-journaled debugfs writes do not. The mount costs nothing extra because
-// the instance image is a reflink copy with no dirty pages.
-func deliverGuestInfra(ctx context.Context, runner fastletnetwork.CommandRunner, rootfsImage string, instance fastletinfra.PreparedInstance) error {
+// non-journaled debugfs writes do not. OCI block devices are mounted directly;
+// native rootfs files require a loop device.
+func deliverGuestInfra(ctx context.Context, runner fastletnetwork.CommandRunner, rootfsImage string, instance fastletinfra.PreparedInstance, blockDevice bool) error {
 	if runner == nil {
 		return fmt.Errorf("%w: command runner is required for Infra delivery", ErrInvalidConfig)
 	}
@@ -64,11 +64,15 @@ func deliverGuestInfra(ctx context.Context, runner fastletnetwork.CommandRunner,
 		return err
 	}
 	defer os.RemoveAll(mountpoint)
-	if err := ensureLoopDevices(); err != nil {
-		return err
+	args := []string{rootfsImage, mountpoint}
+	if !blockDevice {
+		if err := ensureLoopDevices(); err != nil {
+			return err
+		}
+		args = append([]string{"-o", "loop"}, args...)
 	}
 
-	if _, err := runner.Run(ctx, "mount", "-o", "loop", rootfsImage, mountpoint); err != nil {
+	if _, err := runner.Run(ctx, "mount", args...); err != nil {
 		return fmt.Errorf("mount guest rootfs for Infra delivery: %w", err)
 	}
 	mounted := true

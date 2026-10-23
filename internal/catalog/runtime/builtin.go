@@ -9,6 +9,12 @@ import (
 
 const builtinProfileVersion = "v1"
 
+// Node-installed OCI tools and the shared ublkd control directory.
+const (
+	OCIToolsDir  = "/opt/fast-sandbox/oci"
+	OCISocketDir = "/run/fast-sandbox/overlaybd"
+)
+
 const (
 	// runscContainerdConfigPath is the host containerd config fragment of the gVisor runsc handler.
 	runscContainerdConfigPath = "/etc/containerd/runsc.toml"
@@ -84,6 +90,10 @@ func builtinProfiles() map[apiv1alpha2.RuntimeName]RuntimeProfile {
 				Deployment: DeploymentRequirements{
 					Privileged: true, RequiresKVM: true, Overhead: overhead("250m", "256Mi"),
 					HostPaths: append([]HostPathRequirement{
+						{Name: "oci-tools", HostPath: OCIToolsDir, MountPath: OCIToolsDir, Type: corev1.HostPathDirectoryOrCreate, ReadOnly: true},
+						{Name: "oci-socket", HostPath: OCISocketDir, MountPath: OCISocketDir, Type: corev1.HostPathDirectoryOrCreate},
+						// Share devtmpfs so ublk devices created after Pod startup are visible.
+						{Name: "host-dev", HostPath: "/dev", MountPath: "/dev", Type: corev1.HostPathDirectory},
 						{Name: "dev-kvm", HostPath: kvmDevicePath, MountPath: kvmDevicePath, Type: corev1.HostPathCharDev},
 						{Name: "dev-net-tun", HostPath: "/dev/net/tun", MountPath: "/dev/net/tun", Type: corev1.HostPathCharDev},
 						{Name: "firecracker-bin", HostPath: firecrackerBinaryPath, MountPath: firecrackerBinaryPath, Type: corev1.HostPathFile, ReadOnly: true},

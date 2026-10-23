@@ -1,7 +1,7 @@
 # agent-daemonset.yaml — node-level firecracker runtime + readiness agent,
 # with the node janitor as a sidecar container.
 #
-# Pod layout (two containers, one node daemon):
+# Pod layout: agent, optional node ublkd, and janitor; OCI tools install first.
 #   1. firecracker-agent — serves the UDS management API (artifact pull +
 #      lease state) the fastlet firecracker driver talks to, and runs the
 #      node readiness loop (the kata-deploy pattern): host checks,
@@ -78,6 +78,10 @@ rules:
   # The janitor sidecar's pod informer tracks this node's pods to detect
   # orphans the moment their pod disappears.
   verbs: ["get", "list", "watch"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxes"]
+  # Janitor revalidates the Sandbox assignment before cleaning its resources.
+  verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -133,6 +137,14 @@ spec:
       # capability is required. The node hostname file is mounted read-only
       # for the stable HRW self-id (hostNetwork used to provide it via the
       # node UTS namespace; a regular pod's hostname is its pod name).
+      initContainers:
+      - name: install-oci-tools
+        image: fast-sandbox/firecracker-runtime:dev
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/install-oci-tools"]
+        volumeMounts:
+        - name: oci-tools
+          mountPath: /opt/fast-sandbox/oci
       containers:
       - name: firecracker-agent
         image: fast-sandbox/firecracker-runtime:dev
@@ -144,6 +156,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.uid
+        - name: FAST_SANDBOX_OCI_ENABLED
+          value: "false"
         - name: FAST_SANDBOX_AGENT_CONFIG
           value: /etc/fast-sandbox/agent-config/agent.yaml
         # Node readiness: spec.nodeName enables the host-check loop (the
@@ -186,8 +200,44 @@ spec:
         - name: node-hostname
           mountPath: /etc/hostname
           readOnly: true
+        - name: oci-tools
+          mountPath: /opt/fast-sandbox/oci
+          readOnly: true
+        - name: oci-socket
+          mountPath: /run/fast-sandbox/overlaybd
         - name: fc-assets
           mountPath: /opt/fast-sandbox/firecracker
+      # Enable this container together with FAST_SANDBOX_OCI_ENABLED on the
+      # agent for OCI nodes. Both runtime and Fastlet use the same StateRoot.
+      - name: overlaybd-ublkd
+        image: fast-sandbox/firecracker-runtime:dev
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-ec"]
+        args:
+        - 'if [ "$FAST_SANDBOX_OCI_ENABLED" != true ]; then exec sleep infinity; fi; exec /usr/local/bin/overlaybd-node'
+        env:
+        - name: FAST_SANDBOX_OCI_ENABLED
+          value: "false"
+        - name: FAST_SANDBOX_STATE_ROOT
+          value: /var/lib/fast-sandbox/firecracker
+        - name: OVERLAYBD_CACHE_SIZE_GB
+          value: "16"
+        securityContext:
+          privileged: true
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-ec", 'if [ "$FAST_SANDBOX_OCI_ENABLED" = true ]; then curl -fsS --max-time 2 --unix-socket /run/fast-sandbox/overlaybd/ublkd.sock http://localhost/v1/ping; fi']
+          periodSeconds: 5
+        volumeMounts:
+        - name: oci-tools
+          mountPath: /opt/fast-sandbox/oci
+          readOnly: true
+        - name: oci-socket
+          mountPath: /run/fast-sandbox/overlaybd
+        - name: agent-state
+          mountPath: /var/lib/fast-sandbox/firecracker
+        - name: host-dev
+          mountPath: /dev
       # Node janitor sidecar: sweeps orphaned fastlet network state (netns/
       # tap/veth) and — the reason for hostPID — kills
       # leaked VMM processes fastlets delegate over the node-cleanup UDS
@@ -199,7 +249,7 @@ spec:
         image: fast-sandbox/janitor:dev
         imagePullPolicy: IfNotPresent
         command: ["/workspace/janitor"]
-        args: ["--scan-interval=2m", "--orphan-timeout=30s", "--containerd-socket="]
+        args: ["--scan-interval=2m", "--orphan-timeout=30s", "--containerd-socket=", "--oci-state-root=/var/lib/fast-sandbox/firecracker"]
         ports:
         - name: metrics
           containerPort: 9092
@@ -218,10 +268,31 @@ spec:
           mountPropagation: Bidirectional
         - name: node-cleanup
           mountPath: /run/fast-sandbox/janitor
+        - name: oci-tools
+          mountPath: /opt/fast-sandbox/oci
+          readOnly: true
+        - name: oci-socket
+          mountPath: /run/fast-sandbox/overlaybd
+        - name: host-dev
+          mountPath: /dev
+        - name: agent-state
+          mountPath: /var/lib/fast-sandbox/firecracker
         - name: runtime-environments
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
       volumes:
+      - name: oci-tools
+        hostPath:
+          path: /opt/fast-sandbox/oci
+          type: DirectoryOrCreate
+      - name: oci-socket
+        hostPath:
+          path: /run/fast-sandbox/overlaybd
+          type: DirectoryOrCreate
+      - name: host-dev
+        hostPath:
+          path: /dev
+          type: Directory
       - name: agent-socket
         hostPath:
           path: /run/fast-sandbox/firecracker

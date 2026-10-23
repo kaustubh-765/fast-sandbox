@@ -1,25 +1,34 @@
-# Keep the Go toolchain in the development image for the existing debugging
-# workflow, while using Alpine's small network tooling layer.
-FROM golang:1.25-alpine
-# for debug
-# RUN GOPROXY=https://goproxy.cn,direct go install github.com/go-delve/delve/cmd/dlv@latest
-# EXPOSE 2345
+# Fastlet uses node-installed fsb-vm/OverlayBD tools and a node ublkd socket.
+FROM --platform=$BUILDPLATFORM golang:1.25 AS fastlet-build
+ARG TARGETOS
+ARG TARGETARCH
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY api ./api
+COPY cmd ./cmd
+COPY internal ./internal
+COPY pkg ./pkg
+ARG DEBUG=0
+RUN case "$DEBUG" in 0) set -- ;; 1) set -- '-gcflags=all=-N -l' ;; *) exit 2 ;; esac \
+    && mkdir -p /out \
+    && for binary in fastlet sandbox-init; do \
+         CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build "$@" -o "/out/$binary" "./cmd/$binary" || exit $?; \
+       done
 
-WORKDIR /workspace
-# tcpdump: per-slot dataplane diagnosis from inside the fastlet netns
-# (kubectl exec ... -- ip netns exec <slot> tcpdump -i vmtap0)
-# Firecracker calls cp --reflink=always for writable rootfs/snapshot clones.
-# BusyBox cp cannot perform that clone, even on a reflink-capable StateRoot.
-RUN apk add --no-cache iproute2 iptables e2fsprogs tcpdump coreutils
-COPY .build/linux-amd64/fastlet .
-COPY .build/linux-amd64/sandbox-init /opt/fast-sandbox/bin/sandbox-init
-
-# Default envs; can be overridden by Pod spec
+FROM ubuntu:22.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates coreutils e2fsprogs iproute2 iptables mount tcpdump util-linux \
+    libaio1 libcurl4 libssl3 libzstd1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=fastlet-build /out/fastlet /workspace/fastlet
+COPY --from=fastlet-build /out/sandbox-init /opt/fast-sandbox/bin/sandbox-init
+ENV PATH=/opt/fast-sandbox/oci/current/bin:${PATH}
 ENV FASTLET_CONTROL_PORT=":5758"
 ENV FAST_SANDBOX_RUNTIME="container"
 ENV RUNTIME_SOCKET="/run/containerd/containerd.sock"
-
+WORKDIR /workspace
 EXPOSE 5758
-ENTRYPOINT ["./fastlet"]
-# debug
-# ENTRYPOINT ["/go/bin/dlv", "--listen=:2345", "--headless=true", "--api-version=2", "--accept-multiclient", "exec", "/workspace/fastlet"]
+ENTRYPOINT ["/workspace/fastlet"]

@@ -130,6 +130,11 @@ func (m *Manager) pass(ctx context.Context) {
 		}
 	}
 	report := RunChecks(m.current.Check, m.config.Probes)
+	for _, check := range report.Checks {
+		if check.Status == StatusWarn {
+			klog.Warningf("host readiness %s: %s", check.Name, check.Detail)
+		}
+	}
 	if m.reconciler != nil {
 		// The CPU tier is a fact of hardware + the installed binary;
 		// resolved every pass so a first-pass asset install is reflected.

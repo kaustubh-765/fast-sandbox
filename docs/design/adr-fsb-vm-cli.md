@@ -1,5 +1,7 @@
 # ADR: fsb-vm CLI —— 从远程 template 创建 VM 的独立 CLI
 
+> Current contract: one `manifest.json`, `schemaVersion: 1`, shared by OCI and S3. See [Artifact manifest reference](../guides/artifact-manifest-reference.md). Historical metadata layouts must be rebuilt; no legacy decoder is provided.
+
 > 文档类型：架构决策记录（ADR）
 >
 > 日期：2026-09-10
@@ -65,8 +67,8 @@ sandbox项目的实现。
 
 ### ADR-004 kernel：宿主机本地，metadata 校验 + flag 覆盖
 
-- **决策**：kernel 不随镜像分发。`metadata.json.kernel_version` 映射到宿主机约定
-  目录下的 vmlinux（默认约定 `/opt/fsb-vm/kernels/vmlinux-<kernel_version>`，
+- **决策**：kernel 不随镜像分发。`manifest.json.kernel.version` 映射到宿主机约定
+  目录下的 vmlinux（默认约定 `/opt/fsb-vm/kernels/vmlinux-<kernel.version>`，
   可用 `--kernel` 显式覆盖）；文件缺失则报错。
 
 ### ADR-005 memfile：裸内存文件 mmap（Firecracker Backend File）
@@ -80,16 +82,16 @@ sandbox项目的实现。
 ### ADR-006 盘内布局约定：ext4 + 固定路径
 
 - **决策**：snapfiles 设备为 ext4，挂载后固定路径 `/vmstate.bin`、`/memfile`、
-  `/metadata.json`。**既有规范，CLI 适配**；构建侧改动需版本化公告。
-- **风险**：规范目前仅有口头约定，联调时需用真实样例镜像验证路径与 FS 类型。
+  `/manifest.json`。由 fsb-vm 按共享模型生成，历史元数据格式的产物需重建。
+- **校验**：读取时使用共享 Go 模型，并明确校验 schemaVersion。
 
-### ADR-007 规格与设备路径来源：metadata.json 权威
+### ADR-007 规格与设备路径来源：manifest.json 权威
 
-- **决策**：`vcpu_count / memory_mb / disk_size_mb` 等规格由快照决定，create 不提供
+- **决策**：`machine.vcpuCount / machine.memoryMiB / machine.rootfsSizeMiB` 等规格由快照决定，create 不提供
   `--vcpu` 或 `--memory-mb` 覆盖；仅允许 `--kernel` 覆盖宿主 kernel 文件路径。启动前校验：
-  `hypervisor_type` 当前仅支持 `firecracker`；`cpu_arch` 与宿主一致；本机 firecracker
-  版本与 `firecracker_version` 兼容（不兼容默认报错，`--force` 仅可降级版本错误）。
-  `rootfs_drive_path` 必须为相对路径 `rootfs.dev`，旧模板缺失该字段或记录宿主绝对设备路径时
+  `runtime` 当前仅支持 `firecracker`；`compatibility.cpuArch` 与宿主一致；本机 firecracker
+  版本与 `compatibility.firecrackerVersion` 兼容（不兼容默认报错，`--force` 仅可降级版本错误）。
+  `machine.rootfsDrivePath` 必须为相对路径 `rootfs.dev`，旧模板缺失该字段或记录宿主绝对设备路径时
   必须重新 build，`--force` 不能绕过。
 
 ### ADR-008 rootfs upper：hybrid 可写层，默认不 commit
@@ -120,8 +122,7 @@ sandbox项目的实现。
 
 ### ADR-010 网络：NetworkProvider 抽象，MVP 支持 none
 
-- **决策**：metadata.json 的 `network{host_dev_name, mac}` 属既有网络体系
-  （`cnid-*`）。CLI 定义 NetworkProvider 接口（Acquire(metadata) → 设备 +
+- **决策**：manifest.json 的 `guestNetwork` 记录烘焙的 guest NIC，不持久化宿主 tap 名称。CLI 定义 NetworkProvider 接口（Acquire(metadata) → 设备 +
   清理回调），具体对接规范**待网络侧提供**；MVP 默认 `--network=none` 跳过，
   不阻塞快照恢复主链路。
 - **未决输入**：网络体系的设备分配接口（待用户提供后另起 ADR 补充）。
@@ -153,7 +154,7 @@ sandbox项目的实现。
   `e2fsck -fn`；文件系统先到达目标后才删除 ublk 设备，通过
   `overlaybd-resize --config ... --size <目标>` 更新 upper，再更新 config 中的 vsize 并
   重新 add。最终以 BLKGETSIZE64 和 `dumpe2fs -h` 同时校验设备与 ext4 几何精确等于目标。
-  metadata.json 保留既有 `disk_size_mb` 字段，写入 `disk_size_gb × 1024`。
+  manifest.json 保留既有 `machine.rootfsSizeMiB` 字段，写入 `disk_size_gb × 1024`。
 - **快照拍摄**：向可写 rootfs 注入 init 脚本（内置 redis 样例默认脚本，
   `--init-script-file` 覆盖）。`--init-path` 必须是 clean 绝对 guest 路径，写入全程经
   `os.Root` 约束，最终分量若为符号链接则替换，镜像内容不能把写操作重定向到宿主机或其他
@@ -165,7 +166,7 @@ sandbox项目的实现。
   目录重建同名链接，并以该目录为 Firecracker cwd，在 snapshot load 前提供正确设备；load
   后不再 PATCH drive。
 - **snapfiles 不经 raw 导入**：`overlaybd-create --hybrid` 建无 lower 的空可写盘 →
-  `mkfs.ext4` → rw 挂载 → 写入 `/vmstate.bin`、`/memfile`、`/metadata.json` →
+  `mkfs.ext4` → rw 挂载 → 写入 `/vmstate.bin`、`/memfile`、`/manifest.json` →
   sync → umount → ublkd del → `overlaybd-commit` 封装为只读层。排除项：
   `build/sandboxtemplate-builder/overlaybd-import-raw.cpp`（不参与本链路）。
 - **密封顺序**：先 commit snapfiles upper，再删除 rootfs ublk 设备后 commit rootfs
@@ -215,7 +216,7 @@ sandbox项目的实现。
 3. 将 dockerAuth 规范化为 OverlayBD blob URL 前缀后合入 `/opt/overlaybd/cred.json`。
 4. rootfs：分配前先持久化 config 所有权 → 创建 hybrid upper → ublkd `/v1/add` → 更新设备记录。
 5. snapfiles：分配前先持久化 config 所有权 → `/v1/add` → mount -o ro →
-   读 metadata.json / 校验（ADR-007）。
+   读 manifest.json / 校验（ADR-007）。
 6. 解析 kernel 路径；在运行目录建立 `rootfs.dev` 链接并以该目录为 cwd 启动 Firecracker；
    持久化 `(pid, starttime, boot_id)`。
 7. `PUT /snapshot/load`（vmstate 中的相对 `rootfs.dev` 已可解析，memfile 使用 File backend）
@@ -239,7 +240,7 @@ sandbox项目的实现。
 6. 冷启动 Firecracker（1C1G 默认）→ 串口等待 ready pattern → pause → Full Snapshot
    → 终止 Firecracker。
 7. snapfiles：空 hybrid upper → `/v1/add` → `mkfs.ext4` → rw 挂载 → 写入
-   vmstate.bin/memfile/metadata.json → sync → umount → ublkd del → commit。
+   vmstate.bin/memfile/manifest.json → sync → umount → ublkd del → commit。
 8. rootfs ublk del → commit rootfs upper；两个 commit 层移入 `blobs/sha256/`。
 9. 生成最小 config blob、双 manifest、index.json；全量校验布局完整性 → 清理临时目录
    → 输出产物清单。
@@ -248,8 +249,8 @@ sandbox项目的实现。
 
 | 风险 | 缓解 |
 |------|------|
-| hypervisor_type=dragonball 的存量模板无法恢复 | 启动前硬校验 + 明确报错；VMM 抽象预留 |
-| vmstate 版本与宿主 firecracker 不兼容 | `firecracker_version` 校验；`--force` 逃生门 |
+| runtime=dragonball 的存量模板无法恢复 | 启动前硬校验 + 明确报错；VMM 抽象预留 |
+| vmstate 版本与宿主 firecracker 不兼容 | `compatibility.firecrackerVersion` 校验；`--force` 逃生门 |
 | 盘内布局仅口头约定 | 联调用真实镜像验证；路径集中为一个常量区块 |
 | cred.json 并发覆盖或 key 与 blob URL 不匹配 | 文件锁 + tmp/fsync/rename；规范化 host/repository key 并按最长 key 优先 |
 | ublkd 设备泄漏（CLI 崩溃后） | 分配前后渐进持久化 config 所有权；delete 按 ublkd 当前 config 身份回收，失败保留状态供重试 |

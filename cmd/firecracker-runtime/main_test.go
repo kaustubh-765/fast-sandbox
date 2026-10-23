@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,14 @@ import (
 	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/registryconfig"
 )
+
+func TestNodeAgentDoesNotResolveOCIWithNodeCredentials(t *testing.T) {
+	provider := &fakeProvider{err: errors.New("node credentials must not be read")}
+	client := &livePullClient{registry: provider}
+	err := client.PullImage(context.Background(), t.TempDir(), "oci://registry.example/team/template:build")
+	require.ErrorContains(t, err, "must be prepared by fsb-vm")
+	require.Empty(t, provider.lastRef)
+}
 
 // fakeProvider mocks the registryconfig.Provider interface.
 type fakeProvider struct {

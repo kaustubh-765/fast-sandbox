@@ -8,10 +8,12 @@ CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
 SANDBOX_ACTION_FIXTURE_IMAGE ?= $(REGISTRY)/sandbox-action-fixture:dev
 FIRECRACKER_RUNTIME_IMAGE ?= $(REGISTRY)/firecracker-runtime:dev
+OCI_TOOLS_IMAGE ?= $(REGISTRY)/oci-tools:dev
+SANDBOX_TEMPLATE_BUILDER_IMAGE ?= $(REGISTRY)/sandboxtemplate-builder:dev
 
 GO ?= go
 PYTHON ?= python3
-GOPROXY ?= $(shell $(GO) env GOPROXY)
+GOPROXY ?= https://proxy.golang.org,direct
 DOCKER_BUILD_FLAGS ?=
 DEBUG ?= 0
 COMPONENT ?= all
@@ -29,7 +31,8 @@ LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
 ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime fsb-vm
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
 ALL_IMAGES := $(CORE_IMAGES) sandbox-action-fixture firecracker-runtime
-UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
+IMAGE_COMPONENTS := $(ALL_IMAGES) oci-tools sandboxtemplate-builder
+UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./build/oci ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 ifeq ($(DEBUG),1)
 GO_BUILD_FLAGS := -gcflags="all=-N -l"
@@ -124,7 +127,7 @@ fsb-vm-convertor:
 	@$(MAKE) -C "$(ACCELERATED_CONTAINER_IMAGE_DIR)" bin/convertor
 
 images:
-	@case " $(ALL_IMAGES) " in \
+	@case " $(IMAGE_COMPONENTS) " in \
 		*" $(COMPONENT) "*) components="$(COMPONENT)" ;; \
 		*) case "$(COMPONENT)" in \
 			all) components="$(ALL_IMAGES)" ;; \
@@ -132,14 +135,20 @@ images:
 			*) echo "unknown image COMPONENT=$(COMPONENT)" >&2; exit 2 ;; \
 		   esac ;; \
 	esac; \
-	mkdir -p "$(LINUX_BIN_DIR)"; \
 	for component in $$components; do \
 		case "$$component" in \
-			fastlet) binaries="fastlet sandbox-init" ;; \
+			firecracker-runtime|sandboxtemplate-builder) \
+				if [ "$(OCI_TOOLS_IMAGE)" = "$(REGISTRY)/oci-tools:dev" ]; then \
+					$(MAKE) --no-print-directory images COMPONENT=oci-tools || exit $$?; \
+				fi ;; \
+		esac; \
+		case "$$component" in \
+			fastlet|oci-tools|sandboxtemplate-builder) binaries="" ;; \
 			sandbox-action-fixture) binaries="sandbox-action-fixture" ;; \
 			*) binaries="$$component" ;; \
 		esac; \
 		for binary in $$binaries; do \
+			mkdir -p "$(LINUX_BIN_DIR)"; \
 			echo "==> build linux/amd64 $$binary"; \
 			CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GO_BUILD_FLAGS) \
 				-o "$(LINUX_BIN_DIR)/$$binary" "./cmd/$$binary" || exit $$?; \
@@ -147,13 +156,22 @@ images:
 		echo "==> image $$component"; \
 		case "$$component" in \
 			controller) docker build $(DOCKER_BUILD_FLAGS) -t "$(CONTROLLER_IMAGE)" -f build/Dockerfile.controller . ;; \
-			fastlet) docker build $(DOCKER_BUILD_FLAGS) -t "$(FASTLET_IMAGE)" -f build/Dockerfile.fastlet . ;; \
+			fastlet) docker build $(DOCKER_BUILD_FLAGS) --platform linux/amd64 \
+				--build-arg GOPROXY="$(GOPROXY)" --build-arg DEBUG="$(DEBUG)" \
+				-t "$(FASTLET_IMAGE)" -f build/Dockerfile.fastlet . ;; \
 			fastlet-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(FASTLET_PROXY_IMAGE)" -f build/Dockerfile.fastlet-proxy . ;; \
 			sandbox-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_PROXY_IMAGE)" -f build/Dockerfile.sandbox-proxy . ;; \
 			janitor) docker build $(DOCKER_BUILD_FLAGS) -t "$(JANITOR_IMAGE)" -f build/Dockerfile.janitor . ;; \
 			sandbox-action-fixture) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_ACTION_FIXTURE_IMAGE)" -f build/Dockerfile.sandbox-action-fixture . ;; \
-			firecracker-runtime) docker build $(DOCKER_BUILD_FLAGS) \
+			firecracker-runtime) docker build $(DOCKER_BUILD_FLAGS) --platform linux/amd64 \
+				--build-arg OCI_TOOLS_IMAGE="$(OCI_TOOLS_IMAGE)" \
 				-t "$(FIRECRACKER_RUNTIME_IMAGE)" -f build/Dockerfile.firecracker-runtime . ;; \
+			oci-tools) docker build $(DOCKER_BUILD_FLAGS) --platform linux/amd64 \
+				--build-arg GOPROXY="$(GOPROXY)" \
+				-t "$(OCI_TOOLS_IMAGE)" -f build/Dockerfile.oci-tools . ;; \
+			sandboxtemplate-builder) docker build $(DOCKER_BUILD_FLAGS) --platform linux/amd64 \
+				--build-arg GOPROXY="$(GOPROXY)" --build-arg OCI_TOOLS_IMAGE="$(OCI_TOOLS_IMAGE)" \
+				-t "$(SANDBOX_TEMPLATE_BUILDER_IMAGE)" -f build/Dockerfile.sandboxtemplate-builder . ;; \
 		esac || exit $$?; \
 	done
 

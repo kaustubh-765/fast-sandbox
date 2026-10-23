@@ -5,12 +5,44 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"fast-sandbox/internal/artifacts"
 )
+
+func TestNativePublishDoesNotUploadStaleOverlayBDLayers(t *testing.T) {
+	spec, kernel, rootfs, vmstate, memory := buildManifestFixture(t)
+	workdir := filepath.Dir(rootfs)
+	spec.Output.Publish = "s3://bucket/templates"
+	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, "", nil)
+	require.NoError(t, err)
+	for _, kind := range []string{"rootfs", "memory"} {
+		dir := filepath.Join(workdir, "overlaybd", kind)
+		require.NoError(t, os.MkdirAll(dir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "layer.lsmt"), []byte("stale-layer"), 0600))
+	}
+	bin := t.TempDir()
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	log := filepath.Join(workdir, "uploads")
+	t.Setenv("TEST_UPLOAD_LOG", log)
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "aws"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_UPLOAD_LOG\"\n"), 0755))
+	ref, err := publish(context.Background(), spec, workdir, raw, publishCredentials{})
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(ref, "/manifest.json"))
+	uploads, err := os.ReadFile(log)
+	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(string(uploads)), "\n")
+	require.Len(t, lines, 6) // Three artifacts, checksums, manifest, then image index.
+	require.NotContains(t, string(uploads), "overlaybd")
+	require.Contains(t, lines[4], "/manifest.json")
+	require.Contains(t, lines[5], "/index/")
+}
 
 // TestImageIndexKeyMatchesConsumerCacheKey verifies the index key derivation
 // matches the consumer-side cache key (sha256 of the image reference string),

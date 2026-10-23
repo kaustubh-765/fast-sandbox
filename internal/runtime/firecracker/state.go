@@ -102,9 +102,8 @@ func metaPath(directory string) string {
 	return filepath.Join(directory, sandboxMetaName)
 }
 
-// saveState persists the Sandbox state to meta.json. The write is in place
-// (no temp-file + rename): a crash mid-write can truncate the file, and
-// loadState then surfaces a decode error for the affected Sandbox.
+// saveState replaces meta.json atomically so process death cannot truncate
+// the ownership record needed to recover attached OCI devices.
 func saveState(directory string, state *SandboxState) error {
 	if state == nil {
 		return fmt.Errorf("%w: sandbox state is required", ErrInvalidConfig)
@@ -113,11 +112,19 @@ func saveState(directory string, state *SandboxState) error {
 	if err != nil {
 		return err
 	}
-	path := metaPath(directory)
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
+	file, err := os.CreateTemp(directory, ".meta-*")
+	if err != nil {
 		return err
 	}
-	return os.Chtimes(path, time.Now(), time.Now())
+	defer os.Remove(file.Name())
+	if _, err := file.Write(payload); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), metaPath(directory))
 }
 
 // loadState reads the Sandbox state; os.ErrNotExist means the Sandbox is not

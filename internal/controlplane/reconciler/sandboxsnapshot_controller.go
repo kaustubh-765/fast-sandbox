@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
+	"oras.land/oras-go/v2/registry/remote/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -23,13 +26,15 @@ import (
 	"fast-sandbox/internal/controlplane/assignment"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/observability"
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"fast-sandbox/internal/registryconfig"
 )
 
 const (
-	// SandboxSnapshotFinalizerName gates object deletion on best-effort
-	// cleanup of node-local snapshot artifacts.
-	SandboxSnapshotFinalizerName = "sandbox.fast.io/snapshot-cleanup"
+	// SandboxSnapshotFinalizerName gates object deletion on published OCI
+	// artifact deletion and best-effort node-local cleanup.
+	SandboxSnapshotFinalizerName = assignment.SnapshotCleanupFinalizer
 	// SnapshotObservationPollInterval drives the observe loop of a running
 	// snapshot task.
 	SnapshotObservationPollInterval = time.Second
@@ -109,6 +114,17 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, request ctrl.
 		return *result, nil
 	}
 	ctx = enrichSnapshotIdentity(ctx, sandbox)
+	// Pin the credential scope before any publication can start. The source
+	// Sandbox may be deleted before the snapshot itself is deleted.
+	if snapshot.Annotations[assignment.AnnotationSnapshotPoolRef] == "" {
+		if snapshot.Annotations == nil {
+			snapshot.Annotations = map[string]string{}
+		}
+		snapshot.Annotations[assignment.AnnotationSnapshotPoolRef] = sandbox.Spec.PoolRef
+		if err := r.Update(ctx, &snapshot); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if snapshot.Status.SnapshotID == "" {
 		return r.reconcileTrigger(ctx, &snapshot, sandbox)
 	}
@@ -275,8 +291,13 @@ func (r *SandboxSnapshotReconciler) reconcileDeletion(ctx context.Context, snaps
 			return ctrl.Result{RequeueAfter: SnapshotObservationPollInterval}, err
 		}
 	}
-	// Best-effort artifact cleanup: stored objects are never unpublished and
-	// node-side leftovers are bounded by driver-local garbage collection.
+	// projectObservation updates this copy from the successful status write;
+	// a cached re-read here could still omit the just-published reference.
+	if err := r.deletePublishedOCISnapshot(ctx, snapshot); err != nil {
+		return ctrl.Result{RequeueAfter: SnapshotRetryInterval}, err
+	}
+	// Node-local leftovers remain best-effort; remote artifact deletion above
+	// is mandatory even when the source Sandbox or Fastlet no longer exists.
 	sandbox, result, resolveErr := r.resolveTarget(ctx, snapshot)
 	if resolveErr == nil && result == nil && sandbox != nil {
 		ctx = enrichSnapshotIdentity(ctx, sandbox)
@@ -303,6 +324,37 @@ func (r *SandboxSnapshotReconciler) reconcileDeletion(ctx context.Context, snaps
 		controllerutil.RemoveFinalizer(&current, SandboxSnapshotFinalizerName)
 		return r.Update(ctx, &current)
 	})
+}
+
+// Remote cleanup belongs to the controller, not to the source VM's Fastlet:
+// the source and its node may already be gone when the snapshot is deleted.
+func (r *SandboxSnapshotReconciler) deletePublishedOCISnapshot(ctx context.Context, snapshot *apiv1alpha2.SandboxSnapshot) error {
+	if !strings.HasPrefix(snapshot.Status.ManifestRef, ocitemplate.Prefix) {
+		return nil
+	}
+	if err := ocitemplate.ValidateDigestReference(snapshot.Status.ManifestRef, snapshot.Status.ArtifactDigest); err != nil {
+		return err
+	}
+	pool := snapshot.Annotations[assignment.AnnotationSnapshotPoolRef]
+	if pool == "" {
+		return fmt.Errorf("snapshot credential Pool reference is missing")
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: snapshot.Namespace, Name: registrySecretName(pool)}, &secret); err != nil {
+		return err
+	}
+	compiled, err := registryconfig.ParseCompiled(secret.Data[registryconfig.SecretKey])
+	if err != nil {
+		return err
+	}
+	credentials := func(_ context.Context, reference string) (auth.Credential, error) {
+		value, _ := compiled.Match(reference)
+		if value.WriteUsername != "" {
+			value.Username, value.Password, value.IdentityToken = value.WriteUsername, value.WritePassword, ""
+		}
+		return ocitemplate.BasicCredential(value.Username, value.Password, value.IdentityToken)
+	}
+	return ocitemplate.DeletePair(ctx, snapshot.Status.ManifestRef, snapshot.Status.SnapshotID, credentials)
 }
 
 // waitSnapshotTerminal reports whether the in-flight task reached a terminal
@@ -384,14 +436,20 @@ func (r *SandboxSnapshotReconciler) patchStatus(ctx context.Context, snapshot *a
 		// the object (a deletion-time target recheck or a stale observation
 		// would otherwise roll a terminal object backwards).
 		if before.Phase.Terminal() {
+			*snapshot = current
 			return nil
 		}
 		mutate(&current.Status)
 		current.Status.ObservedGeneration = current.Generation
 		if reflect.DeepEqual(before, current.Status) {
+			*snapshot = current
 			return nil
 		}
-		return r.Status().Update(ctx, &current)
+		if err := r.Status().Update(ctx, &current); err != nil {
+			return err
+		}
+		*snapshot = current
+		return nil
 	})
 }
 

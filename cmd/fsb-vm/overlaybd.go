@@ -238,7 +238,7 @@ func resizeOverlayBDUpper(ctx context.Context, configPath string, targetGiB int)
 
 // writeBuildSnapfilesConfig creates an empty hybrid writable upper (no
 // lowers): the device starts as a blank disk that the build formats with
-// ext4 and fills with vmstate.bin/memfile/metadata.json.
+// ext4 and fills with vmstate.bin/memfile/manifest.json.
 func writeBuildSnapfilesConfig(ctx context.Context, workDir string, sizeGiB int) (configPath string, err error) {
 	dataFile, indexFile := buildUpperPaths(workDir, "snapfiles")
 	if err := createHybridUpper(ctx, global.overlaybdCreate, dataFile, indexFile, sizeGiB); err != nil {

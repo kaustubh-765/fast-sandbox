@@ -2,6 +2,8 @@ package firecracker
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -241,4 +243,38 @@ func TestEnsureSandboxCachedImageNeverPins(t *testing.T) {
 	require.NoError(t, err)
 	pins, _, _ := agent.snapshot()
 	require.Empty(t, pins, "a cached image must not pin on create (warm pull pins once, delete unpins once)")
+}
+
+func TestDeleteOCIResumeDoesNotUnpinAgentImages(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	agent := &fakeAgentClient{}
+	fixture.installAgent(agent)
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	directory := filepath.Join(fixture.driver.config.StateRoot, sandboxStateDir, fixture.sandboxSpec.Identity.SandboxUID)
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	digest := strings.Repeat("a", 64)
+	checkpoint := "oci://registry.example/checkpoints@sha256:" + digest
+	state.Config.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: checkpoint, ArtifactDigest: digest}
+	require.NoError(t, saveState(directory, state))
+	require.NoError(t, fixture.driver.DeleteSandbox(context.Background(), fixture.sandboxSpec.Identity.SandboxUID))
+	_, unpins, _ := agent.snapshot()
+	require.Empty(t, unpins)
+}
+
+func TestReleaseAgentSandboxUnpinIDScopesEachResumeReference(t *testing.T) {
+	fixture := newDriverFixture(t)
+	agent := &fakeAgentClient{}
+	fixture.installAgent(agent)
+	for _, reference := range []string{"template", "checkpoint-1", "checkpoint-2", "checkpoint-2"} {
+		fixture.driver.releaseAgentSandbox(context.Background(), "same-sandbox", reference)
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	require.Len(t, agent.unpinReqs, 4)
+	require.NotEqual(t, agent.unpinReqs[0], agent.unpinReqs[1])
+	require.NotEqual(t, agent.unpinReqs[1], agent.unpinReqs[2])
+	require.Equal(t, agent.unpinReqs[2], agent.unpinReqs[3], "retrying the same release remains idempotent")
 }

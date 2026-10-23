@@ -19,6 +19,7 @@ type ResourceBackend string
 const (
 	BackendContainerd   ResourceBackend = "containerd"
 	BackendLinuxNetwork ResourceBackend = "linux-network"
+	BackendOCI          ResourceBackend = "oci"
 )
 
 // ResourceIdentity is the common fencing identity for every node-local

@@ -3,7 +3,7 @@
 A SandboxSnapshot takes a live checkpoint of a **running** Sandbox and
 publishes it as a bootable image. After the snapshot succeeds, starting a
 new Sandbox from it is an ordinary create whose `image` is the snapshot's
-template name — same as any golden image.
+template name for native + S3, or the returned immutable OCI `manifest_ref` for OverlayBD + OCI. See [OCI live snapshots](overlaybd-oci-sandboxes.md#live-snapshot-api) for the UUID-based two-artifact flow.
 
 ```text
 your Sandbox (running)
@@ -19,10 +19,12 @@ During the snapshot the source Sandbox keeps running: the only interruption
 is a sub-second pause while the memory is dumped (zero observable `/ping`
 failures with a spill area configured).
 
+The source remains running for both publication paths. OCI snapshots use a random UUID `snapshot_id`; `template_name` is optional and no image-name index is published. Native snapshots retain the named-index behavior described below.
+
 ## Prerequisites
 
 - The target Sandbox is `Ready` on a Firecracker pool.
-- The node runtime-agent has a **write credential** for the artifact store
+- For native + S3, the node runtime-agent has a **write credential** for the artifact store
   (a `writeSecretRef` on the registry rule; without it snapshots fail with
   a Forbidden-family error and pulls keep working). Your platform operator
   provides this — on the integration environment `verify-snapshot` wires it
@@ -96,32 +98,34 @@ path); later creates on that node restore in milliseconds.
 
 ## Network policy on restore
 
-A snapshot records the source Sandbox's **action bindings** verbatim in the
-published manifest (`actionBindings`, an optional field every existing
-consumer ignores) — including egress network policy applied through the
-egress handler. The artifact set is therefore self-contained and outlives
-the SandboxSnapshot CR: deleting the CR keeps the artifacts, and the
-policy survives with them.
+The published manifest carries no policy record. What a Sandbox created
+from a snapshot image enforces is decided by two channels, in a fixed
+priority:
 
-Creating a Sandbox whose `image` equals a snapshot's `templateName`
-re-applies the recorded policy automatically: fastpath resolves the image
-through the artifact store at create time (two small GETs — index then
-manifest — served through the target Pool's compiled registry credential,
-with a short-TTL cache), then merges:
+1. **Template state carry (capability-gated).** When the egress handler
+   reports `templateStateExport`, the template bundle includes the source's
+   opaque, sealed `policy.json`. The node lands it for the clone's first
+   registration — strictly before the data plane becomes ready — and the
+   landed record is authoritative: its revision is the source's, not the
+   seed's. This is how a clone continues the source's converged policy.
+2. **The create-request `actionBindings` (the seed).** A clone is a new
+   policy subject; the bindings you pass are validated as on any create and
+   seed its first registration. They decide the effective policy when the
+   template bundle carries no state — the egress lacks the capability, or
+   the landing degraded (logged, never fails the create).
 
-- bindings you pass **explicitly** on the create win per handler (override
-  one policy, keep the rest);
-- recorded handlers the target Pool does not declare are dropped (they
-  could not take effect there);
-- in-guest network state (routes, connections, in-guest firewall) comes
-  along in the memory image itself.
+`verify-policy` discriminates the channels by cloning with the *opposite*
+binding (deny) while the template record is allow: a capability-carrying
+egress must enforce the template's allow (source revision preserved); a
+seed-only egress must enforce the deny.
 
-Resolution is best-effort: an unreachable store or an image unknown to it
-(the local-only case) proceeds without recorded policy, so sandbox create
-availability never hinges on the object store. The store comes from the
-mounted `fast-sandbox-artifact-store` ConfigMap (an absent or empty `store`
-disables the feature). The policy still passes the target Pool's
-handler validation and drives the normal binding lifecycle.
+Pause the source Sandbox first if you need to replay its bindings — they
+are readable from the Sandbox spec until it is gone.
+
+A resume of the *same* Sandbox (pause checkpoint) is different: its live,
+relay-mutated policy rides the checkpoint bundle as the opaque
+`policy.json` and is re-imported node-side before the data plane becomes
+ready. That path never involves the control plane or the manifest.
 
 ## Rules of thumb
 
@@ -135,8 +139,10 @@ handler validation and drives the normal binding lifecycle.
 - **After `Failed`**: issue a new snapshot with a new `request_id` (the
   object is one-shot). Nothing was made addressable by the failed attempt.
 - **Deleting the snapshot** (`DeleteSandboxSnapshot` / `kubectl delete`)
-  removes the CR and node-local staging, but **never deletes the published
-  artifacts** — store lifecycle is managed out of band.
+  deletes the published rootfs and snapfiles manifests for OCI snapshots,
+  then removes the CR and node-local staging. Failures keep the CR terminating
+  for retry. Shared blobs are reclaimed by registry GC. Native + S3 retains
+  its existing out-of-band artifact lifecycle.
 - Template names are **global across namespaces**: two teams snapshotting to
   the same name overwrite each other's index (last writer wins).
 
@@ -184,7 +190,7 @@ credentials) see the sections below.
 - **Artifacts**: byte-identical to SandboxTemplate builds
   (`<store>/<sha256(manifest)[:16]>/{rootfs.ext4,vmstate.snap,memory.snap,
   SHA256SUMS,manifest.json}` + `index/<sha256(templateName)>.json` written
-  last). The manifest copies `machine`/`guestNetwork`/`kernel`/`envs`
+  last). The manifest copies `machine`/`guestNetwork`/`kernel`/`platform.envs`
   verbatim from the source image (they describe the vmstate lineage that
   restore validates). Only the template-name index is written — never a
   default `sha256(image)` key, which would pollute the golden image.

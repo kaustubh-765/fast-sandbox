@@ -310,8 +310,9 @@ docker pull -q "$CHAIN_SOURCE_IMAGE" >/dev/null 2>&1 || die "docker pull failed:
 docker save "$CHAIN_SOURCE_IMAGE" -o "$IMAGE_TAR" >/dev/null 2>&1 || die "docker save failed"
 
 log "building builder image ($BUILDER_IMAGE)"
-docker build --progress=plain -t "$BUILDER_IMAGE" \
-    -f "$REPO_ROOT/build/Dockerfile.sandboxtemplate-builder" "$REPO_ROOT" || die "builder image build failed"
+(cd "$REPO_ROOT" && make images COMPONENT=sandboxtemplate-builder \
+    SANDBOX_TEMPLATE_BUILDER_IMAGE="$BUILDER_IMAGE" \
+    DOCKER_BUILD_FLAGS="--progress=plain") || die "builder image build failed"
 
 SPEC_JSON=$(jq -n \
     --arg image "$CHAIN_IMAGE" \
@@ -416,7 +417,7 @@ while IFS= read -r name; do
         echo "warning: mc cp download of $name skipped (tool limitation); upload covered by local digest + stored size" >&2
     fi
     rm -f "$WORK/verify-$name"
-done < <(printf '%s' "$MANIFEST_JSON" | jq -r '.files | keys[]' | grep -v '^overlaybd/')
+done < <(printf '%s' "$MANIFEST_JSON" | jq -r '.files | keys[]')
 pass "verification point 1: publish layout (index + digest16 build + SHA256SUMS)"
 
 # --- runtime-agent -----------------------------------------------------------

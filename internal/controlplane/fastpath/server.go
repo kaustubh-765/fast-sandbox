@@ -45,9 +45,6 @@ type Server struct {
 	CredentialIssuer    *routeauth.Issuer
 	SandboxProxyBaseURL string
 	DefaultNamespace    string
-	// ManifestPolicy resolves snapshot-recorded action bindings from the
-	// artifact store at create time (nil disables the re-application).
-	ManifestPolicy ManifestPolicySource
 }
 
 var _ fastpathv2.FastPathServiceServer = &Server{}
@@ -116,15 +113,6 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	// Inject identity before any downstream logging: helper calls on this
 	// path log through the ctx logger and must carry request_id/namespace.
 	ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: request.RequestId})
-	// A create whose image resolves to a snapshot re-applies the
-	// manifest-recorded runtime policy (network policy via the egress
-	// handler, lifecycle hooks): explicit bindings win per handler, and
-	// only handlers the target Pool declares are filled in.
-	bindings, err = s.applyManifestRecordedBindings(ctx, request, bindings, pool)
-	if err != nil {
-		return nil, err
-	}
-
 	createSpecHash, err := CreateSpecHash(request)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "hash create request: %v", err)
@@ -508,6 +496,12 @@ func (s *Server) GetSandbox(ctx context.Context, request *fastpathv2.GetSandboxR
 	}
 	if err := checkGenerationFloor(sandbox, request.ExpectedGeneration); err != nil {
 		return nil, err
+	}
+	// Pause states belong to the controller FSM. The runtime may already be
+	// released while its assignment is still present, and Fastlet cannot
+	// report these states even before release.
+	if sandbox.Status.Runtime.State == apiv1alpha2.RuntimePausing || sandbox.Status.Runtime.State == apiv1alpha2.RuntimePaused {
+		return &fastpathv2.GetSandboxResponse{Sandbox: sandboxInfoFromCRD(sandbox), Generation: sandbox.Generation}, nil
 	}
 	// Without a durable assignment there is no live runtime to inspect: a
 	// paused Sandbox (no placement) and a resume waiting for capacity both

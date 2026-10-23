@@ -169,6 +169,8 @@ environments:
 	require.True(t, hasHostPath(plan.Profile, "/opt/fast-sandbox/firecracker/firecracker"))
 	require.True(t, hasHostPath(plan.Profile, "/opt/fast-sandbox/firecracker/jailer"))
 	require.True(t, hasHostPath(plan.Profile, "/srv/fast-sandbox/firecracker"))
+	require.False(t, hasHostPath(plan.Profile, "/srv/fast-sandbox/firecracker/overlaybd-cache"))
+	require.False(t, hasHostPath(plan.Profile, "/var/lib/fast-sandbox/firecracker/overlaybd-cache"))
 }
 
 func TestFirecrackerBindingKeepsBuiltinDefaultsWhenEmpty(t *testing.T) {

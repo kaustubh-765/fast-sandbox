@@ -40,6 +40,7 @@ const (
 )
 
 type FastletClient interface {
+	Heartbeat(context.Context, string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
 	CreateSandbox(context.Context, string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
 	InspectSandbox(context.Context, string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
 	DeleteSandbox(context.Context, string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
@@ -49,6 +50,7 @@ type FastletClient interface {
 }
 
 type Registry interface {
+	ApplyHeartbeat(placement.FastletID, string, *fastletapi.HeartbeatResponse, time.Time) error
 	TopK(placement.CandidateRequest, int) []placement.FastletInfo
 	GetFastletByID(placement.FastletID) (placement.FastletInfo, bool)
 	RecordFeedback(placement.FastletID, placement.LocalFeedback)
@@ -278,6 +280,17 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 	if sandbox == nil || sandbox.UID == "" {
 		return nil, false, errors.New("persisted Sandbox UID is required")
 	}
+	// Reconciles read from the informer cache, which may still contain the
+	// released assignment's fences after ClearAssignment writes to the API.
+	// Use the durable object before selecting a new runtime identity.
+	var current apiv1alpha2.Sandbox
+	if err := o.Client.Get(ctx, client.ObjectKeyFromObject(sandbox), &current); err != nil {
+		return nil, false, err
+	}
+	if current.UID != sandbox.UID {
+		return nil, false, assignment.ErrAssignmentAnnotationChanged
+	}
+	sandbox = &current
 	envelope, err := assignment.AssignmentFromAnnotation(sandbox)
 	if err != nil {
 		return nil, false, err
@@ -632,6 +645,23 @@ func (o *Orchestrator) RuntimeGone(ctx context.Context, sandbox *apiv1alpha2.San
 	if err != nil {
 		var failure *fastletapi.FastletError
 		if errors.As(err, &failure) && failure.Code == fastletapi.ErrorNotFound {
+			// Release the scheduler's stale full-capacity observation before a
+			// paused Sandbox can resume. Delete is asynchronous, so refresh only
+			// after Inspect confirms absence, using the normal heartbeat fences.
+			refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			heartbeat, refreshErr := o.FastletClient.Heartbeat(refreshCtx, fastlet.PodIP, &fastletapi.HeartbeatRequest{
+				Cache: fastletapi.CacheCursor{Epoch: fastlet.CacheEpoch, Revision: fastlet.CacheRevision},
+			})
+			if refreshErr == nil {
+				refreshErr = o.Registry.ApplyHeartbeat(fastlet.ID, fastlet.PodUID, heartbeat, time.Now())
+			}
+			// A newer periodic heartbeat may have won the race. On other failures,
+			// retain the existing observation and let periodic probing recover;
+			// a failed refresh must not undo confirmed runtime deletion.
+			if refreshErr != nil && !errors.Is(refreshErr, placement.ErrStaleHeartbeat) {
+				klog.ErrorS(refreshErr, "Refresh Fastlet capacity after runtime deletion", "fastlet", fastlet.ID, "podUID", fastlet.PodUID)
+			}
 			return true, nil
 		}
 		return false, err

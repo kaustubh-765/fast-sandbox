@@ -64,6 +64,20 @@ const (
 	PublishKindCheckpoint = "checkpoint"
 )
 
+// Bundle member names of a published snapshot artifact set. The driver
+// stages the optional state files under these exact names, the publisher
+// uploads them under these names, and the pull layer materializes them
+// byte-identically next to the snapshot files — a rename on one side would
+// silently break the cross-node resume. Keep the derivation in one place.
+const (
+	// VaultBundleName is the staged credential vault file of a checkpoint
+	// set (OSEP-0022).
+	VaultBundleName = "vault.json"
+	// PolicyBundleName is the staged recorded network policy file of any
+	// snapshot set (checkpoint and template alike).
+	PolicyBundleName = "policy.json"
+)
+
 // PinImageRequest pulls and keeps an image pinned on the node.
 type PinImageRequest struct {
 	Identity

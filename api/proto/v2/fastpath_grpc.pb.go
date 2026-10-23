@@ -50,7 +50,7 @@ type FastPathServiceClient interface {
 	GetPool(ctx context.Context, in *GetPoolRequest, opts ...grpc.CallOption) (*PoolInfo, error)
 	ListPools(ctx context.Context, in *ListPoolsRequest, opts ...grpc.CallOption) (*ListPoolsResponse, error)
 	// CreateSandboxSnapshot snapshots a running Sandbox and publishes the
-	// artifact set to the artifact store under the snapshot's template name.
+	// artifact set to the native artifact store or an OCI registry.
 	// It returns after the intent is persisted and the snapshot is triggered;
 	// completion is observed via GetSandboxSnapshot.
 	CreateSandboxSnapshot(ctx context.Context, in *CreateSandboxSnapshotRequest, opts ...grpc.CallOption) (*CreateSandboxSnapshotResponse, error)
@@ -247,7 +247,7 @@ type FastPathServiceServer interface {
 	GetPool(context.Context, *GetPoolRequest) (*PoolInfo, error)
 	ListPools(context.Context, *ListPoolsRequest) (*ListPoolsResponse, error)
 	// CreateSandboxSnapshot snapshots a running Sandbox and publishes the
-	// artifact set to the artifact store under the snapshot's template name.
+	// artifact set to the native artifact store or an OCI registry.
 	// It returns after the intent is persisted and the snapshot is triggered;
 	// completion is observed via GetSandboxSnapshot.
 	CreateSandboxSnapshot(context.Context, *CreateSandboxSnapshotRequest) (*CreateSandboxSnapshotResponse, error)

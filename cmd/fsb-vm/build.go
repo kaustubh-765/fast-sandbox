@@ -14,6 +14,8 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
+
+	"fast-sandbox/internal/ocitemplate"
 )
 
 // buildOptions holds the build-command flags. The build turns one remote
@@ -23,24 +25,31 @@ import (
 const defaultBuildDiskSizeGiB = 20
 
 type buildOptions struct {
-	source          string
-	output          string
-	kernel          string
-	kernelVersion   string
-	vcpu            int
-	memoryMB        int
-	diskSizeGiB     int
-	snapfilesSizeMB int
-	rootfsDriveID   string
-	bootArgs        string
-	initPath        string
-	initScriptFile  string
-	readyPattern    string
-	readyTimeout    time.Duration
-	authFile        string
-	username        string
-	noCompress      bool
-	keepWorkDir     bool
+	snapfilesProgress func(string) error
+	snapshotManifest  []byte
+	snapshotExtras    map[string]string
+	manifestExtraFile string
+	injectDir         string
+	tapName           string
+	guestMAC          string
+	source            string
+	output            string
+	kernel            string
+	kernelVersion     string
+	vcpu              int
+	memoryMB          int
+	diskSizeGiB       int
+	snapfilesSizeMB   int
+	rootfsDriveID     string
+	bootArgs          string
+	initPath          string
+	initScriptFile    string
+	readyPattern      string
+	readyTimeout      time.Duration
+	authFile          string
+	username          string
+	noCompress        bool
+	keepWorkDir       bool
 }
 
 func newBuildCommand() *cobra.Command {
@@ -53,10 +62,14 @@ func newBuildCommand() *cobra.Command {
 		},
 	}
 	flags := command.Flags()
+	flags.StringVar(&options.manifestExtraFile, "manifest-extra-file", "", "optional guestNetwork, lineage and platform fields to supplement the VM manifest")
+	flags.StringVar(&options.injectDir, "inject-dir", "", "directory of guest files to inject before snapshot")
+	flags.StringVar(&options.tapName, "tap-name", "", "preconfigured build tap (optional)")
+	flags.StringVar(&options.guestMAC, "guest-mac", "02:FC:00:00:00:01", "baked guest NIC MAC")
 	flags.StringVar(&options.source, "source", "", "source overlaybd image reference (required)")
 	flags.StringVar(&options.output, "output", "", "logical output name <name>:<tag>; produces <tag>_rootfs and <tag>_snapfiles (required)")
 	flags.StringVar(&options.kernel, "kernel", "", "vmlinux path used for the cold boot (required)")
-	flags.StringVar(&options.kernelVersion, "kernel-version", "", "kernel_version recorded in metadata.json (default: derived from the vmlinux-<version> filename)")
+	flags.StringVar(&options.kernelVersion, "kernel-version", "", "kernel.version recorded in manifest.json (default: derived from the vmlinux-<version> filename)")
 	flags.IntVar(&options.vcpu, "vcpu", 1, "guest vCPU count")
 	flags.IntVar(&options.memoryMB, "memory-mb", 1024, "guest memory in MiB")
 	flags.IntVar(&options.diskSizeGiB, "disk-size-gb", defaultBuildDiskSizeGiB, "rootfs virtual disk size in GiB")
@@ -438,7 +451,7 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 	return attachment, nil
 }
 
-func prepareBuildSource(ctx context.Context, repository remoteSource, resolved resolvedBuildSource, dockerCfg dockerConfig, sourceRef string, layout artifactLayout, workDir string, diskSizeGiB int, plainHTTP bool, runner convertorRunner) (fetchedImage, error) {
+func prepareBuildSource(ctx context.Context, repository ocitemplate.MetadataRepository, resolved resolvedBuildSource, dockerCfg dockerConfig, sourceRef string, layout artifactLayout, workDir string, diskSizeGiB int, plainHTTP bool, runner convertorRunner) (fetchedImage, error) {
 	kind, err := classifyBuildSource(resolved.Manifest, sourceRef)
 	if err != nil {
 		return fetchedImage{}, err
@@ -550,6 +563,11 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 		return err
 	}
 
+	if options.injectDir != "" {
+		if err := injectDirectory(rootfs.devPath, filepath.Join(workDir, "mnt-inject"), options.injectDir, undo); err != nil {
+			return err
+		}
+	}
 	// Step 4: inject the init script into the rootfs.
 	initScript := []byte(defaultInitScript())
 	if options.initScriptFile != "" {
@@ -587,7 +605,8 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 	}
 
 	// Steps 8-9: write the manifests and layout index, then publish.
-	pair, err := writeTemplateManifests(layout, options.source, output, fetched, rootfsDesc, snapDesc)
+	rootfsLayers := append(append([]ocispec.Descriptor{}, fetched.Layers...), rootfsDesc)
+	pair, err := writeTemplatePair(layout, output, rootfsLayers, snapDesc, options.source, &fetched)
 	if err != nil {
 		return err
 	}
@@ -645,7 +664,7 @@ func createBuildWorkDir(artifactName string, keep bool, undo *rollback) (string,
 }
 
 // captureSnapfiles formats a blank ublk disk, copies the snapshot files and
-// metadata.json onto it, then unmounts and detaches it so its upper can be
+// manifest.json onto it, then unmounts and detaches it so its upper can be
 // sealed.
 func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOptions, workDir, vmstatePath, memfilePath string, undo *rollback) error {
 	sizeGiB, err := snapfilesSizeGiB(options, vmstatePath, memfilePath)
@@ -659,7 +678,19 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 	snapfiles := trackDevice(snapConfig, ublkd.Del, func(ctx context.Context, config string) (int, error) {
 		return releaseOwnedDevicesByConfig(ctx, ublkd, config)
 	}, undo)
+	progress := func(phase string) error {
+		if options.snapfilesProgress != nil {
+			return options.snapfilesProgress(phase)
+		}
+		return nil
+	}
+	if err := progress(packPhaseAdding); err != nil {
+		return err
+	}
 	if err := snapfiles.add(ctx, ublkd.Add); err != nil {
+		return err
+	}
+	if err := progress(packPhaseAttached); err != nil {
 		return err
 	}
 	if err := mkfsExt4(ctx, snapfiles.devPath); err != nil {
@@ -676,18 +707,30 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 	if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
 		return err
 	}
-	metadataPayload, err := buildSnapfilesMetadata(options, options.source, time.Now())
+	metadataPayload := options.snapshotManifest
+	if len(metadataPayload) == 0 {
+		metadataPayload, err = buildSnapfilesManifest(options, time.Now())
+	}
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(snapMount, inDiskMetadata), metadataPayload, 0o600); err != nil {
-		return fmt.Errorf("write metadata.json: %w", err)
+	if err := os.WriteFile(filepath.Join(snapMount, inDiskManifest), metadataPayload, 0o600); err != nil {
+		return fmt.Errorf("write manifest.json: %w", err)
 	}
+	for name, source := range options.snapshotExtras {
+		if err := copyFile(source, filepath.Join(snapMount, name), 0600); err != nil {
+			return err
+		}
+	}
+
 	syncFilesystems()
 	if err := unmount(snapMount); err != nil {
 		return err
 	}
-	return snapfiles.detach(ctx)
+	if err := snapfiles.detach(ctx); err != nil {
+		return err
+	}
+	return progress(packPhaseReleased)
 }
 
 // sealUpper commits the detached upper of stage into a read-only layer blob
@@ -711,57 +754,50 @@ type manifestDigests struct {
 	snapfiles digest.Digest
 }
 
-// writeTemplateManifests writes the config blob and the two manifests into
-// the staging layout, validates the complete layout, and only then writes
-// its index.
-func writeTemplateManifests(layout artifactLayout, source string, output outputNames, fetched fetchedImage, rootfsDesc, snapDesc ocispec.Descriptor) (manifestDigests, error) {
-	configDesc, err := layout.installBytes(minimalImageConfig(), ocispec.MediaTypeImageConfig)
+// writeTemplatePair writes the shared config, rootfs/snapfiles manifests and index.
+// Builds validate all local blobs before indexing. Checkpoints may inherit remote
+// layers, so their index has no local source manifest to validate.
+func writeTemplatePair(layout artifactLayout, output outputNames, root []ocispec.Descriptor, snap ocispec.Descriptor, source string, fetched *fetchedImage) (manifestDigests, error) {
+	config, err := layout.installBytes(minimalImageConfig(), ocispec.MediaTypeImageConfig)
 	if err != nil {
 		return manifestDigests{}, err
 	}
-	rootfsLayers := append(append([]ocispec.Descriptor{}, fetched.Layers...), rootfsDesc)
-	rootfsManifest, rootfsManifestDesc, err := assembleManifest(configDesc, rootfsLayers)
-	if err != nil {
+	index := layoutIndex{SourceRef: source}
+	var manifests [][]byte
+	var sums []digest.Digest
+	for _, entry := range []struct {
+		name   string
+		layers []ocispec.Descriptor
+	}{{output.rootfsName(), root}, {output.snapfilesName(), []ocispec.Descriptor{snap}}} {
+		payload, desc, err := assembleManifest(config, entry.layers)
+		if err != nil {
+			return manifestDigests{}, err
+		}
+		file := sanitizeFileName(entry.name) + ".json"
+		if err := writeFileAtomic(layout.manifestPath(file), payload, 0o640); err != nil {
+			return manifestDigests{}, fmt.Errorf("write %s: %w", file, err)
+		}
+		index.Images = append(index.Images, layoutIndexEntry{Name: entry.name, ManifestFile: file, ManifestDigest: desc.Digest.String()})
+		manifests = append(manifests, payload)
+		sums = append(sums, desc.Digest)
+	}
+	if fetched != nil {
+		sourceManifest, err := os.ReadFile(fetched.ManifestPath)
+		if err != nil {
+			return manifestDigests{}, fmt.Errorf("read stored source manifest: %w", err)
+		}
+		if err := verifyDescriptorBytes(fetched.ManifestDesc, sourceManifest, "stored source manifest"); err != nil {
+			return manifestDigests{}, err
+		}
+		index.SourceManifest = layoutIndexEntry{Name: source, ManifestFile: filepath.Base(fetched.ManifestPath), ManifestDigest: fetched.ManifestDesc.Digest.String()}
+		if err := layout.validateLayout(append(manifests, sourceManifest)...); err != nil {
+			return manifestDigests{}, err
+		}
+	}
+	if err := layout.writeLayoutIndex(index); err != nil {
 		return manifestDigests{}, err
 	}
-	snapManifest, snapManifestDesc, err := assembleManifest(configDesc, []ocispec.Descriptor{snapDesc})
-	if err != nil {
-		return manifestDigests{}, err
-	}
-	rootfsFile := sanitizeFileName(output.rootfsName()) + ".json"
-	snapFile := sanitizeFileName(output.snapfilesName()) + ".json"
-	if err := writeFileAtomic(layout.manifestPath(rootfsFile), rootfsManifest, 0o640); err != nil {
-		return manifestDigests{}, fmt.Errorf("write %s: %w", rootfsFile, err)
-	}
-	if err := writeFileAtomic(layout.manifestPath(snapFile), snapManifest, 0o640); err != nil {
-		return manifestDigests{}, fmt.Errorf("write %s: %w", snapFile, err)
-	}
-
-	sourceManifest, err := os.ReadFile(fetched.ManifestPath)
-	if err != nil {
-		return manifestDigests{}, fmt.Errorf("read stored source manifest: %w", err)
-	}
-	if err := verifyDescriptorBytes(fetched.ManifestDesc, sourceManifest, "stored source manifest"); err != nil {
-		return manifestDigests{}, err
-	}
-	if err := layout.validateLayout(sourceManifest, rootfsManifest, snapManifest); err != nil {
-		return manifestDigests{}, err
-	}
-	if err := layout.writeLayoutIndex(layoutIndex{
-		SourceRef: source,
-		SourceManifest: layoutIndexEntry{
-			Name:           source,
-			ManifestFile:   filepath.Base(fetched.ManifestPath),
-			ManifestDigest: fetched.ManifestDesc.Digest.String(),
-		},
-		Images: []layoutIndexEntry{
-			{Name: output.rootfsName(), ManifestFile: rootfsFile, ManifestDigest: rootfsManifestDesc.Digest.String()},
-			{Name: output.snapfilesName(), ManifestFile: snapFile, ManifestDigest: snapManifestDesc.Digest.String()},
-		},
-	}); err != nil {
-		return manifestDigests{}, err
-	}
-	return manifestDigests{rootfs: rootfsManifestDesc.Digest, snapfiles: snapManifestDesc.Digest}, nil
+	return manifestDigests{rootfs: sums[0], snapfiles: sums[1]}, nil
 }
 
 // installCommittedLayer moves an overlaybd-commit output into the blob store

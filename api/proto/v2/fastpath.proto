@@ -15,7 +15,7 @@ service FastPathService {
   rpc GetPool(GetPoolRequest) returns (PoolInfo);
   rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
   // CreateSandboxSnapshot snapshots a running Sandbox and publishes the
-  // artifact set to the artifact store under the snapshot's template name.
+  // artifact set to the native artifact store or an OCI registry.
   // It returns after the intent is persisted and the snapshot is triggered;
   // completion is observed via GetSandboxSnapshot.
   rpc CreateSandboxSnapshot(CreateSandboxSnapshotRequest) returns (CreateSandboxSnapshotResponse);
@@ -411,9 +411,10 @@ message CreateSandboxSnapshotRequest {
   // sandbox is the snapshot target; expected_uid fences against a Sandbox
   // recreated under the same name.
   SandboxReference sandbox = 2;
-  // template_name is the artifact-store index key the artifact set is
-  // published under; afterwards CreateSandbox(image=template_name) boots
-  // from the snapshot. Immutable per request_id.
+  // template_name is required for native + S3 snapshots and selects their
+  // artifact-store index key. OCI snapshots may omit it: their two images
+  // use a random snapshot_id; create new Sandboxes with image=manifest_ref.
+  // Immutable per request_id.
   string template_name = 3;
   // metadata is projected as sandbox.fast.io/<k> labels, mirroring
   // CreateSandboxRequest.metadata.
@@ -433,8 +434,8 @@ message SandboxSnapshotInfo {
   // fastlet_name is the fastlet the snapshot was triggered on (resolved
   // from the target Sandbox's assignment at trigger time).
   string fastlet_name = 7;
-  // manifest_ref is the s3:// URI of the published manifest.json (terminal
-  // success only).
+  // manifest_ref is the published s3:// manifest.json or immutable oci://
+  // snapfiles reference (terminal success only).
   string manifest_ref = 8;
   // artifact_digest is the sha256 of the manifest document.
   string artifact_digest = 9;
@@ -442,6 +443,9 @@ message SandboxSnapshotInfo {
   int64 size_bytes = 10;
   int64 created_unix_seconds = 11;
   int64 completed_unix_seconds = 12;
+  // snapshot_id is the random UUID assigned by Fastlet on admission. OCI
+  // publication uses it as the prefix of the rootfs and snapfiles tags.
+  string snapshot_id = 13;
 }
 
 message CreateSandboxSnapshotResponse {
@@ -460,8 +464,10 @@ message GetSandboxSnapshotResponse {
 
 message DeleteSandboxSnapshotRequest {
   // snapshot references the SandboxSnapshot to delete; expected_uid, when
-  // set, must match the SandboxSnapshot UID. Deleting a snapshot does not
-  // unpublish its artifacts.
+  // set, must match the SandboxSnapshot UID. OCI deletion removes the
+  // published rootfs and snapfiles manifests before the CR disappears.
+  // The call accepts asynchronous deletion; poll Get until NotFound.
+  // Native artifact-store lifecycle remains managed out of band.
   SandboxReference snapshot = 1;
 }
 

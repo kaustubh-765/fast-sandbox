@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -348,4 +349,31 @@ func TestCreateTemplateSnapshotStillRequiresTemplateName(t *testing.T) {
 	require.ErrorAs(t, err, &failure)
 	require.Equal(t, fastletapi.ErrorConflict, failure.Code)
 	require.Contains(t, failure.Message, "templateName is required")
+}
+
+func TestCreateOCITemplateSnapshotUsesIndependentUUIDsWithoutNameFence(t *testing.T) {
+	runtime := newSnapshotRuntime()
+	runtime.block = make(chan struct{})
+	runtime.blockBeforePublishing = true
+	defer close(runtime.block)
+	manager := newSnapshotManager(t, runtime)
+	manager.sandboxes["uid-a"].Config.Desired.Image = "oci://r.example/ns/template:base"
+	var ids []string
+	for _, taskID := range []string{"first", "second"} {
+		request := snapshotRequest(taskID)
+		request.Snapshot.TemplateName = ""
+		response, err := manager.CreateSnapshot(t.Context(), request)
+		require.NoError(t, err)
+		_, err = uuid.Parse(response.Snapshot.SnapshotID)
+		require.NoError(t, err)
+		ids = append(ids, response.Snapshot.SnapshotID)
+		require.Eventually(t, func() bool {
+			v, err := manager.InspectSnapshot(&fastletapi.InspectSnapshotRequest{Identity: snapshotIdentityFor(taskID)})
+			return err == nil && v.Snapshot.Phase == fastletapi.SnapshotPhasePublishing
+		}, 2*time.Second, 10*time.Millisecond)
+	}
+	require.NotEqual(t, ids[0], ids[1])
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	require.Equal(t, sandboxStateRunning, manager.sandboxes["uid-a"].Phase)
 }

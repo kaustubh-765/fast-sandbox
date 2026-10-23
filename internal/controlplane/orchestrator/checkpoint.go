@@ -13,8 +13,6 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/klog/v2"
-
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -34,16 +32,6 @@ func (o *Orchestrator) CreateCheckpoint(ctx context.Context, sandbox *apiv1alpha
 	request := &fastletapi.CreateSnapshotRequest{
 		RequestID: checkpointID, Identity: identity,
 		Snapshot: fastletapi.SnapshotSpec{Kind: fastletapi.SnapshotKindCheckpoint},
-	}
-	// The source Sandbox's bindings ride along into the checkpoint manifest
-	// exactly as for a template snapshot: the manifest stays self-contained
-	// and the resume path needs no side records.
-	if bindings, bindErr := compileActionBindings(sandbox.Spec.ActionBindings); bindErr == nil {
-		request.ActionBindings = bindings
-	} else {
-		// Publishing without bindings breaks the self-contained artifact
-		// promise; never silent.
-		klog.FromContext(ctx).Error(bindErr, "Failed to compile checkpoint action bindings; manifest will lack them", "sandbox", sandbox.Name)
 	}
 	response, callErr := o.FastletClient.CreateSnapshot(ctx, fastlet.PodIP, request)
 	if callErr == nil && response != nil &&

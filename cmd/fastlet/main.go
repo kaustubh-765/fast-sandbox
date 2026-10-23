@@ -104,13 +104,14 @@ func main() {
 		configurable.SetFastletPodUID(podUID)
 		configurable.SetAgentSocket(getEnv("FAST_SANDBOX_RUNTIME_AGENT_SOCKET", ""))
 	}
-	// The driver-invoked egress vault transfer (OSEP-0022): checkpoints stage
-	// the subject's vault file into the bundle before the runtime release,
-	// restores import it before the data plane becomes ready. Optional:
-	// drivers without the capability (and pools without a vault handler)
-	// simply never move vault files.
-	if configurable, ok := rt.(vaultMoverConfigurable); ok {
-		configurable.SetVaultMover(actionManager)
+	// The driver-invoked egress state transfers (OSEP-0022 vault, plus the
+	// recorded network policy): checkpoints stage the subject's vault and
+	// policy files into the bundle before the runtime release, restores
+	// import them before the data plane becomes ready. Optional: drivers
+	// without the capability (and pools without an egress handler) simply
+	// never move state files.
+	if configurable, ok := rt.(stateMoverConfigurable); ok {
+		configurable.SetStateMover(actionManager)
 	}
 	registryProvider := registryconfig.NewFileProvider(getEnv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", registryconfig.MountPath))
 	if revision, err := registryProvider.Refresh(); err != nil {
@@ -416,10 +417,11 @@ type agentClientConfigurable interface {
 	SetAgentSocket(socketPath string)
 }
 
-// vaultMoverConfigurable is the optional driver capability for the
-// egress-owned vault transfer across pause/resume.
-type vaultMoverConfigurable interface {
-	SetVaultMover(mover runtimecontract.VaultMover)
+// stateMoverConfigurable is the optional driver capability for the
+// egress-owned state transfers (credential vault, recorded network policy)
+// across pause/resume.
+type stateMoverConfigurable interface {
+	SetStateMover(mover runtimecontract.StateMover)
 }
 
 func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager, proxyClient *fastletproxy.ControlClient) {

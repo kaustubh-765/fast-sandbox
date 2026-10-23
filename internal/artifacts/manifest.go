@@ -6,13 +6,199 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const (
+	VMManifestVersion = 1
+	VMManifestName    = "manifest.json"
+	VMRootfsDrivePath = "rootfs.dev"
+)
+
+// VMManifest is the shared snapshot contract for OCI and object storage.
+// Platform is optional for standalone fsb-vm use. Files lists native VM
+// artifacts only; platform state is described once in Platform.StateFiles.
+type VMManifest struct {
+	SchemaVersion int                     `json:"schemaVersion"`
+	Runtime       string                  `json:"runtime"`
+	Machine       VMMachine               `json:"machine"`
+	Kernel        VMKernel                `json:"kernel"`
+	Compatibility SnapshotCompatibility   `json:"compatibility"`
+	GuestNetwork  *VMGuestNetwork         `json:"guestNetwork,omitempty"`
+	Lineage       *VMLineage              `json:"lineage,omitempty"`
+	Platform      *VMPlatform             `json:"platform,omitempty"`
+	Files         map[string]ManifestFile `json:"files,omitempty"`
+}
+
+type VMMachine struct {
+	VCPUCount       int    `json:"vcpuCount"`
+	MemoryMiB       int64  `json:"memoryMiB"`
+	RootfsSizeMiB   int64  `json:"rootfsSizeMiB"`
+	RootfsDriveID   string `json:"rootfsDriveID"`
+	RootfsDrivePath string `json:"rootfsDrivePath"`
+}
+
+type VMKernel struct {
+	Version string `json:"version"`
+}
+
+type VMGuestNetwork struct {
+	Iface   string `json:"iface"`
+	MAC     string `json:"mac"`
+	IP      string `json:"ip,omitempty"`
+	Gateway string `json:"gateway,omitempty"`
+	Netmask string `json:"netmask,omitempty"`
+	MTU     int    `json:"mtu,omitempty"`
+}
+
+type VMLineage struct {
+	Image       string `json:"image,omitempty"`
+	ImageDigest string `json:"imageDigest,omitempty"`
+	CreatedAt   string `json:"createdAt,omitempty"`
+}
+
+type CheckpointOwner struct {
+	SandboxUID string `json:"sandboxUID"`
+	Namespace  string `json:"namespace"`
+}
+
+type ManifestFile struct {
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+type VMPlatform struct {
+	Execd        string                  `json:"execd,omitempty"`
+	Entrypoint   []string                `json:"entrypoint,omitempty"`
+	Init         string                  `json:"init,omitempty"`
+	Envs         map[string]string       `json:"envs,omitempty"`
+	EgressMitmCA *MITMCALineage          `json:"egressMitmCA,omitempty"`
+	Checkpoint   *CheckpointOwner        `json:"checkpoint,omitempty"`
+	StateFiles   map[string]ManifestFile `json:"stateFiles,omitempty"`
+}
+
+type MITMCALineage struct {
+	Certificates []CertificateFingerprint `json:"certificates"`
+}
+
+type CertificateFingerprint struct {
+	CertSHA256 string `json:"certSha256"`
+	SPKISHA256 string `json:"spkiSha256"`
+	NotAfter   string `json:"notAfter"`
+}
+
+// DecodeVMManifest rejects unsupported versions before interpreting their
+// fields. Callers that repackage a manifest retain the original JSON bytes so
+// unknown optional extensions survive older readers.
+func DecodeVMManifest(raw []byte) (VMManifest, error) {
+	var document VMManifest
+	var version struct {
+		SchemaVersion int `json:"schemaVersion"`
+	}
+	if err := json.Unmarshal(raw, &version); err != nil {
+		return document, fmt.Errorf("decode VM manifest: %w", err)
+	}
+	if version.SchemaVersion != VMManifestVersion {
+		return document, fmt.Errorf("unsupported VM manifest schemaVersion %d (want %d); rebuild legacy templates with the matching Builder/fsb-vm", version.SchemaVersion, VMManifestVersion)
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return document, fmt.Errorf("decode VM manifest: %w", err)
+	}
+	return document, document.Validate()
+}
+
+func (m VMManifest) Validate() error {
+	if m.SchemaVersion != VMManifestVersion || m.Runtime != "firecracker" {
+		return fmt.Errorf("unsupported VM manifest version/runtime: %d/%q", m.SchemaVersion, m.Runtime)
+	}
+	if m.Machine.VCPUCount < 1 || m.Machine.MemoryMiB < 1 || m.Machine.MemoryMiB > math.MaxInt64>>20 || m.Machine.RootfsSizeMiB < 1 || m.Machine.RootfsSizeMiB > math.MaxInt64>>20 {
+		return fmt.Errorf("VM manifest requires positive, representable machine sizes")
+	}
+	if m.Machine.RootfsDrivePath != VMRootfsDrivePath && m.Machine.RootfsDrivePath != "rootfs.img" {
+		return fmt.Errorf("unsupported rootfsDrivePath %q (want %q); rebuild the template", m.Machine.RootfsDrivePath, VMRootfsDrivePath)
+	}
+	if m.Kernel.Version == "" || m.Compatibility.CPUArch == "" || !KnownFirecrackerVersion(m.Compatibility.FirecrackerVersion) {
+		return fmt.Errorf("VM manifest requires kernel.version, compatibility.cpuArch and a known firecrackerVersion")
+	}
+	switch m.Compatibility.CPUTemplate {
+	case CPUTemplateNone:
+		if m.Compatibility.Vendor == "" || m.Compatibility.Vendor == unknownProvenanceValue || m.Compatibility.CPUFamily < 1 || m.Compatibility.CPUModel < 1 || m.Compatibility.CPUStepping < 0 {
+			return fmt.Errorf("unmasked VM manifest requires a resolved CPU identity")
+		}
+	case CPUTemplateT2, CPUTemplateT2A:
+		if len(cpuTemplateAllowlists[m.Compatibility.FirecrackerVersion][m.Compatibility.CPUTemplate]) == 0 {
+			return fmt.Errorf("unsupported CPU template/version %s/%s", m.Compatibility.CPUTemplate, m.Compatibility.FirecrackerVersion)
+		}
+	default:
+		return fmt.Errorf("unsupported cpuTemplate %q", m.Compatibility.CPUTemplate)
+	}
+	if network := m.GuestNetwork; network != nil {
+		if _, err := net.ParseMAC(network.MAC); err != nil || network.Iface == "" {
+			return fmt.Errorf("guestNetwork requires an interface and valid MAC")
+		}
+	}
+	return validateVMPlatform(m.Platform)
+}
+
+func validateVMPlatform(platform *VMPlatform) error {
+	if platform != nil {
+		if owner := platform.Checkpoint; owner != nil && (strings.TrimSpace(owner.SandboxUID) == "" || strings.TrimSpace(owner.Namespace) == "") {
+			return fmt.Errorf("checkpoint requires sandboxUID and namespace")
+		}
+		for name, file := range platform.StateFiles {
+			if name != "policy.json" && name != "vault.json" {
+				return fmt.Errorf("unsupported platform state file %q", name)
+			}
+			decoded, err := hex.DecodeString(file.SHA256)
+			if err != nil || len(decoded) != sha256.Size || strings.ToLower(file.SHA256) != file.SHA256 || file.SizeBytes < 1 {
+				return fmt.Errorf("invalid platform state file %q", name)
+			}
+		}
+	}
+	return nil
+}
+
+// NewVMManifest records the actual capture environment for every producer.
+func NewVMManifest(machine VMMachine, kernelVersion, binary, cpuTemplate string) VMManifest {
+	identity := HostCPUIdentity()
+	return VMManifest{
+		SchemaVersion: VMManifestVersion, Runtime: "firecracker", Machine: machine,
+		Kernel:        VMKernel{Version: kernelVersion},
+		Compatibility: SnapshotCompatibility{CPUArch: HostCPUArch(), Vendor: identity.Vendor, CPUFamily: identity.Family, CPUModel: identity.Model, CPUStepping: identity.Stepping, CPUModelName: identity.ModelName, CPUTemplate: cpuTemplate, FirecrackerVersion: FirecrackerVersion(binary), HostKernel: HostKernelRelease()},
+	}
+}
+
+func HostCPUArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+// MarshalVMManifest validates and serializes the shared contract with two-space
+// indentation and a trailing newline. Its exact bytes determine the artifact digest.
+func MarshalVMManifest(document VMManifest) ([]byte, error) {
+	if err := document.Validate(); err != nil {
+		return nil, err
+	}
+	raw, err := json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(raw, '\n'), nil
+}
 
 // SHA256Of returns the lowercase hex SHA-256 of a byte slice.
 func SHA256Of(payload []byte) string {
@@ -27,33 +213,21 @@ func Digest16(manifestBytes []byte) string {
 	return SHA256Of(manifestBytes)[:16]
 }
 
-// MarshalManifest serializes a manifest document with the canonical
-// producer encoding: two-space indented JSON plus a trailing newline. The
-// artifact digest and the per-build namespace are both derived from these
-// exact bytes, so every producer must marshal identically.
-func MarshalManifest(document map[string]any) ([]byte, error) {
-	payload, err := json.MarshalIndent(document, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(payload, '\n'), nil
-}
-
 // FileEntry describes one artifact in a manifest: a sparse-aware sha256 and
 // the logical (sparse) size. cache memoizes checksums across the manifest
 // and SHA256SUMS of one artifact set; it may be nil.
-func FileEntry(path string, cache map[string]string) (map[string]any, error) {
+func FileEntry(path string, cache map[string]string) (ManifestFile, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		return ManifestFile{}, err
 	}
 	sum, err := SHA256FileCached(path, cache)
 	if err != nil {
-		return nil, err
+		return ManifestFile{}, err
 	}
-	return map[string]any{
-		"sha256":    sum,
-		"sizeBytes": info.Size(),
+	return ManifestFile{
+		SHA256:    sum,
+		SizeBytes: info.Size(),
 	}, nil
 }
 
@@ -240,6 +414,7 @@ func parseCPUIdentity(payload []byte) CPUIdentity {
 // SnapshotCompatibility mirrors the manifest compatibility block. Zero
 // Vendor and CPUTemplate means a pre-structured (legacy) manifest.
 type SnapshotCompatibility struct {
+	CPUArch            string `json:"cpuArch,omitempty"`
 	Vendor             string `json:"vendor"`
 	CPUFamily          int    `json:"cpuFamily"`
 	CPUModel           int    `json:"cpuModel"`

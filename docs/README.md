@@ -29,6 +29,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [OpenSandbox integration](guides/opensandbox-integration.md)
 - [OpenSandbox Execd](guides/opensandbox-execd.md)
 - [SandboxTemplate golden images](guides/sandboxtemplate-golden-images.md)
+- [OverlayBD OCI quick start](guides/overlaybd-oci-sandboxes.md)
 - [Sandbox Snapshots](guides/sandbox-snapshots.md)
 - [Pause, resume, and snapshot integration](guides/pause-resume-snapshot-integration.md)
 - [Artifact manifest reference](guides/artifact-manifest-reference.md)

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -36,7 +38,7 @@ func newSandboxTemplate(namespace, name string) *apiv1alpha2.SandboxTemplate {
 			Readiness: apiv1alpha2.ReadinessSpec{WarmupSeconds: 60},
 			Output: apiv1alpha2.OutputSpec{
 				RootfsSize: "30Gi",
-				Format:     apiv1alpha2.ArtifactFormatOverlayBD,
+				Format:     apiv1alpha2.ArtifactFormatNative,
 				Publish:    "s3://bucket/sandbox-images/",
 			},
 		},
@@ -1075,4 +1077,168 @@ func TestSandboxTemplateReconcileDefaultsMitmCertificateKey(t *testing.T) {
 		return
 	}
 	t.Fatalf("expected a mitm-certificate secret volume, got %+v", pods[0].Spec.Volumes)
+}
+
+func TestSandboxTemplateOCIOutputAndDeviceMount(t *testing.T) {
+	template := newSandboxTemplate("default", "oci-template")
+	template.Spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
+	template.Spec.Output.Publish = "oci://registry.example.com/templates/alpine"
+	template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: "registry"}
+	r := newSandboxTemplateReconciler(t, template)
+	output, err := r.effectiveOutput(template.Spec.Output, "s3://native/store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = r.createBuildPod(context.Background(), template, output, ""); err != nil {
+		t.Fatal(err)
+	}
+	var pod corev1.Pod
+	if err = r.Get(context.Background(), client.ObjectKey{Namespace: template.Namespace, Name: buildPodName(template)}, &pod); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "host-dev" && mount.MountPath == "/dev" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("OCI builder must see dynamically created host ublk devices")
+	}
+	output.Format = apiv1alpha2.ArtifactFormatNative
+	if _, err = r.effectiveOutput(output, "s3://native/store"); err == nil {
+		t.Fatal("native OCI output must fail")
+	}
+}
+
+func TestOutputFormatMismatchFailsBeforeCreatingPod(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		format  apiv1alpha2.ArtifactFormat
+		publish string
+		message string
+	}{
+		{"overlaybd-s3", apiv1alpha2.ArtifactFormatOverlayBD, "s3://bucket/sandbox-images/", "overlaybd requires output.publish=oci://"},
+		{"overlaybd-default-store", apiv1alpha2.ArtifactFormatOverlayBD, "", "overlaybd requires output.publish=oci://"},
+		{"native-oci", apiv1alpha2.ArtifactFormatNative, "oci://registry.example.com/templates/alpine", "OCI templates require overlaybd format"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			template := newSandboxTemplate("default", "overlaybd-s3")
+			template.Spec.Output.Format = test.format
+			template.Spec.Output.Publish = test.publish
+			r := newSandboxTemplateReconciler(t, template)
+			reconcileOnce(t, r, client.ObjectKeyFromObject(template))
+			var current apiv1alpha2.SandboxTemplate
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(template), &current); err != nil {
+				t.Fatal(err)
+			}
+			condition := findBuildCondition(t, &current)
+			if current.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed || condition.Reason != "InvalidOutput" || !strings.Contains(condition.Message, test.message) {
+				t.Fatalf("expected invalid output failure: %+v", current.Status)
+			}
+			var pods corev1.PodList
+			if err := r.List(context.Background(), &pods); err != nil {
+				t.Fatal(err)
+			}
+			if len(pods.Items) != 0 {
+				t.Fatal("invalid output format launched a Pod")
+			}
+		})
+	}
+}
+
+func TestOCIMissingPublishSecretFailsBeforeCreatingPod(t *testing.T) {
+	for _, name := range []string{"nil", "", "  "} {
+		t.Run(name, func(t *testing.T) {
+			template := newSandboxTemplate("default", "oci-no-secret")
+			template.Spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
+			template.Spec.Output.Publish = "oci://registry.example.com/templates/alpine"
+			if name != "nil" {
+				template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: name}
+			}
+			r := newSandboxTemplateReconciler(t, template)
+			reconcileOnce(t, r, client.ObjectKeyFromObject(template))
+			var current apiv1alpha2.SandboxTemplate
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(template), &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed || !strings.Contains(findBuildCondition(t, &current).Message, "publishSecretRef") {
+				t.Fatalf("expected missing-secret failure: %+v", current.Status)
+			}
+			var pods corev1.PodList
+			if err := r.List(context.Background(), &pods); err != nil {
+				t.Fatal(err)
+			}
+			if len(pods.Items) != 0 {
+				t.Fatal("invalid OCI output launched a Pod")
+			}
+		})
+	}
+}
+
+func TestOCITemplateBuildUUIDPersistsPerPodAndChangesOnRebuild(t *testing.T) {
+	ctx := context.Background()
+	template := newSandboxTemplate("default", "oci-rebuild")
+	template.Spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
+	template.Spec.Output.Publish = "oci://registry.example.com/templates/alpine"
+	template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: "registry"}
+	r := newSandboxTemplateReconciler(t, template)
+	key := client.ObjectKeyFromObject(template)
+	reconcileOnce(t, r, key)
+	readID := func(template *apiv1alpha2.SandboxTemplate) string {
+		var pod corev1.Pod
+		require.NoError(t, r.Get(ctx, client.ObjectKey{Namespace: template.Namespace, Name: buildPodName(template)}, &pod))
+		id := ""
+		for _, env := range pod.Spec.Containers[0].Env {
+			switch env.Name {
+			case buildIDEnvName:
+				id = env.Value
+			case builderImageEnv:
+				var spec apiv1alpha2.SandboxTemplateSpec
+				require.NoError(t, json.Unmarshal([]byte(env.Value), &spec))
+				require.Equal(t, template.Spec.Output.Publish, spec.Output.Publish, "user spec remains repository-only")
+			}
+		}
+		parsed, err := uuid.Parse(id)
+		require.NoError(t, err)
+		require.Equal(t, uuid.Version(4), parsed.Version())
+		return id
+	}
+	first := readID(template)
+	// Even competing Pod creates retain the UUID persisted by the winning create.
+	require.NoError(t, r.createBuildPod(ctx, template, template.Spec.Output, ""))
+	reconcileOnce(t, r, key)
+	require.Equal(t, first, readID(template))
+	var updated apiv1alpha2.SandboxTemplate
+	require.NoError(t, r.Get(ctx, key, &updated))
+	updated.Generation++
+	updated.Spec.Machine.Memory = "4Gi"
+	require.NoError(t, r.Update(ctx, &updated))
+	reconcileOnce(t, r, key)
+	second := readID(&updated)
+	require.NotEqual(t, first, second, "new generations must not overwrite the previous pair")
+	reconcileOnce(t, r, key)
+	require.Equal(t, second, readID(&updated))
+}
+
+func TestOCIInvalidPublishFailsBeforeCreatingPod(t *testing.T) {
+	for _, publish := range []string{"oci://registry.example.com/templates:tag", "oci://registry.example.com/templates@sha256:" + strings.Repeat("a", 64), "oci://registry.example.com/", "oci://registry.example.com/templates:"} {
+		t.Run(publish, func(t *testing.T) {
+			template := newSandboxTemplate("default", "oci-invalid-target")
+			template.Spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
+			template.Spec.Output.Publish = publish
+			template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: "registry"}
+			r := newSandboxTemplateReconciler(t, template)
+			reconcileOnce(t, r, client.ObjectKeyFromObject(template))
+			var current apiv1alpha2.SandboxTemplate
+			require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(template), &current))
+			require.Equal(t, apiv1alpha2.SandboxTemplatePhaseFailed, current.Status.Phase)
+			condition := findBuildCondition(t, &current)
+			require.Equal(t, "InvalidOutput", condition.Reason)
+			require.Contains(t, condition.Message, "without a tag or digest")
+			var pods corev1.PodList
+			require.NoError(t, r.List(context.Background(), &pods))
+			require.Empty(t, pods.Items)
+		})
+	}
 }

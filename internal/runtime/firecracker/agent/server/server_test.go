@@ -19,6 +19,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
@@ -56,14 +57,19 @@ func seedCache(stateRoot, image string) error {
 	if err := os.WriteFile(filepath.Join(dir, "memory.snap"), memory, 0o640); err != nil {
 		return err
 	}
-	manifest := map[string]any{
-		"files": map[string]any{
-			"rootfs.ext4":  map[string]any{"sha256": hexSHA256(rootfs), "sizeBytes": len(rootfs)},
-			"vmstate.snap": map[string]any{"sha256": hexSHA256(vmstate), "sizeBytes": len(vmstate)},
-			"memory.snap":  map[string]any{"sha256": hexSHA256(memory), "sizeBytes": len(memory)},
+	manifest := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion,
+		Runtime:       "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"},
+		Kernel:        artifacts.VMKernel{Version: "6.1.177"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", CPUTemplate: artifacts.CPUTemplateT2, FirecrackerVersion: "1.16.1"},
+		Files: map[string]artifacts.ManifestFile{
+			"rootfs.ext4":  {SHA256: hexSHA256(rootfs), SizeBytes: int64(len(rootfs))},
+			"vmstate.snap": {SHA256: hexSHA256(vmstate), SizeBytes: int64(len(vmstate))},
+			"memory.snap":  {SHA256: hexSHA256(memory), SizeBytes: int64(len(memory))},
 		},
 	}
-	payload, err := json.Marshal(manifest)
+	payload, err := artifacts.MarshalVMManifest(manifest)
 	if err != nil {
 		return err
 	}

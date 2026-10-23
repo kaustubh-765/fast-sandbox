@@ -232,6 +232,7 @@ type fastpathFastlet struct {
 	nilCreateReply bool
 	inspectStatus  *fastletapi.SandboxStatus
 	inspectError   error
+	inspectCalls   int
 	diagnostics    *fastletapi.SandboxDiagnosticsResponse
 	diagnosticsErr error
 	snapshotErr    error
@@ -274,6 +275,7 @@ func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, req
 func (f *fastpathFastlet) InspectSandbox(_ context.Context, _ string, request *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.inspectCalls++
 	if f.inspectError != nil {
 		return nil, f.inspectError
 	}
@@ -526,69 +528,6 @@ func TestCreateRejectsLimitAboveDerivedFastletEnvelope(t *testing.T) {
 	creates, _, _, _ := k8sClient.counts()
 	require.Zero(t, creates)
 	require.Empty(t, fastlet.createRequests)
-}
-
-type fakeManifestPolicy struct {
-	bindings map[string][]apiv1alpha2.ActionBinding
-	err      error
-}
-
-func (f *fakeManifestPolicy) ActionBindings(_ context.Context, _ *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.bindings[image], nil
-}
-
-func TestCreateSandboxAppliesManifestRecordedBindings(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
-	server.ManifestPolicy = &fakeManifestPolicy{bindings: map[string][]apiv1alpha2.ActionBinding{
-		"app-snap-v1": {
-			{Handler: "audit", Input: `{"a":1}`},
-			{Handler: "missing-in-pool", Input: `{}`},
-		},
-	}}
-
-	// No explicit bindings: the recorded policy applies (declared handlers
-	// only).
-	request := createRequest("restored-1")
-	request.Image = "app-snap-v1"
-	_, err := server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err)
-	var restored apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
-	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"a":1}`}}, restored.Spec.ActionBindings)
-
-	// Explicit bindings win per handler.
-	request2 := createRequest("restored-2")
-	request2.Image = "app-snap-v1"
-	request2.ActionBindings = []*fastpathv2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}
-	_, err = server.CreateSandbox(context.Background(), request2)
-	require.NoError(t, err)
-	var overridden apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-2"}, &overridden))
-	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}, overridden.Spec.ActionBindings)
-
-	// An image without recorded policy is untouched.
-	request3 := createRequest("plain-1")
-	_, err = server.CreateSandbox(context.Background(), request3)
-	require.NoError(t, err)
-	var plain apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "plain-1"}, &plain))
-	require.Empty(t, plain.Spec.ActionBindings)
-}
-
-func TestCreateSandboxPolicyResolutionFailureProceeds(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
-	server.ManifestPolicy = &fakeManifestPolicy{err: errors.New("store unreachable")}
-
-	request := createRequest("restored-1")
-	request.Image = "app-snap-v1"
-	_, err := server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err, "policy resolution is best-effort; the create proceeds")
-	var restored apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
-	require.Empty(t, restored.Spec.ActionBindings)
 }
 
 func TestGetAndListCacheHitsAvoidDurableKubernetesReads(t *testing.T) {
@@ -1161,4 +1100,74 @@ func TestIdempotentCreateProtectsIntentWrittenByOlderServer(t *testing.T) {
 	}
 	_, err = server.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
+}
+
+func TestGetSandboxPauseStatesIgnoreReleasedAssignment(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		runtime    apiv1alpha2.RuntimeState
+		desired    apiv1alpha2.SandboxState
+		failure    error
+		checkpoint bool
+		want       fastpathv2.RuntimeState
+	}{
+		{"pausing-release-window", apiv1alpha2.RuntimePausing, apiv1alpha2.SandboxStatePaused, &fastletapi.FastletError{Code: fastletapi.ErrorNotFound}, true, fastpathv2.RuntimeState_RUNTIME_STATE_PAUSING},
+		{"pausing-snapshot-in-progress", apiv1alpha2.RuntimePausing, apiv1alpha2.SandboxStatePaused, errors.New("connection refused"), false, fastpathv2.RuntimeState_RUNTIME_STATE_PAUSING},
+		{"paused-assignment-not-cleared", apiv1alpha2.RuntimePaused, apiv1alpha2.SandboxStatePaused, &fastletapi.FastletError{Code: fastletapi.ErrorNotFound}, true, fastpathv2.RuntimeState_RUNTIME_STATE_PAUSED},
+		{"paused-live-status-must-not-override", apiv1alpha2.RuntimePaused, apiv1alpha2.SandboxStatePaused, nil, true, fastpathv2.RuntimeState_RUNTIME_STATE_PAUSED},
+		{"resume-intent-awaiting-reconcile", apiv1alpha2.RuntimePaused, apiv1alpha2.SandboxStateRunning, &fastletapi.FastletError{Code: fastletapi.ErrorNotFound}, true, fastpathv2.RuntimeState_RUNTIME_STATE_PAUSED},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, k8sClient, _, fastlet := newV2Server(t)
+			_, err := server.CreateSandbox(context.Background(), createRequest("sandbox-a"))
+			require.NoError(t, err)
+			var current apiv1alpha2.Sandbox
+			key := types.NamespacedName{Namespace: "default", Name: "sandbox-a"}
+			require.NoError(t, k8sClient.Get(context.Background(), key, &current))
+			envelope, err := assignment.EffectiveAssignment(&current)
+			require.NoError(t, err)
+			require.NotNil(t, envelope, "exercise the release window with a retained assignment")
+			current.Spec.State = test.desired
+			require.NoError(t, k8sClient.Update(context.Background(), &current))
+			current.Status.Runtime.State = test.runtime
+			current.Status.DataPlane.State = apiv1alpha2.DataPlaneUnavailable
+			current.Status.Conditions = nil
+			if test.checkpoint {
+				current.Status.Runtime.Checkpoint = &apiv1alpha2.CheckpointStatus{CheckpointID: "checkpoint-a", ManifestRef: "oci://r.example/ns/t@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ArtifactDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+			}
+			require.NoError(t, k8sClient.Status().Update(context.Background(), &current))
+			fastlet.inspectError = test.failure
+			fastlet.inspectCalls = 0
+			response, err := server.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{Sandbox: expectedReference("sandbox-a", "default")})
+			require.NoError(t, err)
+			require.Equal(t, test.want, response.Sandbox.Runtime.State)
+			require.False(t, response.Sandbox.Ready)
+			require.Equal(t, 0, fastlet.inspectCalls)
+			require.Equal(t, current.Generation, response.Generation)
+			if test.checkpoint {
+				require.NotNil(t, response.Sandbox.Checkpoint)
+				require.Equal(t, "checkpoint-a", response.Sandbox.Checkpoint.CheckpointId)
+			}
+			_, err = server.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{Sandbox: expectedReference("sandbox-a", "default"), ExpectedGeneration: current.Generation + 1})
+			require.Equal(t, codes.Aborted, status.Code(err))
+		})
+	}
+}
+
+func TestGetSandboxRunningInspectFailuresRemainUnavailable(t *testing.T) {
+	for _, failure := range []error{&fastletapi.FastletError{Code: fastletapi.ErrorNotFound}, errors.New("connection refused")} {
+		server, _, _, fastlet := newV2Server(t)
+		_, err := server.CreateSandbox(context.Background(), createRequest("sandbox-a"))
+		require.NoError(t, err)
+		fastlet.inspectError = failure
+		_, err = server.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{Sandbox: expectedReference("sandbox-a", "default")})
+		require.Equal(t, codes.Unavailable, status.Code(err))
+	}
+}
+
+func (*fastpathRegistry) ApplyHeartbeat(placement.FastletID, string, *fastletapi.HeartbeatResponse, time.Time) error {
+	return nil
+}
+func (*fastpathFastlet) Heartbeat(context.Context, string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error) {
+	return &fastletapi.HeartbeatResponse{}, nil
 }

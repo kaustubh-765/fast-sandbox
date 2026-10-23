@@ -38,6 +38,7 @@ func main() {
 	var metricsAddress string
 	var runtimeEnvironmentsFile string
 	var controlSocket string
+	var ociStateRoot string
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node this janitor is running on")
@@ -48,6 +49,8 @@ func main() {
 	flag.StringVar(&metricsAddress, "metrics-address", ":9092", "Prometheus metrics listen address; empty disables the server")
 	flag.StringVar(&runtimeEnvironmentsFile, "runtime-environments-file", runtimeenv.ConfigFilePath, "Path to the platform runtime environment configuration")
 	flag.StringVar(&controlSocket, "control-socket", nodecleanup.DefaultSocketPath, "Unix socket used by Fastlet for fenced host-process cleanup")
+
+	flag.StringVar(&ociStateRoot, "oci-state-root", "", "Shared Firecracker StateRoot for orphan OCI device cleanup; empty disables it")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -163,6 +166,9 @@ func main() {
 		fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{}),
 		hostProcessCleaner,
 	))
+	if ociStateRoot != "" {
+		j.AddBackend(janitor.NewOCIBackend(ociStateRoot))
+	}
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval

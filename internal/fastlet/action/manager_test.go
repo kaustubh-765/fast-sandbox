@@ -32,16 +32,19 @@ type recordedRelay struct {
 }
 
 type fakeCaller struct {
-	mu          sync.Mutex
-	instanceID  string
-	statusErr   error
-	requests    []recordedRequest
-	fail        map[actionapi.Operation]int
-	statusCall  atomic.Int32
-	relayCalls  []recordedRelay
-	relayStatus int
-	relayBody   []byte
-	relayErr    error
+	mu                  sync.Mutex
+	instanceID          string
+	vaultTransfer       bool
+	policyTransfer      bool
+	templateStateExport bool
+	statusErr           error
+	requests            []recordedRequest
+	fail                map[actionapi.Operation]int
+	statusCall          atomic.Int32
+	relayCalls          []recordedRelay
+	relayStatus         int
+	relayBody           []byte
+	relayErr            error
 }
 
 func (f *fakeCaller) Status(context.Context, int32) (actionapi.HandlerStatus, error) {
@@ -51,7 +54,12 @@ func (f *fakeCaller) Status(context.Context, int32) (actionapi.HandlerStatus, er
 	if f.statusErr != nil {
 		return actionapi.HandlerStatus{}, f.statusErr
 	}
-	return actionapi.HandlerStatus{APIVersion: actionapi.APIVersion, Ready: true, InstanceID: f.instanceID}, nil
+	return actionapi.HandlerStatus{
+		APIVersion: actionapi.APIVersion, Ready: true, InstanceID: f.instanceID,
+		VaultTransfer:       f.vaultTransfer,
+		PolicyTransfer:      f.policyTransfer,
+		TemplateStateExport: f.templateStateExport,
+	}, nil
 }
 
 func (f *fakeCaller) Invoke(_ context.Context, port int32, request actionapi.Request) error {
@@ -94,6 +102,7 @@ func attachment(uid string) Attachment {
 		ID: "attachment-" + uid, SandboxUID: uid, SandboxName: "sandbox-" + uid,
 		InstanceGeneration: 1, AssignmentAttempt: 1,
 		RuntimeInstanceID: "runtime-" + uid, RouteGeneration: 1,
+		IP: "172.30.0.2", Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24", HostVeth: "host-" + uid,
 	}
 }
 
@@ -134,6 +143,43 @@ func TestBindingAndLifecycleHooksAreOrderedOrthogonally(t *testing.T) {
 	require.Equal(t, "audit: raw", *requests[0].request.Binding.Input)
 	require.Equal(t, actionapi.LifecycleHookRuntimeReady, requests[2].request.Hook.Name)
 	require.Equal(t, actionapi.LifecycleHookDataPlaneReady, requests[4].request.Hook.Name)
+}
+
+// TestSetBindingDefersWhileAttachmentHasNoNetwork pins the #136 fix: desired
+// Bindings registered at admission precede the runtime, so the attachment has
+// no IP and every Handler would reject the envelope with 400. The Bindings
+// park as Pending-with-reason with no Handler I/O until the post-boot
+// attachment re-registration carries the IP and convergence fires.
+func TestSetBindingDefersWhileAttachmentHasNoNetwork(t *testing.T) {
+	caller := &fakeCaller{instanceID: "handler-1", fail: make(map[actionapi.Operation]int)}
+	manager := readyManager(t, []apiv1alpha2.ActionHandler{handler("egress", 18080)}, caller)
+	unattached := attachment("a")
+	unattached.IP = ""
+
+	require.NoError(t, manager.RegisterDesired(unattached, 1, []DesiredInput{input("egress", "v1")}))
+	require.Empty(t, caller.snapshot(), "an IP-less attachment must not reach the Handler")
+	var statuses []fastletapi.ActionBindingStatus
+	var applied int64
+	require.Eventually(t, func() bool {
+		statuses, applied = manager.Statuses("a")
+		return len(statuses) == 1 && statuses[0].State == string(apiv1alpha2.ActionPending) &&
+			strings.Contains(statuses[0].Message, "network attachment has no IP") && applied == 0
+	}, time.Second, 10*time.Millisecond)
+
+	manager.probe(context.Background())
+	require.Empty(t, caller.snapshot(), "probe ticks must not turn the parked Binding into Handler traffic")
+
+	attached := attachment("a")
+	require.NoError(t, manager.RegisterDesired(attached, 1, []DesiredInput{input("egress", "v1")}))
+	require.Eventually(t, func() bool {
+		statuses, applied = manager.Statuses("a")
+		return len(statuses) == 1 && statuses[0].State == string(apiv1alpha2.ActionReady) && applied == 1
+	}, time.Second, 10*time.Millisecond)
+	requests := caller.snapshot()
+	require.Len(t, requests, 1)
+	require.Equal(t, actionapi.OperationSetBinding, requests[0].request.Operation)
+	require.Equal(t, attached.IP, requests[0].request.Attachment.Network.IP)
+	require.Equal(t, "v1", *requests[0].request.Binding.Input)
 }
 
 func TestOrdinaryInputUpdateDoesNotReplayReachedHooks(t *testing.T) {

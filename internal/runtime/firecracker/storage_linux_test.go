@@ -55,9 +55,21 @@ func TestStateRootStorageRealFilesystem(t *testing.T) {
 		t.Skip("non-XFS rejection test requires a non-XFS temporary directory")
 	}
 	// Exercise the production New/Initialize wiring, not an injected check.
-	fixture := newDriverFixture(t)
-	driver, err := New(fixture.driver.profile)
-	require.NoError(t, err)
-	require.ErrorContains(t, driver.Initialize(context.Background(), ""), "must use XFS with reflink=1")
-	require.False(t, driver.initialized)
+	for _, enabled := range []string{"false", "true"} {
+		t.Run("oci="+enabled, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_ENABLED", enabled)
+			fixture := newDriverFixture(t)
+			driver, err := New(fixture.driver.profile)
+			require.NoError(t, err)
+			err = driver.Initialize(context.Background(), "")
+			if enabled == "true" {
+				require.NoError(t, err)
+				require.True(t, driver.initialized)
+				t.Cleanup(func() { _ = driver.Close() })
+			} else {
+				require.ErrorContains(t, err, "must use XFS with reflink=1")
+				require.False(t, driver.initialized)
+			}
+		})
+	}
 }

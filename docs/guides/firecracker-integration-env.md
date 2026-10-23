@@ -33,16 +33,17 @@ One-liners:
 ./scripts/integration-env.sh up        # two-node env + P2P/dart (tasks 1-8)
 ./scripts/integration-env.sh verify    # 2 + 5 sandboxes; verify 4 = P2P evidence
 ./scripts/integration-env.sh verify-snapshot  # live snapshot E2E (see below)
+./scripts/integration-env.sh verify-policy    # relayed-policy lifecycle E2E (see below)
 ./scripts/integration-env.sh verify-all       # every verify flow in one session
 ./scripts/integration-env.sh status    # component health + P2P block_source counters (dart metrics)
 ./scripts/integration-env.sh down      # host left clean
 ```
 
 `verify-all` runs the full battery in one go, ordered base delivery → P2P →
-execd API → snapshot → egress, fail-fast with the usual log dumps and
-one final stage-timings table. It assumes `up` has already built the golden
-image; the snapshot step rebuilds images and rolls the control plane, and the
-egress step recreates and finally removes its pool.
+execd API → snapshot → pause → egress → policy, fail-fast with the usual log
+dumps and one final stage-timings table. It assumes `up` has already built the
+golden image; the snapshot step rebuilds images and rolls the control plane,
+and the egress step recreates and finally removes its pool.
 
 `KIND_SINGLE=1` falls back to one node (cache-only, no peer traffic);
 `WARM_IMAGES=1` restores the preheat for fast delivery baselines.
@@ -55,6 +56,21 @@ inside the pause window, admitted during `Publishing`), and validates the
 published artifact set. See the
 [Sandbox Snapshots guide](sandbox-snapshots.md); evidence lands in
 `logs/snapshot-e2e-<ts>/`.
+
+`verify-policy` drives the relayed-policy lifecycle (issue #129): a sandbox
+created with a bootstrap deny binding is mutated in place through the
+handler relay (`PUT /policy/{uid}` over the full fastpath
+`InvokeHandlerAction` chain, then `GET` for the revision), paused and
+resumed — the checkpoint bundle carries the persisted policy record as an
+**opaque** `policy.json` (`POLICY_EXPORT`), the restore lands it before
+data-plane-ready
+(`POLICY_IMPORT` re-stamps the record), and the relayed allow policy (not
+the CRD bootstrap) is enforced afterwards and survives an egress worker
+restart. Relay mutations are subject-local: a clone created from the
+template snapshot inherits the create-time CRD seed only, and template
+snapshots never export (an export seals the source). Requires
+`opensandbox/egress:latest` in local docker; evidence lands in
+`logs/policy-e2e-<ts>/`.
 
 `up` and the plain `verify` only prove execd `/ping` delivery. For execd
 **protocol** usability in the guest (OpenSandbox issue #1695: `POST
@@ -291,21 +307,14 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 - `fs.inotify.max_user_instances` ≥ 8192 (kubelet/containerd watchers).
 
 ### 6.2 StateRoot filesystem — the single biggest latency lever
-- Put the node StateRoot on **XFS with `reflink=1`**. The Firecracker Fastlet
-  refuses to start on any other filesystem, including ext4 and Btrfs.
-  Initialization also probes an actual `cp --reflink=always` clone; disabled
-  reflink, missing GNU coreutils, and an unwritable StateRoot block startup.
-  The node readiness check treats non-XFS or unavailable reflink as a hard
-  failure instead of a warning. There is no opt-out for a slow deployment.
-  A per-instance rootfs CoW clone takes ~1 ms instead of a multi-GiB copy.
+- Put the node StateRoot on **XFS with `reflink=1`** for short native snapshot pauses. With OCI disabled, Fastlet startup and node readiness require XFS and an actual reflink clone; missing GNU coreutils or disabled reflink blocks startup. With `FAST_SANDBOX_OCI_ENABLED=true`, XFS/reflink validation is skipped with a warning: native templates can still require full rootfs copies, increasing create latency and snapshot pause time. Set the variable on both the Fastlet and runtime-agent to relax both checks; the standalone host-check script accepts the same variable. Directory preparation and the node's minimum free-space requirement remain enforced. A per-instance rootfs CoW clone takes ~1 ms instead of a multi-GiB copy.
 - The cache, the agent journal, and the per-sandbox jails **must share one
   filesystem** (reflink only works within a filesystem) and one StateRoot
   (`/var/lib/fast-sandbox/firecracker`) across agent + all fastlets.
 - Size: sparse rootfs (2 GiB declared) × concurrency + snapshot cache;
   monitor real usage (`du`, not `ls` — sparse).
 
-Existing ext4/Btrfs deployments must drain sandboxes and stop Fastlets before
-migrating. Preserve the old StateRoot, provision an XFS mount with
+Existing ext4/Btrfs deployments adopting XFS must drain sandboxes and stop Fastlets before migrating. Preserve the old StateRoot, provision an XFS mount with
 `scripts/firecracker-xfs-stateroot.sh --loop`, copy the preserved state into
 the new mount, and restart the runtime Pods. Do not format an existing state
 disk or mount over live sandbox state.

@@ -252,7 +252,7 @@ func newDriverFixture(t *testing.T) *driverFixture {
 		manager: newNetworkManagerForTest(t),
 	}
 	driver := &Driver{
-		profile: profile, config: config,
+		profile: profile, config: config, fcVersion: "1.16.1",
 		runner: runner, launcher: launcher,
 		newClient: func(string) *Client { return NewClient(server.socket) },
 		stat:      func(string) (os.FileInfo, error) { return fakeFileInfoForTest{}, nil },
@@ -299,13 +299,7 @@ func (f *driverFixture) prepareCachedImage(t *testing.T, image string) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), []byte("rootfs-image-data"), 0o640))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, vmstateSnapshotName), []byte("vmstate-snapshot-data"), 0o640))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, memorySnapshotName), []byte("memory-snapshot-data"), 0o640))
-	manifest, err := json.Marshal(map[string]any{
-		"machine": map[string]any{"vcpu": "2", "memory": "1Gi"},
-		// The baked guest address every slot netns translates its slot IP
-		// to (per-clone clone model). Must stay the reserved convention
-		// address (gateway + 2 of the runtime CIDR).
-		"guestNetwork": map[string]any{"iface": "eth0", "mac": "02:00:00:00:00:01", "ip": "172.30.0.3", "gateway": "172.30.0.1", "netmask": "255.255.255.0"},
-	})
+	manifest, err := json.Marshal(testManifestDocument(t))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o640))
 }
@@ -850,9 +844,9 @@ func TestValidateRestoreMachineConfigUsesManifest(t *testing.T) {
 	image := "example.com/app:v1"
 	dir := filepath.Join(stateRoot, imageCacheDir, imageKey(image))
 	require.NoError(t, os.MkdirAll(dir, 0o750))
-	manifest, err := json.Marshal(map[string]any{
-		"machine": map[string]any{"vcpu": "1", "memory": "512Mi"},
-	})
+	document := testManifestDocument(t)
+	document["machine"].(map[string]any)["memoryMiB"] = 512
+	manifest, err := json.Marshal(document)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o640))
 	config := firecrackerConfigForTest(t, stateRoot)
@@ -886,23 +880,17 @@ func TestCheckRestoreCompatibility(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 
 	// Structured compatibility decodes cleanly.
-	manifest, err := json.Marshal(map[string]any{
-		"compatibility": map[string]any{
-			"vendor":             "AuthenticAMD",
-			"cpuFamily":          26,
-			"cpuModel":           17,
-			"cpuTemplate":        "none",
-			"firecrackerVersion": "1.16.1",
-		},
-	})
+	document := testManifestDocument(t)
+	document["compatibility"] = map[string]any{"cpuArch": artifacts.HostCPUArch(), "vendor": "AuthenticAMD", "cpuFamily": 26, "cpuModel": 17, "cpuTemplate": "none", "firecrackerVersion": "1.16.1"}
+	manifest, err := json.Marshal(document)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o640))
 
 	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
 	require.NoError(t, err)
-	compat, ok := decodeCachedManifestCompatibility(payload)
+	decoded, err := artifacts.DecodeVMManifest(payload)
+	compat := decoded.Compatibility
 	require.NoError(t, err)
-	require.True(t, ok)
 	require.Equal(t, "none", compat.CPUTemplate)
 
 	// Same identity as the snapshot: admitted.
@@ -926,10 +914,8 @@ func TestCheckRestoreCompatibility(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), legacy, 0o640))
 	payload, err = os.ReadFile(cachedManifestPath(stateRoot, image))
 	require.NoError(t, err)
-	_, ok = decodeCachedManifestCompatibility(payload)
-	require.NoError(t, err)
-	require.False(t, ok)
-	require.NoError(t, checkRestoreCompatibility(artifacts.SnapshotCompatibility{}, local, "1.16.1", image))
+	_, err = artifacts.DecodeVMManifest(payload)
+	require.Error(t, err, "old-shaped metadata is not admitted by the shared decoder")
 }
 
 func TestResolveRestoreSnapshotFilesRequiresBothArtifacts(t *testing.T) {
@@ -965,18 +951,17 @@ func TestResolveBakedGuestIPFallsBackWithoutManifest(t *testing.T) {
 	require.Equal(t, "172.30.0.3", guestIP)
 	require.Zero(t, guestMTU)
 
-	// A manifest without an MTU keeps reporting the baked address only.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(
-		`{"guestNetwork":{"ip":"172.30.0.3"}}`), 0o640))
-	guestIP, guestMTU, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"})
+	// A present manifest must carry the complete static-network contract.
+	document := testManifestDocument(t)
+	delete(document["guestNetwork"].(map[string]any), "mtu")
+	raw, err := json.Marshal(document)
 	require.NoError(t, err)
-	require.Equal(t, "172.30.0.3", guestIP)
-	require.Zero(t, guestMTU)
-
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0640))
+	_, _, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"})
+	require.ErrorIs(t, err, ErrInvalidConfig)
 	// A manifest with an MTU reports it so callers can validate the slot
 	// data plane against the frozen guest value.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(
-		`{"guestNetwork":{"ip":"172.30.0.3","mtu":1500}}`), 0o640))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), testNetworkManifest(t, `{"guestNetwork":{"ip":"172.30.0.3","mtu":1500}}`), 0o640))
 	guestIP, guestMTU, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"})
 	require.NoError(t, err)
 	require.Equal(t, "172.30.0.3", guestIP)
@@ -1000,7 +985,7 @@ func TestResolveBakedGuestIPRejectsRuntimeMismatch(t *testing.T) {
 	slot := &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"}
 
 	writeManifest := func(payload string) {
-		require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(payload), 0o640))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), testNetworkManifest(t, payload), 0o640))
 	}
 
 	// The aligned case (builder convention) passes.
@@ -1165,4 +1150,51 @@ func TestRecoverRuntimeResourcesRemovesJailRoot(t *testing.T) {
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
 	_, err = os.Stat(jailDir)
 	require.True(t, os.IsNotExist(err))
+}
+
+func testManifestDocument(t *testing.T) map[string]any {
+	t.Helper()
+	doc := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 2, MemoryMiB: 1024, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "6.1.177", "/missing/firecracker", artifacts.CPUTemplateNone)
+	doc.Compatibility.FirecrackerVersion = "1.16.1"
+	doc.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: "02:00:00:00:00:01", IP: "172.30.0.3", Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: 1500}
+	doc.Files = map[string]artifacts.ManifestFile{}
+	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
+		doc.Files[name] = artifacts.ManifestFile{SHA256: artifacts.SHA256Of([]byte(name)), SizeBytes: 1}
+	}
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(raw, &result))
+	return result
+}
+
+func testNetworkManifest(t *testing.T, raw string) []byte {
+	t.Helper()
+	document := testManifestDocument(t)
+	var fields map[string]map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw), &fields))
+	network := map[string]any{"iface": "eth0", "mac": "02:00:00:00:00:01", "gateway": "172.30.0.1", "netmask": "255.255.255.0", "mtu": 1500}
+	for key, value := range fields["guestNetwork"] {
+		network[key] = value
+	}
+	document["guestNetwork"] = network
+	payload, err := json.Marshal(document)
+	require.NoError(t, err)
+	return payload
+}
+
+func TestRecoveryDoesNotInspectAnotherFastletPodVM(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.driver.SetFastletPodUID("new-pod")
+	other := fixture.sandboxSpec
+	other.Identity.FastletPodUID = "live-other-pod"
+	directory, err := ensureSandboxDir(fixture.stateRoot, other.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{Config: other, Phase: PhaseRunning, PID: 123}))
+	fixture.driver.probeProcess = func(int) error { t.Fatal("must not probe another Pod's PID in this PID namespace"); return nil }
+	managed, err := fixture.driver.ListManagedSandboxes(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, managed)
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.FileExists(t, filepath.Join(directory, sandboxMetaName))
 }

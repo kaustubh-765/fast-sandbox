@@ -305,8 +305,9 @@ spec:
                 properties:
                   format:
                     default: overlaybd
-                    description: Format selects the storage encoding of the snapshot
-                      set.
+                    description: |-
+                      Format selects the storage encoding. Native requires object storage;
+                      OverlayBD requires an explicit oci:// publish target.
                     enum:
                     - native
                     - overlaybd
@@ -327,7 +328,12 @@ spec:
                     type: object
                   publish:
                     description: |-
-                      Publish is the S3-compatible object store target, e.g.
+                      Publish selects the destination. oci://registry/namespace/repo must
+                      omit the tag and digest; each build Pod receives a system-generated
+                      UUID and publishes <uuid>_rootfs and <uuid>_snapfiles. A new build
+                      uses a new UUID; retries of the same Pod reuse its UUID.
+                      PublishSecretRef then requires .dockerconfigjson.
+                      For format=native, Publish is the S3-compatible object store target, e.g.
                       s3://bucket/sandbox-images/ (digest-addressed publication). When
                       empty, the controller defaults it to the platform artifact store
                       (the fast-sandbox-artifact-store ConfigMap); when set it must equal

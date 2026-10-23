@@ -613,8 +613,9 @@ type SnapshotSpec struct {
 	// Kind selects the publish mode. Empty is treated as SnapshotKindTemplate
 	// so callers that predate checkpoints keep working.
 	Kind SnapshotKind `json:"kind,omitempty"`
-	// TemplateName is the artifact-store index key the artifact set is
-	// published under. Required for Template, must be empty for Checkpoint.
+	// TemplateName is required for native template snapshots and selects their
+	// artifact-store index key. OCI templates use SnapshotID instead and need
+	// no name index. Must be empty for Checkpoint.
 	TemplateName string `json:"templateName,omitempty"`
 }
 
@@ -641,9 +642,6 @@ type CreateSnapshotRequest struct {
 	RequestID string           `json:"requestId,omitempty"`
 	Identity  SnapshotIdentity `json:"identity"`
 	Snapshot  SnapshotSpec     `json:"snapshot"`
-	// ActionBindings are the source Sandbox's bindings, recorded in the
-	// published manifest (durable policy provenance).
-	ActionBindings []ActionBindingInput `json:"actionBindings,omitempty"`
 }
 
 type CreateSnapshotResponse struct {

@@ -3221,9 +3221,10 @@ type CreateSandboxSnapshotRequest struct {
 	// sandbox is the snapshot target; expected_uid fences against a Sandbox
 	// recreated under the same name.
 	Sandbox *SandboxReference `protobuf:"bytes,2,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
-	// template_name is the artifact-store index key the artifact set is
-	// published under; afterwards CreateSandbox(image=template_name) boots
-	// from the snapshot. Immutable per request_id.
+	// template_name is required for native + S3 snapshots and selects their
+	// artifact-store index key. OCI snapshots may omit it: their two images
+	// use a random snapshot_id; create new Sandboxes with image=manifest_ref.
+	// Immutable per request_id.
 	TemplateName string `protobuf:"bytes,3,opt,name=template_name,json=templateName,proto3" json:"template_name,omitempty"`
 	// metadata is projected as sandbox.fast.io/<k> labels, mirroring
 	// CreateSandboxRequest.metadata.
@@ -3304,8 +3305,8 @@ type SandboxSnapshotInfo struct {
 	// fastlet_name is the fastlet the snapshot was triggered on (resolved
 	// from the target Sandbox's assignment at trigger time).
 	FastletName string `protobuf:"bytes,7,opt,name=fastlet_name,json=fastletName,proto3" json:"fastlet_name,omitempty"`
-	// manifest_ref is the s3:// URI of the published manifest.json (terminal
-	// success only).
+	// manifest_ref is the published s3:// manifest.json or immutable oci://
+	// snapfiles reference (terminal success only).
 	ManifestRef string `protobuf:"bytes,8,opt,name=manifest_ref,json=manifestRef,proto3" json:"manifest_ref,omitempty"`
 	// artifact_digest is the sha256 of the manifest document.
 	ArtifactDigest string `protobuf:"bytes,9,opt,name=artifact_digest,json=artifactDigest,proto3" json:"artifact_digest,omitempty"`
@@ -3313,8 +3314,11 @@ type SandboxSnapshotInfo struct {
 	SizeBytes            int64 `protobuf:"varint,10,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	CreatedUnixSeconds   int64 `protobuf:"varint,11,opt,name=created_unix_seconds,json=createdUnixSeconds,proto3" json:"created_unix_seconds,omitempty"`
 	CompletedUnixSeconds int64 `protobuf:"varint,12,opt,name=completed_unix_seconds,json=completedUnixSeconds,proto3" json:"completed_unix_seconds,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// snapshot_id is the random UUID assigned by Fastlet on admission. OCI
+	// publication uses it as the prefix of the rootfs and snapfiles tags.
+	SnapshotId    string `protobuf:"bytes,13,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SandboxSnapshotInfo) Reset() {
@@ -3429,6 +3433,13 @@ func (x *SandboxSnapshotInfo) GetCompletedUnixSeconds() int64 {
 		return x.CompletedUnixSeconds
 	}
 	return 0
+}
+
+func (x *SandboxSnapshotInfo) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
 }
 
 type CreateSandboxSnapshotResponse struct {
@@ -3575,8 +3586,10 @@ func (x *GetSandboxSnapshotResponse) GetSnapshot() *SandboxSnapshotInfo {
 type DeleteSandboxSnapshotRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// snapshot references the SandboxSnapshot to delete; expected_uid, when
-	// set, must match the SandboxSnapshot UID. Deleting a snapshot does not
-	// unpublish its artifacts.
+	// set, must match the SandboxSnapshot UID. OCI deletion removes the
+	// published rootfs and snapfiles manifests before the CR disappears.
+	// The call accepts asynchronous deletion; poll Get until NotFound.
+	// Native artifact-store lifecycle remains managed out of band.
 	Snapshot      *SandboxReference `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -4336,7 +4349,7 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v27.fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfa\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9b\x04\n" +
 	"\x13SandboxSnapshotInfo\x128\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1c.fastpath.v2.SandboxIdentityR\bidentity\x12!\n" +
 	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12\x1f\n" +
@@ -4352,7 +4365,9 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"size_bytes\x18\n" +
 	" \x01(\x03R\tsizeBytes\x120\n" +
 	"\x14created_unix_seconds\x18\v \x01(\x03R\x12createdUnixSeconds\x124\n" +
-	"\x16completed_unix_seconds\x18\f \x01(\x03R\x14completedUnixSeconds\"]\n" +
+	"\x16completed_unix_seconds\x18\f \x01(\x03R\x14completedUnixSeconds\x12\x1f\n" +
+	"\vsnapshot_id\x18\r \x01(\tR\n" +
+	"snapshotId\"]\n" +
 	"\x1dCreateSandboxSnapshotResponse\x12<\n" +
 	"\bsnapshot\x18\x01 \x01(\v2 .fastpath.v2.SandboxSnapshotInfoR\bsnapshot\"w\n" +
 	"\x19GetSandboxSnapshotRequest\x127\n" +

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // fakeProcTree points procRoot at a temporary tree for the test.
@@ -570,6 +572,7 @@ func TestOverlaybdCredentialsRekeysForBlobURL(t *testing.T) {
 		"registry-1.docker.io/library/redis": "alice:secret",
 		"registry.example.com/team/app":      "bob:pw",
 		"registry.example.com/team/db":       "carol:pw2",
+		"unknown.example.com/x/y":            ":",
 	}
 	if len(handoff.Auths) != len(want) {
 		t.Fatalf("handoff keys = %v", handoff.Auths)
@@ -738,18 +741,17 @@ func TestWriteGuestFileReplacesSpecialFiles(t *testing.T) {
 	})
 }
 
-func TestMetadataRequiresRelativeRootfsDrive(t *testing.T) {
-	legacy := vmMetadata{HypervisorType: hypervisorFirecracker}
-	if err := legacy.validate("firecracker", true); err == nil || !strings.Contains(err.Error(), "rebuild") {
-		t.Fatalf("legacy template = %v, want rebuild error even with --force", err)
+func TestManifestRequiresRelativeRootfsDrive(t *testing.T) {
+	for _, path := range []string{"", "/dev/ublkb2"} {
+		document := testVMManifest()
+		document.Machine.RootfsDrivePath = path
+		if err := validateManifest(document, "firecracker", true); err == nil {
+			t.Fatalf("drive %q must fail even with --force", path)
+		}
 	}
-	pinned := vmMetadata{RootfsDrivePath: "/dev/ublkb2"}
-	if err := pinned.validate("firecracker", true); err == nil {
-		t.Fatal("a host device path must be rejected")
-	}
-	current := vmMetadata{RootfsDrivePath: rootfsDriveLink}
-	if err := current.validate("firecracker", true); err != nil {
-		t.Fatalf("current template: %v", err)
+	document := testVMManifest()
+	if err := validateManifest(document, "/missing/firecracker", true); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -759,5 +761,50 @@ func TestCreateHasNoSpecOverrides(t *testing.T) {
 		if flags.Lookup(removed) != nil {
 			t.Errorf("create must not expose --%s", removed)
 		}
+	}
+}
+
+func TestInjectionPreservesGuestHostsAndConfinesSymlinks(t *testing.T) {
+	for _, mode := range []string{"existing", "missing", "symlink", "escaping-parent"} {
+		t.Run(mode, func(t *testing.T) {
+			guest, source, outside := t.TempDir(), t.TempDir(), t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(source, "etc"), 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(source, "etc/hosts"), []byte("default"), 0644))
+			sentinel := filepath.Join(outside, "hosts")
+			require.NoError(t, os.WriteFile(sentinel, []byte("host-private"), 0600))
+			if mode == "escaping-parent" {
+				require.NoError(t, os.Symlink(outside, filepath.Join(guest, "etc")))
+			} else {
+				require.NoError(t, os.MkdirAll(filepath.Join(guest, "etc"), 0755))
+				if mode == "existing" {
+					require.NoError(t, os.WriteFile(filepath.Join(guest, "etc/hosts"), []byte("10.0.0.1 custom"), 0644))
+				}
+				if mode == "symlink" {
+					require.NoError(t, os.Symlink(sentinel, filepath.Join(guest, "etc/hosts")))
+				}
+			}
+			err := copyInjection(guest, source)
+			if mode == "escaping-parent" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				if mode == "symlink" {
+					target, e := os.Readlink(filepath.Join(guest, "etc/hosts"))
+					require.NoError(t, e)
+					require.Equal(t, sentinel, target)
+				} else {
+					data, e := os.ReadFile(filepath.Join(guest, "etc/hosts"))
+					require.NoError(t, e)
+					want := "default"
+					if mode == "existing" {
+						want = "10.0.0.1 custom"
+					}
+					require.Equal(t, want, string(data))
+				}
+			}
+			raw, err := os.ReadFile(sentinel)
+			require.NoError(t, err)
+			require.Equal(t, "host-private", string(raw))
+		})
 	}
 }

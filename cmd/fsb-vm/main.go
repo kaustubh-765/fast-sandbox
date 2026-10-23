@@ -16,7 +16,7 @@
 //
 //	config.go    — global flags and shared configuration
 //	template.go  — template.json input manifest
-//	metadata.go  — snapfiles metadata.json (authoritative VM spec) + validation
+//	manifest.go  — snapfiles manifest.json (authoritative VM spec) + validation
 //	registry.go  — pull overlaybd manifests with go-containerregistry
 //	cred.go       — merge dockerAuth into overlaybd's global cred.json
 //	overlaybd.go — config.v1.json generation and the hybrid writable upper

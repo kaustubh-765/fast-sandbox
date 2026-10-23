@@ -69,13 +69,19 @@ func (s *fakePublishStore) body(key string) []byte {
 func stageArtifactSet(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	manifest := map[string]any{
-		"schemaVersion": 1,
-		"runtime":       "firecracker",
-		"machine":       map[string]any{"vcpu": "2", "memory": "1Gi"},
-		"format":        "native",
+	manifest := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion,
+		Runtime:       "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 2, MemoryMiB: 1024, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"},
+		Kernel:        artifacts.VMKernel{Version: "6.1.177"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: artifacts.CPUTemplateNone, Vendor: artifacts.VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7},
+		Files: map[string]artifacts.ManifestFile{
+			"rootfs.ext4":  {SHA256: artifacts.SHA256Of([]byte("rootfs")), SizeBytes: 6},
+			"vmstate.snap": {SHA256: artifacts.SHA256Of([]byte("vmstate")), SizeBytes: 7},
+			"memory.snap":  {SHA256: artifacts.SHA256Of([]byte("memory")), SizeBytes: 6},
+		},
 	}
-	manifestBytes, err := artifacts.MarshalManifest(manifest)
+	manifestBytes, err := artifacts.MarshalVMManifest(manifest)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifestBytes, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("rootfs"), 0o644))

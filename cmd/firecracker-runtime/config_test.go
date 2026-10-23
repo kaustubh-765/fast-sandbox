@@ -23,6 +23,17 @@ func TestLoadAgentConfigMissingFileYieldsDefaults(t *testing.T) {
 	require.Empty(t, config.NodeReadiness.MinMemory)
 }
 
+func TestReadinessSettingsOCIEnabled(t *testing.T) {
+	for _, enabled := range []string{"true", "false", "", "invalid"} {
+		t.Run("enabled="+enabled, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_ENABLED", enabled)
+			settings, err := readinessSettings(filepath.Join(t.TempDir(), "missing.yaml"), t.TempDir())()
+			require.NoError(t, err)
+			require.Equal(t, enabled == "true", settings.Check.OCIEnabled)
+		})
+	}
+}
+
 func TestLoadAgentConfigParsesP2PAndFillsDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.yaml")
 	payload := `

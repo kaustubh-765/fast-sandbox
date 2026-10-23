@@ -246,17 +246,10 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 			os.Exit(1)
 		}
 		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")))
-		// Snapshot-recorded action bindings live in the published manifest;
-		// the control plane resolves them through the pool's compiled
-		// registry credential (read pair) at create time. The store address
-		// is resolved from the mounted ConfigMap per create, so an edit
-		// applies without a restart and no ConfigMap RBAC is involved.
-		manifestPolicy := fastpath.NewStorePolicySource(durableClient, artifactstore.Loader{})
 		fastpathv2.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
 			DiagnosticsClient: fastletClient,
 			CredentialIssuer:  credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
-			ManifestPolicy: manifestPolicy,
 		})
 		go func() {
 			<-runContext.Done()

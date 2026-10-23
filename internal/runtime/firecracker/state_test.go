@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,4 +75,28 @@ func TestRemoveSandboxDirRefusesRoot(t *testing.T) {
 	root := t.TempDir()
 	err := removeSandboxDir(filepath.Join(root, sandboxStateDir))
 	require.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func TestSaveStateReplacesWithoutTruncatingPreviousRecord(t *testing.T) {
+	directory := t.TempDir()
+	state := &SandboxState{Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{SandboxUID: "sandbox-1"}}, Phase: PhaseStarting}
+	require.NoError(t, saveState(directory, state))
+	old, err := os.Open(metaPath(directory))
+	require.NoError(t, err)
+	defer old.Close()
+	state.Phase = PhaseRunning
+	state.PID = 42
+	require.NoError(t, saveState(directory, state))
+	var previous SandboxState
+	require.NoError(t, json.NewDecoder(old).Decode(&previous))
+	require.Equal(t, PhaseStarting, previous.Phase)
+	current, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, 42, current.PID)
+	info, err := os.Stat(metaPath(directory))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+	entries, err := os.ReadDir(directory)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
 }

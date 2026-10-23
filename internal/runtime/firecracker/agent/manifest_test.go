@@ -2,11 +2,37 @@ package agent
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestObjectStoreRejectsOCIManifestWithoutNativeFiles(t *testing.T) {
+	payload := testManifest(map[string][]byte{
+		"rootfs.ext4": []byte("rootfs"), "vmstate.snap": []byte("vmstate"), "memory.snap": []byte("memory"),
+	})
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(payload, &doc))
+	delete(doc, "files")
+	raw, err := json.Marshal(doc)
+	require.NoError(t, err)
+	_, err = parseManifest(raw)
+	require.ErrorContains(t, err, "no native files")
+
+	// A cached OCI manifest must not bypass the format check as a cache hit.
+	dir := t.TempDir()
+	for name, data := range map[string][]byte{
+		"rootfs.img": []byte("rootfs"), "vmstate.snap": []byte("vmstate"), "memory.snap": []byte("memory"), "manifest.json": raw,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), data, 0600))
+	}
+	ready, err := cacheComplete(dir)
+	require.NoError(t, err)
+	require.False(t, ready)
+}
 
 func TestParseManifest(t *testing.T) {
 	payload := testManifest(map[string][]byte{
@@ -28,11 +54,14 @@ func TestParseManifestInvalidJSON(t *testing.T) {
 }
 
 func TestParseManifestEmptyFiles(t *testing.T) {
-	payload, err := json.Marshal(map[string]any{"files": map[string]any{}})
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(testManifest(nil), &document))
+	document["files"] = map[string]any{}
+	payload, err := json.Marshal(document)
 	require.NoError(t, err)
 	_, err = parseManifest(payload)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no files")
+	require.Contains(t, err.Error(), "no native files")
 }
 
 func TestNativeFiles(t *testing.T) {

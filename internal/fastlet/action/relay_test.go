@@ -1,7 +1,9 @@
 package action
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -111,13 +113,13 @@ func TestHTTPCallerRelayBoundsResponsesAndRedirects(t *testing.T) {
 	require.Empty(t, body)
 
 	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(make([]byte, maxResponseSize+1))
+		_, _ = w.Write(make([]byte, maxRelayResponseSize+1))
 	}))
 	t.Cleanup(oversized.Close)
 	_, _, err = NewHTTPCaller().Relay(context.Background(),
 		int32(oversized.Listener.Addr().(*net.TCPAddr).Port), "uid-a", http.MethodGet, "/vault/s-a", nil)
 	require.Error(t, err)
-	require.ErrorContains(t, err, "32 KiB")
+	require.ErrorContains(t, err, fmt.Sprintf("exceeds %d bytes", int64(maxRelayResponseSize)))
 }
 
 func TestHTTPCallerRelaySurfacesContextCancellation(t *testing.T) {
@@ -142,4 +144,40 @@ func TestHTTPCallerRelaySurfacesContextCancellation(t *testing.T) {
 		t.Fatal("relay did not honor context cancellation")
 	}
 	require.ErrorIs(t, relayErr, context.Canceled)
+}
+
+// The handler-relay response bound is the relay's own (128 KiB): a policy
+// record larger than the management 32 KiB bound round-trips verbatim,
+// while the management channel stays at 32 KiB.
+func TestHTTPCallerRelayReturnsResponsesOverManagementBound(t *testing.T) {
+	large := make([]byte, 40<<10)
+	for i := range large {
+		large[i] = byte('a' + i%26)
+	}
+	document := []byte(`{"revision":2,"policy":` + string(large) + `}`)
+	require.Greater(t, len(document), 32<<10, "the fixture must exceed the management bound")
+
+	handlerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(document)
+	}))
+	defer handlerServer.Close()
+	port, err := func() (int32, error) {
+		address := handlerServer.Listener.Addr().(*net.TCPAddr)
+		return int32(address.Port), nil
+	}()
+	require.NoError(t, err)
+
+	status, body, relayErr := NewHTTPCaller().Relay(context.Background(), port, "uid-a", http.MethodGet, "/policy/uid-a", nil)
+	require.NoError(t, relayErr)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, document, body, "the relay returns handler-owned documents verbatim")
+
+	// The management channel keeps the 32 KiB bound: the same body through
+	// Status is a transport-level refusal.
+	caller := &HTTPCaller{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(document))}, nil
+	})}}
+	_, statusErr := caller.Status(context.Background(), port)
+	require.ErrorContains(t, statusErr, "exceeds")
 }

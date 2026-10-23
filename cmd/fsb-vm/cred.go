@@ -25,13 +25,12 @@ func overlaybdCredentials(config dockerConfig, imageRefs ...string) (dockerConfi
 		if err != nil {
 			return dockerConfig{}, err
 		}
-		credential, found, err := credentialFor(config, ref)
+		credential, _, err := credentialFor(config, ref)
 		if err != nil {
 			return dockerConfig{}, fmt.Errorf("credential for %s: %w", imageRef, err)
 		}
-		if !found || (credential.Username == "" && credential.Password == "") {
-			continue
-		}
+		// An explicit anonymous entry replaces a previously installed credential
+		// and masks less-specific host entries without touching other repositories.
 		key := canonicalRegistryHost(ref.Registry) + "/" + ref.Repository
 		handoff.Auths[key] = authEntry{
 			Auth: base64.StdEncoding.EncodeToString([]byte(credential.Username + ":" + credential.Password)),
@@ -69,6 +68,9 @@ func mergeCredentials(credFile string, incoming dockerConfig) error {
 		existing.Auths = map[string]authEntry{}
 	}
 	for host, entry := range incoming.Auths {
+		if previous, exists := existing.Auths[host]; exists && global.rejectCredentialConflicts && previous != entry {
+			return fmt.Errorf("shared overlaybd credential conflict for %s: node daemon requires one credential per repository; drain consumers before rotating credentials", host)
+		}
 		existing.Auths[host] = entry
 	}
 	return writeCredentialsAtomic(credFile, existing)

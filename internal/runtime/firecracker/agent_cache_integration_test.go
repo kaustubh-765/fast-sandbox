@@ -40,7 +40,9 @@ func TestAgentPullFeedsDriverCache(t *testing.T) {
 			"sizeBytes": len(content),
 		}
 	}
-	manifestBytes, err := json.Marshal(map[string]any{"schemaVersion": 1, "runtime": "firecracker", "files": files})
+	document := testManifestDocument(t)
+	document["files"] = files
+	manifestBytes, err := json.Marshal(document)
 	require.NoError(t, err)
 	digest16 := sha256HexTest(manifestBytes)[:16]
 

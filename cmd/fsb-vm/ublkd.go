@@ -15,6 +15,8 @@ import (
 // maxUblkdResponseBytes bounds the control-API responses read from ublkd.
 const maxUblkdResponseBytes = 1 << 20
 
+const ublkdConfigKey = "config"
+
 // errAddOutcomeUnknown means the Add request may still be running in ublkd.
 // The daemon does not expose in-flight Adds through List, so callers must keep
 // the config and its backing files until a later cleanup can confirm the result.
@@ -99,7 +101,7 @@ func (c *ublkdClient) Ping(ctx context.Context) error {
 // Add attaches the device described by configPath and returns its dev_id and
 // /dev/ublkbN path. The call blocks until the device is usable.
 func (c *ublkdClient) Add(ctx context.Context, configPath string) (int, string, error) {
-	request := map[string]string{"config": configPath}
+	request := map[string]string{ublkdConfigKey: configPath}
 	var response ublkdAddResponse
 	if err := c.do(ctx, http.MethodPost, "/v1/add", request, &response); err != nil {
 		var requestErr *ublkdRequestError
@@ -141,42 +143,80 @@ func (c *ublkdClient) List(ctx context.Context) ([]ublkdDevice, error) {
 }
 
 func (c *ublkdClient) do(ctx context.Context, method, path string, input, output any) error {
+	_, err := c.doStatus(ctx, method, path, input, output)
+	return err
+}
+
+func (c *ublkdClient) doStatus(ctx context.Context, method, path string, input, output any) (int, error) {
 	var body io.Reader
 	if input != nil {
 		payload, err := json.Marshal(input)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		body = bytes.NewReader(payload)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, "http://ublkd"+path, body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return &ublkdRequestError{err: err}
+		return 0, &ublkdRequestError{err: err}
 	}
 	defer response.Body.Close()
 	limited := io.LimitReader(response.Body, maxUblkdResponseBytes)
 	payload, err := io.ReadAll(limited)
 	if err != nil {
-		return fmt.Errorf("read ublkd response: %w", err)
+		return response.StatusCode, fmt.Errorf("read ublkd response: %w", err)
 	}
 	// The daemon reports failures with a non-2xx status and a JSON body
 	// carrying "error"; decode regardless so callers can surface it.
 	if output != nil && len(payload) > 0 {
 		if err := json.Unmarshal(payload, output); err != nil {
-			return fmt.Errorf("decode ublkd response (%s): %w", bytes.TrimSpace(payload), err)
+			return response.StatusCode, fmt.Errorf("decode ublkd response (%s): %w", bytes.TrimSpace(payload), err)
 		}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if output == nil {
-			return fmt.Errorf("ublkd %s %s: %s: %s", method, path, response.Status, bytes.TrimSpace(payload))
+			return response.StatusCode, fmt.Errorf("ublkd %s %s: %s: %s", method, path, response.Status, bytes.TrimSpace(payload))
 		}
 	}
-	return nil
+	return response.StatusCode, nil
+}
+
+// FenceAdd disables future Adds of a retained pack config and waits for the
+// daemon's per-config guard to become free. The pinned ublkd holds that guard
+// through start(), including failures. Its 500 start-failure response to this
+// invalid config therefore acknowledges that earlier Adds have finished.
+// A timeout, disconnect, or unfamiliar response is never treated as success.
+func (c *ublkdClient) FenceAdd(ctx context.Context, config string) error {
+	if err := writeFileAtomic(config, []byte("fsb-vm: retired pack config\n"), 0600); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		var response ublkdAddResponse
+		code, err := c.doStatus(ctx, http.MethodPost, "/v1/add", map[string]string{ublkdConfigKey: config}, &response)
+		if err != nil {
+			return fmt.Errorf("fence retained pack add: %w", err)
+		}
+		if code == http.StatusInternalServerError && !response.OK && response.Error == "device failed to start (see daemon log)" {
+			return nil
+		}
+		if code != http.StatusConflict || response.Error != "an add of this image is already in progress" {
+			return fmt.Errorf("ublkd did not acknowledge retired pack config: status %d: %s", code, response.Error)
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

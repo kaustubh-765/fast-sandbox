@@ -1,14 +1,18 @@
 # sandboxtemplate-builder — golden-image build pipeline (SandboxTemplate).
 #
 # Contains the platform toolchain (oci2rootfs, firecracker, e2fsprogs,
-# overlaybd-import-raw, aws CLI) plus the embedded guest kernel, and executes
-# the convert → validate-boot → snapshot → package pipeline driven by
-# cmd/sandboxtemplate-builder. The snapshot stage entry is the same binary
-# under a symlinked name. OverlayBD packaging is always built in from source
-# (overlaybd-import-raw, see the overlaybd-build stage below).
+# fsb-vm, OverlayBD tools, aws CLI) plus the embedded guest kernel.
+# Native output uses oci2rootfs → snapshot → object-store publication;
+# OverlayBD output uses fsb-vm build → OCI publication. The snapshot stage
+# entry is the same binary under a symlinked name. OCI tools are copied from
+# the shared artifact image, also consumed by firecracker-runtime.
 
+ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
 ARG OCI2ROOTFS_REV=76d3f4648a591066a4419f972e4118f2d1d68a35
 ARG FIRECRACKER_VERSION=v1.16.1
+
+# --- shared OCI artifacts ------------------------------------------------
+FROM ${OCI_TOOLS_IMAGE} AS oci-tools
 
 # --- oci2rootfs (OCI layers → ext4) ---------------------------------------
 FROM rust:1.88-bookworm AS oci2rootfs-build
@@ -19,35 +23,6 @@ RUN git clone https://github.com/arcboxlabs/oci2rootfs.git /src/oci2rootfs \
     && cd /src/oci2rootfs \
     && git checkout --detach "$OCI2ROOTFS_REV" \
     && cargo build --release --locked -p oci2rootfs-cli
-
-# --- overlaybd-import-raw (raw image → LSMT commit layer) ------------------
-FROM ubuntu:22.04 AS overlaybd-build
-
-ARG OVERLAYBD_REV=063821fc8cfaf06f4496b1bb523c6d59563ed1bd
-
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        autoconf automake build-essential ca-certificates cmake git \
-        libaio-dev libcurl4-openssl-dev libext2fs-dev libgflags-dev \
-        libnl-3-dev libnl-genl-3-dev libssl-dev libtool libzstd-dev \
-        pkg-config uuid-dev zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN git clone https://github.com/containerd/overlaybd.git /src/overlaybd \
-    && cd /src/overlaybd \
-    && git checkout --detach "$OVERLAYBD_REV" \
-    && git submodule update --init src/overlaybd/cache/ocf_cache/ocf
-
-COPY build/sandboxtemplate-builder/overlaybd-import-raw.cpp /tmp/overlaybd-import-raw.cpp
-RUN cd /src/overlaybd \
-    && install -m 0644 /tmp/overlaybd-import-raw.cpp src/tools/overlaybd-import-raw.cpp \
-    && sed -i '/add_executable(overlaybd-create/i add_executable(overlaybd-import-raw overlaybd-import-raw.cpp)\ntarget_include_directories(overlaybd-import-raw PUBLIC ${PHOTON_INCLUDE_DIR})\ntarget_link_libraries(overlaybd-import-raw photon_static overlaybd_lib)\n' src/tools/CMakeLists.txt \
-    && cmake -S . -B build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=0 \
-        -DBUILD_STREAM_CONVERTOR=0 \
-        -DORIGIN_EXT2FS=1 \
-    && cmake --build build --target overlaybd-import-raw --parallel "$(nproc)"
 
 # --- sandboxtemplate-builder binary ----------------------------------------
 FROM golang:1.25 AS builder-build
@@ -66,6 +41,7 @@ RUN go mod download
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
 COPY internal/guestnetwork ./internal/guestnetwork
+COPY internal/ocitemplate ./internal/ocitemplate
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 
@@ -92,7 +68,7 @@ ENV OCI2ROOTFS_REV=${OCI2ROOTFS_REV}
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         busybox-static ca-certificates coreutils curl e2fsprogs iproute2 jq libaio1 \
-        libzstd1 mount procps tar unzip util-linux \
+        libzstd1 libcurl4 libgflags2.2 libglib2.0-0 libnl-3-200 libnl-genl-3-200 libssl3 mount procps tar unzip util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # awscli v2: the ubuntu package is v1 whose botocore ignores the
@@ -113,8 +89,18 @@ RUN set -eux; \
     rm -rf "/tmp/${archive}" "/tmp/release-${FIRECRACKER_VERSION}-x86_64"
 
 COPY --from=oci2rootfs-build /src/oci2rootfs/target/release/oci2rootfs /usr/local/bin/oci2rootfs
-COPY --from=overlaybd-build /src/overlaybd/build/output/overlaybd-import-raw /usr/local/bin/overlaybd-import-raw
+COPY --from=oci-tools /opt/overlaybd/ /opt/overlaybd/
+COPY --from=oci-tools /usr/local/bin/convertor /usr/local/bin/convertor
+COPY --from=oci-tools /usr/local/bin/fsb-vm /usr/local/bin/fsb-vm
 COPY --from=builder-build /out/sandboxtemplate-builder /usr/local/bin/sandboxtemplate-builder
+COPY build/oci/overlaybd.json /etc/overlaybd/ublkd.json
+COPY build/oci/entrypoint.sh /usr/local/bin/oci-entrypoint
+RUN sed 's/"enable": true, "uriPrefix"/"enable": false, "uriPrefix"/' /etc/overlaybd/ublkd.json > /etc/overlaybd/overlaybd.json \
+    && chmod 0755 /usr/local/bin/oci-entrypoint \
+    && ln -s /opt/overlaybd/bin/overlaybd-import-raw /usr/local/bin/overlaybd-import-raw
+ENV LD_LIBRARY_PATH=/opt/overlaybd/lib
+ENV PATH=/opt/overlaybd/bin:${PATH}
+ENV FAST_SANDBOX_OCI_ENABLED=auto
 
 # Guest kernel, embedded in the builder image so builds do not download a
 # kernel at build time. Override KERNEL_URL to pin a specific build.
@@ -124,4 +110,4 @@ RUN mkdir -p /usr/local/share/firecracker \
     && ln -s /usr/local/bin/sandboxtemplate-builder /usr/local/bin/sandbox-snapshot-stage
 
 WORKDIR /build
-ENTRYPOINT ["/usr/local/bin/sandboxtemplate-builder"]
+ENTRYPOINT ["/usr/local/bin/oci-entrypoint", "/usr/local/bin/sandboxtemplate-builder"]

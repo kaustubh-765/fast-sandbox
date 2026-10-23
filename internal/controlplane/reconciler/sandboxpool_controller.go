@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -199,39 +200,24 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
-		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
-		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is valid and compiled",
-	})
-	infraPlan, err := r.resolveInfraPlan(&pool, profile)
-	if err != nil {
-		logger.V(1).Info("pool Infra Components are invalid", "reason", err.Error())
-		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
-			Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionFalse,
-			Reason: apiv1alpha2.ReasonInfraComponentsInvalid, Message: err.Error(),
-		}); condErr != nil {
-			logger.Error(condErr, "Failed to update Pool condition", "condition", apiv1alpha2.PoolConditionInfraReady)
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+	logger.V(4).Info("pool registry configuration compiled", "revision", compiledRegistry.Revision)
+	infraPlan, infraErr := r.resolveInfraPlan(&pool, profile)
+	infraCondition := metav1.Condition{
 		Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionTrue,
 		Reason: apiv1alpha2.ReasonInfraComponentsAvailable, Message: "Infra Components are valid for the selected runtime",
-	})
-	if err := r.ensureInfraPlanConfigMap(ctx, &pool, infraPlan); err != nil {
-		return ctrl.Result{}, err
 	}
-	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
-		return ctrl.Result{}, err
+	if infraErr != nil {
+		logger.V(1).Info("pool Infra Components are invalid", "reason", infraErr.Error())
+		infraCondition.Status = metav1.ConditionFalse
+		infraCondition.Reason = apiv1alpha2.ReasonInfraComponentsInvalid
+		infraCondition.Message = infraErr.Error()
 	}
-	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.ensureFastletSettingsConfigMap(ctx, &pool, settings); err != nil {
+	if err := r.updatePoolCondition(ctx, &pool, infraCondition); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// Report registry rollout even when infra validation failed, but do not
+	// provision Fastlets until both configurations are valid.
 	var childPods corev1.PodList
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
@@ -249,6 +235,23 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.updatePoolCondition(ctx, &pool, registryCondition); err != nil {
 		return ctrl.Result{}, err
 	}
+	if infraErr != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil //nolint:nilerr // invalid configuration is reported through InfraReady and retried at a fixed interval
+	}
+	if err := r.ensureInfraPlanConfigMap(ctx, &pool, infraPlan); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
+		return ctrl.Result{}, err
+	}
+	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureFastletSettingsConfigMap(ctx, &pool, settings); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	runtimeCondition, readyPods := r.runtimeCapabilityCondition(&pool, childPods.Items)
 	if err := r.updatePoolCondition(ctx, &pool, runtimeCondition); err != nil {
 		return ctrl.Result{}, err
@@ -404,8 +407,11 @@ func (r *SandboxPoolReconciler) aggregateWarmImageStatus(
 				status.CachedFastlets++
 			case "Failed":
 				status.FailedFastlets++
-				if observed.Message != "" {
-					status.LastError = boundedStatusMessage(observed.Message)
+				// Registry iteration order is unspecified; select a stable error
+				// so unchanged reports cannot trigger another status write.
+				if msg := boundedStatusMessage(observed.Message); msg != "" &&
+					(status.LastError == "" || msg < status.LastError) {
+					status.LastError = msg
 				}
 			default:
 				status.PullingFastlets++
@@ -2304,12 +2310,14 @@ func (o poolObservation) apply(pool *apiv1alpha2.SandboxPool) bool {
 	status := &pool.Status
 	summaryDue := status.SummaryObservedAt == nil || o.observedAt.Sub(status.SummaryObservedAt.Time) >= time.Minute
 	summaryMatches := !summaryDue || reflect.DeepEqual(status.Fastlets, o.fastlets) && reflect.DeepEqual(status.Resources, o.resources) && reflect.DeepEqual(status.Sandboxes, o.sandboxes)
+	// omitempty turns empty WarmImages into nil on API reads; treat both as equal
+	// to avoid repeated status writes and watch-triggered reconciles.
 	if status.CurrentPods == o.currentPods &&
 		status.ReadyPods == o.readyPods && status.IdleFastlets == o.idleFastlets &&
 		status.BusyFastlets == o.busyFastlets &&
 		status.RuntimeRevision == o.runtimeRevision && status.InfraRevision == o.infraRevision &&
 		status.FastletRevision == o.fastletRevision && status.PreparedFastlets == o.preparedFastlets &&
-		reflect.DeepEqual(status.WarmImages, o.warmImages) && conditionMatches(status.Conditions, o.scaleDownCandidate) && summaryMatches {
+		slices.Equal(status.WarmImages, o.warmImages) && conditionMatches(status.Conditions, o.scaleDownCandidate) && summaryMatches {
 		return false
 	}
 	status.CurrentPods = o.currentPods

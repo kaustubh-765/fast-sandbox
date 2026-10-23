@@ -23,6 +23,17 @@ const (
 	// authorized incarnation transfer. Driver-invoked via the Fastlet.
 	OperationVaultExport Operation = "VAULT_EXPORT"
 	OperationVaultImport Operation = "VAULT_IMPORT"
+	// Policy snapshot transfer across pause/resume: export copies the
+	// subject's recorded network policy file into the snapshot bundle
+	// strictly before the runtime teardown (for checkpoint AND template
+	// snapshots — the policy is desired state, not a secret, so a template
+	// clone inherits it); import lands the re-stamped bundle file before
+	// data-plane-ready at restore, and the imported record stays
+	// authoritative over later binding replays. The envelope shape is the
+	// vault transfer's (SnapshotTransfer{Path}, registered fence), served by
+	// the same egress Handler.
+	OperationPolicyExport Operation = "POLICY_EXPORT"
+	OperationPolicyImport Operation = "POLICY_IMPORT"
 )
 
 type LifecycleHook string
@@ -69,13 +80,22 @@ type LifecycleHookPayload struct {
 }
 
 // SnapshotTransfer names the driver-provided staging file for one subject's
-// vault snapshot (OSEP-0022): the export target inside the snapshot bundle,
-// or the bundle source at restore. One file per invocation; the path is
-// Pod-local and validated by the Handler (absolute, no parent traversal).
-// The bytes never cross the envelope: the Handler copies/reads the file
-// itself.
+// state snapshot: the export target inside the snapshot bundle, or the
+// bundle source at restore. One file per invocation; the path is Pod-local
+// and validated by the Handler (absolute, no parent traversal). The bytes
+// never cross the envelope: the Handler copies/reads the file itself.
 type SnapshotTransfer struct {
 	Path string `json:"path"`
+	// Seal governs the subject latch on export (absent = sealed, the
+	// checkpoint semantics): a sealed subject answers its relay surface
+	// with 409 until an import re-owns the record — the pause window must
+	// stay consistent. Template carries export with seal=false: the
+	// template's completion path never imports, so sealing would lock the
+	// still-running source out of its state CRUD; the record is copied
+	// verbatim and the source keeps mutating. Handlers without the
+	// template-carry capability ignore the field and always seal — callers
+	// gate seal=false on the HandlerStatus.TemplateStateExport flag.
+	Seal *bool `json:"seal,omitempty"`
 }
 
 type Request struct {
@@ -95,4 +115,27 @@ type HandlerStatus struct {
 	Ready      bool   `json:"ready"`
 	InstanceID string `json:"instanceId"`
 	Message    string `json:"message,omitempty"`
+	// VaultTransfer reports that the Handler can carry a subject's vault
+	// file across pause/resume (VAULT_EXPORT / VAULT_IMPORT): it serves the
+	// vault operations and persists vault files. Absent (older Handler
+	// builds) decodes as false: vault transfer is skipped and the
+	// checkpoint proceeds without a vault — the pre-transfer semantics.
+	VaultTransfer bool `json:"vaultTransfer,omitempty"`
+	// PolicyTransfer reports that the Handler can carry a subject's
+	// recorded network policy file across pause/resume (POLICY_EXPORT /
+	// POLICY_IMPORT): it serves the policy operations and persists policy
+	// files. Absent (older Handler builds) decodes as false: policy
+	// transfer is skipped and the snapshot records the CRD binding input
+	// only — the pre-transfer semantics, where SET_BINDING is the only
+	// policy channel.
+	PolicyTransfer bool `json:"policyTransfer,omitempty"`
+	// TemplateStateExport reports that the Handler supports the TEMPLATE
+	// state-carry semantics on top of the transfer operations: seal-free
+	// exports (SnapshotTransfer.Seal=false — the source keeps its relay
+	// CRUD; a template's completion path never imports) and imports that
+	// land a template-borne record for the NEXT registration of a fresh
+	// subject (a clone boots with the template's state). Absent decodes as
+	// false: template snapshots export nothing and clones carry no
+	// template-borne state.
+	TemplateStateExport bool `json:"templateStateExport,omitempty"`
 }

@@ -25,9 +25,6 @@ import (
 // manifest URI. Upload order guarantees consumers never observe a
 // half-published artifact set: artifacts and SHA256SUMS first, then the
 // manifest, and finally the image index that points at this build.
-// OverlayBD layers keep their relative paths
-// (overlaybd/rootfs/layer.lsmt, overlaybd/memory/layer.lsmt) — a flat
-// basename would collide on the same S3 key.
 func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, manifestBytes []byte, credentials publishCredentials) (string, error) {
 	aws, err := exec.LookPath(awsBin)
 	if err != nil {
@@ -41,15 +38,6 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 		// SHA256SUMS covers only the published artifact set; it belongs to
 		// the immutable build directory and goes up with the artifacts.
 		{filepath.Join(workdir, "SHA256SUMS"), "SHA256SUMS"},
-	}
-	if layers, err := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt")); err == nil {
-		for _, layer := range layers {
-			relative, err := filepath.Rel(workdir, layer)
-			if err != nil {
-				return "", err
-			}
-			entries = append(entries, struct{ local, key string }{layer, relative})
-		}
 	}
 	// The platform endpoint (injected as AWS_ENDPOINT_URL by the controller)
 	// wins over the mounted secret's endpoint; --endpoint-url pins the

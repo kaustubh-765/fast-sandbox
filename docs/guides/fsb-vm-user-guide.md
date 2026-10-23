@@ -137,8 +137,10 @@ go build -o "$FSB_VM" ./cmd/fsb-vm/
 | --- | --- | --- |
 | `--ublkd-socket` | `/var/run/overlaybd-ublk/ublkd.sock` | ublkd 控制 socket |
 | `--cred-file` | `/opt/overlaybd/cred.json` | OverlayBD 全局凭证文件 |
+| `--reject-credential-conflicts` | `false` | 共享 daemon 时拒绝同仓库的凭证冲突 |
 | `--kernel-dir` | `/opt/fsb-vm/kernels` | `create` 默认查找 `vmlinux-<version>` 的目录 |
 | `--state-dir` | `/var/lib/fsb-vm/sandboxes` | 持久化 sandbox 状态根目录 |
+| `--manifest-cache-dir` | `<state-dir>/.manifest-cache` | 不可变 registry 元数据缓存，可独立于 sandbox 状态共享 |
 | `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket 和串口日志目录 |
 | `--firecracker` | `firecracker` | Firecracker 可执行文件 |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
@@ -153,6 +155,20 @@ sudo "$FSB_VM" --plain-http --state-dir "$STATE_DIR" list
 ```
 
 ## 4. 构建模板
+
+通过 Kubernetes `SandboxTemplate` 构建时，`spec.output.publish` 只填写仓库地址，
+例如 `oci://registry.example.com/team/templates`，不要带 tag 或 digest。
+Controller 为每个构建 Pod 分配随机 UUID，Builder 发布 `<uuid>_rootfs` 和
+`<uuid>_snapfiles`，并通过 `status.manifestRef` 返回 snapfiles 的不可变 digest 引用。
+修改 spec 触发新一轮构建时生成新的 UUID；重复 reconcile 复用已有 Pod 的 UUID。
+重复 apply 未变化的 spec 不会触发构建。已有带 tag 的发布地址需要先去掉 tag，
+具体见 [OCI 模板重复构建](overlaybd-oci-sandboxes.md#rebuilds-and-generated-tags)。
+
+`SandboxTemplate` 的标准 Builder 镜像包含 OCI 所需的 `fsb-vm`、convertor 和 OverlayBD 工具。输出为 `oci://` 时，Builder 启动 ublkd，读取源镜像的 manifest/config 以固定 linux/amd64 镜像 digest 并准备环境变量和运行时注入文件，然后将远端 digest 引用直接传给 `fsb-vm build`。源镜像层由 `fsb-vm` 的构建流程读取，不预先写入 OCI layout，也不启动本地 registry。`format: native` 的对象存储路径保留 `pullOCILayout → oci2rootfs` 流程；OverlayBD 仅支持 OCI，不支持 S3；`SANDBOX_TEMPLATE_IMAGE_TAR` 仅支持该对象存储路径，OCI 路径设置此变量会报错。OCI 构建需要访问源和目标 registry。
+
+`build/Dockerfile.fastlet` 生成的标准 Fastlet 镜像包含 OCI 运行工具；OCI Firecracker Pool 通过 `FAST_SANDBOX_OCI_ENABLED=true` 启动 ublkd。默认不启动，普通运行模式不需要 ublk。标准 Builder 使用 `auto` 模式，保留非 OCI 构建不依赖 ublk 的行为。OCI 仓库访问支持匿名或用户名密码认证，包括 Docker config 的 `auth` 字段；仅含 `identitytoken` 的凭据会被明确拒绝，同时存在用户名密码时使用用户名密码。原有公共凭据字段及其他运行时行为保持不变。
+
+Checkpoint 默认写回源模板仓库；可用 `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY=registry/repository` 指定其他目标。目标凭证需具备 push 权限，独立写账号通过 registry rule 的 `writeSecretRef` 配置。Checkpoint 发布按完整仓库路径分别选择父层读凭证和目标写凭证；跨仓库时需在 Pool 中配置两者。OCI GuestCopy 直接挂载 ublk 块设备，普通 rootfs 镜像文件仍使用 loop 挂载。
 
 最小命令：
 
@@ -177,6 +193,7 @@ sudo "$FSB_VM" build \
 | `--disk-size-gb` | `20` | rootfs 虚拟磁盘大小 GiB，必须为正整数 |
 | `--snapfiles-size-mb` | 自动计算 | snapfiles 虚拟磁盘大小 |
 | `--kernel-version` | 从 `vmlinux-<version>` 推导 | 写入模板 metadata 的内核版本 |
+| `--manifest-extra-file` | 空 | 可选的 `guestNetwork`、`lineage` 和 `platform` 补充字段；合入生成的 manifest，不能覆盖核心 VM 字段 |
 | `--init-script-file` | 内置 Redis init | 注入 guest 并作为 PID 1 运行的脚本 |
 | `--ready-pattern` | `Ready to accept connections` | 串口中表示工作负载就绪的文本 |
 | `--ready-timeout` | `3m` | 等待就绪文本的超时 |
@@ -267,6 +284,25 @@ sudo "$FSB_VM" build \
 sudo "$FSB_VM" --plain-http build ...
 ```
 
+### 不可变 manifest 缓存
+
+`create` 将以 `@sha256:...` 引用的 rootfs 和 snapfiles 镜像 manifest 缓存在
+`<state-dir>/.manifest-cache/`。后续创建先校验本地文件的 SHA256 和 manifest 描述符，
+命中后直接使用，不再向 registry 请求这两份 manifest 或获取对应的认证 token。
+缓存按 registry、repository、HTTP/HTTPS 和当前凭证隔离，不保存凭证。
+使用 `template.reference` 时，同目录还缓存由平台入口解析出的不可变 pair 和元数据，
+并将镜像配对和 checkpoint 归属记录到 sandbox 的 `state.json.template_metadata`；平台信息从挂载的 `manifest.json` 读取。
+删除单个 sandbox 不会删除这份共享缓存。通过 `--manifest-cache-dir` 可让同一节点上不同 sandbox 状态目录共用缓存。Fastlet 使用 `<StateRoot>/oci/manifest-cache`，Pod 重建后无需重新获取已缓存的 registry manifest。缓存超过 128 MiB 或 4,096 个文件时按最近访问时间淘汰；凭证隔离与可变 tag 回源规则不变。
+
+缓存缺失或损坏时重新从 registry 获取并原子写入；缓存写入失败不会阻止使用已验证的
+远端 manifest。可变 tag 始终回源解析，指向多架构 index 的 digest 保持现有平台选择流程。
+删除 `.manifest-cache/` 可清除本地 manifest 缓存。它与 OverlayBD 数据块缓存独立：
+每个 sandbox 仍创建独立的可写层和设备，未缓存的数据块仍由 OverlayBD 按需读取。
+
+Fastlet 从挂载的 snapfiles 文件系统中的 `manifest.json` 读取平台信息。FastPath 使用 create 请求中的绑定，不再访问 OCI registry 读取策略；opaque `policy.json` 和 `vault.json` 由节点侧导入。
+
+`fsb-vm build` 无需平台输入也会生成唯一的 `snapfiles/manifest.json`，不再生成 `metadata.json`。`--manifest-extra-file` 只补充 `guestNetwork`、`lineage`、`platform`，禁止覆盖核心 VM 配置。OCI 和 S3 共用 [schemaVersion 1 模型](artifact-manifest-reference.md)；已有产物需重建，不提供旧格式兼容读取。
+
 ### 4.4 磁盘大小
 
 rootfs 默认是 20 GiB，可指定其他正整数 GiB：
@@ -314,7 +350,9 @@ registry.example.com/team/application:v1_snapfiles
 
 发布工具必须先上传这两个 manifest 引用的全部 `blobs/sha256/*`，再按对应 tag 上传 rootfs 和 snapfiles manifest。`manifest/index.json` 记录了 manifest 文件名和 digest，可供发布脚本读取。
 
-当前 CLI 尚未提供 `push` 子命令。产物布局与上传顺序参见 [发布契约](../design/adr-fsb-vm-cli.md#adr-012-build-本地产物布局与发布契约build-迭代补充)。生产环境应使用能够保留 OCI manifest 和 OverlayBD layer media type 的发布流程。
+对明文 HTTP registry，使用 `fsb-vm --plain-http push ...`；该参数同时用于目标仓库和增量产物的远端父层读取，默认仍使用 HTTPS。
+
+`fsb-vm push` 接收 `--artifact-dir`、`--destination registry/repository:tag`、`--metadata-file` 和 `--auth-file`，只发布 `<tag>_rootfs` 和 `<tag>_snapfiles` 两份镜像；rootfs 先发布，snapfiles 最后发布。fsb-vm 始终生成核心 VM manifest，平台信息通过可选 `build --manifest-extra-file <manifest-extra.json>` 补充并在封装前写入同一份 `manifest.json`；OCI manifest 仅保留配对和 checkpoint 归属 annotations。`push --metadata-file` 可省略，仅提取 checkpoint 归属，不能向已封装的 snapfiles 添加文件。返回的 `manifestRef` 与 `artifactDigest` 指向 snapfiles manifest。两份镜像按相同 ID 配对，ID 必须不可覆盖；发布器拒绝用不同内容覆盖现有 tag。采用历史元数据结构的 OCI 和 S3 模板均需重建，不提供旧格式兼容读取。`SandboxTemplate` 的 OCI 构建流程自动执行此步骤，将不带 tag 的 `output.publish` 与系统分配的 UUID 组合为上传目标。手动执行 CLI 时仍按 `--destination repository:tag` 显式指定 tag。产物布局与上传顺序参见 [发布契约](../design/adr-fsb-vm-cli.md#adr-012-build-本地产物布局与发布契约build-迭代补充)。
 
 ## 6. 准备 template.json
 
@@ -341,8 +379,13 @@ registry.example.com/team/application:v1_snapfiles
 | `sandbox_id` | 本机唯一 sandbox ID，同时用于状态和 runtime 子目录 |
 | `template.repo` | registry repository，不带 tag |
 | `template.template_id` | 模板 ID；工具会拉取 `<id>_rootfs` 和 `<id>_snapfiles` |
+| `template.reference` | 平台返回的 `oci://repository@sha256:...` 或逻辑 tag；与 `repo/template_id`、显式 `rootfs/snapfiles` 二选一 |
 | `template.auth.dockerAuth` | Docker config JSON 的字符串形式；匿名 registry 使用空字符串 |
 | `metadata` | 预留透传字段，可省略 |
+
+Fastlet 集成使用 `template.reference`，直接执行 `create --prepare-only`。
+CLI 负责解析两产物引用及 annotations、复用缓存和准备设备；Fastlet 不再先通过节点 agent 查询 OCI 元数据。
+使用这种输入时，`metadata` 由解析后的镜像配对和归属信息替换，原有 repo/template_id 输入仍可使用。
 
 私有 registry 的 `dockerAuth` 是 JSON **字符串**，不是嵌套对象。例如原始 Docker config：
 
@@ -384,7 +427,7 @@ sudo "$FSB_VM" \
 3. 在 runtime 目录建立 `rootfs.dev` 链接，以该目录为 cwd 加载 Firecracker snapshot；
 4. 恢复 VM，将 `state.json` 更新为 `running`。
 
-默认根据模板 metadata 中的 `kernel_version` 检查 `/opt/fsb-vm/kernels/vmlinux-<version>`。可显式覆盖：
+默认根据模板 metadata 中的 `kernel.version` 检查 `/opt/fsb-vm/kernels/vmlinux-<version>`。标准 Builder 使用 `vmlinux.bin` 时，`kernel.version` 为 `vmlinux.bin`，对应检查同目录下的 `vmlinux.bin`，不会添加 `vmlinux-` 前缀。可显式覆盖：
 
 ```bash
 sudo "$FSB_VM" \
@@ -465,3 +508,9 @@ sudo curl -fsS \
 - create/delete 状态是本机状态，不是分布式控制面资源。
 
 构建、创建步骤和产物所有权说明见 [fsb-vm 设计](../design/adr-fsb-vm-cli.md)。
+
+OCI Fastlet 使用宿主机 `/dev`，以访问运行期间新增的 ublk 设备。runtime-agent DaemonSet 中的节点 ublkd 容器为同节点的 Fastlet 提供服务；fsb-vm 直接连接共享 Unix socket，runtime-agent 安装工具、检查健康，不转发设备请求。OCI jailer 也会在启动前挂载配置的 snapshot spill 目录。
+
+快照打包中断后，重试或删除 staging 前会先按 config 路径恢复并释放 pack 设备；清理失败时保留 backing files。独立 fsb-vm 按实际 rootfs/snapfiles 仓库同步凭据：匿名访问会覆盖该仓库的旧凭据，不会删除其他仓库的凭据。Fastlet 为节点 daemon 启用 `--reject-credential-conflicts`，拒绝同仓库的不同账号或匿名覆盖。此同步不承诺立即撤销已经运行的 VM 的访问。
+
+构建 Fastlet 镜像使用 `make images COMPONENT=fastlet FASTLET_IMAGE=opensandbox/fsb-fastlet:dev`，然后自行推送并在 Pool 中使用该镜像。此 tag 是构建示例，不表示已发布版本。Fastlet 使用 Ubuntu 22.04 运行阶段，不包含 Go 工具链和 OverlayBD 构建阶段。runtime-agent 镜像统一安装 fsb-vm 和 OverlayBD 工具，Fastlet 只读挂载这些工具，保留执行所需的系统库和基础工具。节点 agent/daemon 和 OCI Pool 均通过 `FAST_SANDBOX_OCI_ENABLED=true` 启用；路径、缓存容量、凭证和升级要求见 [OCI 部署指南](overlaybd-oci-sandboxes.md)。无 extent seek 支持时，upper 复制会扫描零块并保留稀疏空间，但扫描耗时可能高于 reflink/extent copy。

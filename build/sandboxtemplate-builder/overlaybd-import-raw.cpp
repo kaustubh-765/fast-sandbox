@@ -233,7 +233,7 @@ int main(int argc, char **argv) {
 
     LSMT::LayerInfo layer_info(data.get(), index.get());
     layer_info.virtual_size = static_cast<uint64_t>(source_stat.st_size);
-    layer_info.sparse_rw = false;
+    // LayerInfo defaults to append mode in both supported OverlayBD APIs.
     std::unique_ptr<LSMT::IFileRW> layer(LSMT::create_file_rw(layer_info, false));
     if (!layer) {
         errno = EIO;

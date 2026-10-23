@@ -13,7 +13,7 @@ import (
 const (
 	inDiskVMState   = "vmstate.bin"
 	inDiskMemfile   = "memfile"
-	inDiskMetadata  = "metadata.json"
+	inDiskManifest  = "manifest.json"
 	snapfilesMount  = "mnt"
 	apiSocketName   = "api.sock"
 	serialLogName   = "firecracker.log"
@@ -62,11 +62,12 @@ func (r *deviceRecord) path() string {
 // step; teardown clears each record once that resource is released. It is the
 // source of truth for list and for a retryable delete.
 type sandboxState struct {
-	FormatVersion int          `json:"format_version"`
-	SandboxID     string       `json:"sandbox_id"`
-	Phase         sandboxPhase `json:"phase"`
-	RootfsRef     string       `json:"rootfs_ref"`
-	SnapfilesRef  string       `json:"snapfiles_ref"`
+	FormatVersion    int             `json:"format_version"`
+	SandboxID        string          `json:"sandbox_id"`
+	Phase            sandboxPhase    `json:"phase"`
+	RootfsRef        string          `json:"rootfs_ref"`
+	SnapfilesRef     string          `json:"snapfiles_ref"`
+	TemplateMetadata json.RawMessage `json:"template_metadata,omitempty"`
 
 	// A nil device record means "not owned"; a record with an empty DevPath
 	// means an add was issued whose reply was never recorded.

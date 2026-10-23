@@ -24,10 +24,18 @@ import (
 )
 
 const (
-	requestPath     = "/_fastlet/v1/actions"
-	statusPath      = "/_fastlet/v1/actions/status"
-	defaultTimeout  = 5 * time.Second
+	requestPath    = "/_fastlet/v1/actions"
+	statusPath     = "/_fastlet/v1/actions/status"
+	defaultTimeout = 5 * time.Second
+	// maxResponseSize bounds the management/status responses of the Sandbox
+	// Actions channel (status documents, invocation acks).
 	maxResponseSize = 32 << 10
+	// maxRelayResponseSize bounds the generic handler-relay responses: the
+	// relayed surface's bodies are handler-owned documents (the egress
+	// policy record alone can reach ~68 KiB encoded), so the bound sits
+	// well above the supported policy size plus its response envelope.
+	// Status/Invoke keep the smaller management bound.
+	maxRelayResponseSize = 128 << 10
 )
 
 type Caller interface {
@@ -106,13 +114,15 @@ func (c *HTTPCaller) Invoke(ctx context.Context, port int32, invocation actionap
 // Relay performs the relay hop of the FastPath handler-relay channel: it
 // sends the payload verbatim as the request body to the Handler's declared
 // loopback port and returns the Handler's HTTP status and body verbatim.
-// The bounded client timeout and the 32 KiB bounded read are the same
-// delivery machinery the Sandbox Actions calls use; redirects are surfaced
-// as the Handler's response instead of being followed. A non-empty body is
-// always delivered as Content-Type: application/json — the fixed relay
-// body contract. SandboxUID is injected as the trusted actionapi.HeaderSandboxUID
-// header so the Handler can scope per-subject state by the fence-validated
-// identity instead of caller-controlled path segments.
+// The bounded client timeout is the same delivery machinery the Sandbox
+// Actions calls use; the response bound is the relay's own (larger) limit —
+// handler-owned documents dwarf the management responses. Redirects are
+// surfaced as the Handler's response instead of being followed. A non-empty
+// body is always delivered as Content-Type: application/json — the fixed
+// relay body contract. SandboxUID is injected as the trusted
+// actionapi.HeaderSandboxUID header so the Handler can scope per-subject
+// state by the fence-validated identity instead of caller-controlled path
+// segments.
 func (c *HTTPCaller) Relay(ctx context.Context, port int32, sandboxUID, method, path string, body []byte) (int, []byte, error) {
 	if method == "" {
 		method = http.MethodPost
@@ -132,7 +142,7 @@ func (c *HTTPCaller) Relay(ctx context.Context, port int32, sandboxUID, method, 
 		return 0, nil, err
 	}
 	defer response.Body.Close()
-	responseBody, err := readBounded(response.Body)
+	responseBody, err := readBoundedLimit(response.Body, maxRelayResponseSize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -140,12 +150,16 @@ func (c *HTTPCaller) Relay(ctx context.Context, port int32, sandboxUID, method, 
 }
 
 func readBounded(reader io.Reader) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(reader, maxResponseSize+1))
+	return readBoundedLimit(reader, maxResponseSize)
+}
+
+func readBoundedLimit(reader io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > maxResponseSize {
-		return nil, errors.New("Action Handler response exceeds 32 KiB")
+	if len(body) > int(limit) {
+		return nil, fmt.Errorf("Action Handler response exceeds %d bytes", limit)
 	}
 	return body, nil
 }
@@ -538,6 +552,14 @@ func (m *Manager) RecordHook(sandboxUID string, attachment Attachment, hook acti
 	return nil
 }
 
+// unattachedBindingMessage is the Binding observation while desired state is
+// registered before the runtime network attachment exists (#136): the
+// admission-time registration precedes the runtime, so the attachment has
+// no IP until the VM boots and every Handler rejects that envelope with
+// "attachment.network.ip is required". SetBinding stays deferred instead of
+// retrying a doomed invocation once per probe tick.
+const unattachedBindingMessage = "network attachment has no IP; SetBinding is deferred until the runtime network exists"
+
 func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error { //nolint:gocognit // pre-existing convergence loop; refactor tracked separately
 	state.mu.RLock()
 	desired := appendDesired(nil, state.desired)
@@ -546,6 +568,10 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 	oldOrder := append([]string(nil), state.order...)
 	state.mu.RUnlock()
 	if generation <= 0 {
+		return nil
+	}
+	if attachment.IP == "" {
+		m.parkUnattachedBindings(state, desired, attachment.SandboxUID)
 		return nil
 	}
 	desiredByName := make(map[string]DesiredInput, len(desired))
@@ -633,6 +659,31 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 	return nil
 }
 
+// parkUnattachedBindings records why desired Bindings cannot converge yet and
+// wakes status watchers once. Bindings stay Pending until the runtime network
+// attachment materializes (the post-boot attachment re-registration fires the
+// real convergence); no Handler I/O happens while parked.
+func (m *Manager) parkUnattachedBindings(state *sandboxState, desired []DesiredInput, sandboxUID string) {
+	state.mu.Lock()
+	changed := false
+	for _, input := range desired {
+		binding := state.bindings[input.Handler]
+		if binding == nil {
+			binding = &bindingState{status: fastletapi.ActionBindingStatus{Handler: input.Handler}, appliedHooks: make(map[actionapi.LifecycleHook]int64)}
+			state.bindings[input.Handler] = binding
+		}
+		if binding.status.State == string(apiv1alpha2.ActionPending) && binding.status.Message == unattachedBindingMessage {
+			continue
+		}
+		setBindingStatus(binding, apiv1alpha2.ActionPending, unattachedBindingMessage)
+		changed = true
+	}
+	state.mu.Unlock()
+	if changed {
+		m.notifyChanged(sandboxUID)
+	}
+}
+
 func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, digest string, replayHooks bool) error {
 	handler := m.byName[handlerName]
 	instanceID, err := m.handlerInstance(handlerName)
@@ -654,11 +705,21 @@ func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerNa
 	}
 	request := buildRequest(actionapi.OperationSetBinding, stableInvocationID(actionapi.OperationSetBinding, handlerName, instanceID, generation, attachment, digest, ""), generation, attachment)
 	request.Binding = &actionapi.BindingPayload{Input: input}
-	if err := m.caller.Invoke(ctx, handler.TargetHTTPPort, request); err != nil {
+	invokeStarted := time.Now()
+	invokeErr := m.caller.Invoke(ctx, handler.TargetHTTPPort, request)
+	klog.Infof("fastlet action invoke: sandbox=%s op=set_binding handler=%s gen=%d took=%dms result=%s",
+		attachment.SandboxUID, handlerName, generation, time.Since(invokeStarted).Milliseconds(),
+		func() string {
+			if invokeErr != nil {
+				return "err:" + invokeErr.Error()
+			}
+			return "ok"
+		}())
+	if invokeErr != nil {
 		state.mu.Lock()
-		setBindingStatus(binding, apiv1alpha2.ActionFailed, err.Error())
+		setBindingStatus(binding, apiv1alpha2.ActionFailed, invokeErr.Error())
 		state.mu.Unlock()
-		return err
+		return invokeErr
 	}
 	if current, currentErr := m.handlerInstance(handlerName); currentErr != nil || current != instanceID {
 		state.mu.Lock()
@@ -712,11 +773,21 @@ func (m *Manager) invokeHook(ctx context.Context, state *sandboxState, handlerNa
 	extra := fmt.Sprintf("%s/%d", checkpoint.Name, checkpoint.Sequence)
 	request := buildRequest(actionapi.OperationLifecycleHook, stableInvocationID(actionapi.OperationLifecycleHook, handlerName, instanceID, generation, attachment, binding.digest, extra), generation, attachment)
 	request.Hook = &actionapi.LifecycleHookPayload{Name: checkpoint.Name, Sequence: checkpoint.Sequence}
-	if err := m.caller.Invoke(ctx, handler.TargetHTTPPort, request); err != nil {
+	invokeStarted := time.Now()
+	invokeErr := m.caller.Invoke(ctx, handler.TargetHTTPPort, request)
+	klog.Infof("fastlet action invoke: sandbox=%s op=hook handler=%s hook=%s/%d gen=%d took=%dms result=%s",
+		attachment.SandboxUID, handlerName, checkpoint.Name, checkpoint.Sequence, generation, time.Since(invokeStarted).Milliseconds(),
+		func() string {
+			if invokeErr != nil {
+				return "err:" + invokeErr.Error()
+			}
+			return "ok"
+		}())
+	if invokeErr != nil {
 		state.mu.Lock()
-		setBindingStatus(binding, apiv1alpha2.ActionFailed, err.Error())
+		setBindingStatus(binding, apiv1alpha2.ActionFailed, invokeErr.Error())
 		state.mu.Unlock()
-		return err
+		return invokeErr
 	}
 	if current, currentErr := m.handlerInstance(handlerName); currentErr != nil || current != instanceID {
 		state.mu.Lock()

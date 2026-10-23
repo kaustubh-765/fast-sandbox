@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/observability"
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
-	runtimecontract "fast-sandbox/internal/runtime/contract"
 	"fast-sandbox/pkg/util/idgen"
 )
 
@@ -29,17 +30,16 @@ var snapshotWorkerTimeout = 30 * time.Minute
 // ever taken toward this Fastlet since start, which is accepted as a small,
 // inspectable leak.
 type snapshotTask struct {
-	identity       fastletapi.SnapshotIdentity
-	kind           fastletapi.SnapshotKind
-	templateName   string
-	actionBindings []runtimecontract.SnapshotActionBinding
-	snapshotID     string
-	phase          fastletapi.SnapshotPhase
-	reason         string
-	message        string
-	result         *SnapshotResult
-	startedAt      time.Time
-	completedAt    time.Time
+	identity     fastletapi.SnapshotIdentity
+	kind         fastletapi.SnapshotKind
+	templateName string
+	snapshotID   string
+	phase        fastletapi.SnapshotPhase
+	reason       string
+	message      string
+	result       *SnapshotResult
+	startedAt    time.Time
+	completedAt  time.Time
 }
 
 func (t *snapshotTask) status() fastletapi.SnapshotStatus {
@@ -111,6 +111,15 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorRuntimeUnavailable,
 			fmt.Sprintf("target Sandbox runtime is %q, not running", metadata.Phase), true))
 	}
+	image := metadata.Config.Desired.Image
+	if metadata.Config.Desired.Restore != nil {
+		image = metadata.Config.Desired.Restore.ManifestRef
+	}
+	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName == "" && !strings.HasPrefix(image, ocitemplate.Prefix) {
+		m.mu.Unlock()
+		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorConflict,
+			"templateName is required for a native template snapshot", false))
+	}
 	// Sandbox fence — only the pause window (Pending/Creating) is
 	// exclusive: a task in Publishing no longer touches the VM, and its
 	// upload may overlap the next snapshot's dump.
@@ -128,7 +137,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 	// Template-name fence — holds to terminal: concurrent publishers of one
 	// index key would race last-writer-wins on the store. Checkpoints carry
 	// no index key and are exempt.
-	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint {
+	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName != "" {
 		for _, task := range m.snapshots {
 			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
 				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
@@ -144,12 +153,8 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletErrorWithCause(fastletapi.ErrorUnknownOutcome,
 			"generate snapshot id: "+err.Error(), true, err))
 	}
-	bindings := make([]runtimecontract.SnapshotActionBinding, 0, len(req.ActionBindings))
-	for _, binding := range req.ActionBindings {
-		bindings = append(bindings, runtimecontract.SnapshotActionBinding{Handler: binding.Handler, Input: binding.Input})
-	}
 	task := &snapshotTask{
-		identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName, actionBindings: bindings,
+		identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName,
 		snapshotID: snapshotID, phase: fastletapi.SnapshotPhasePending,
 	}
 	m.snapshots[req.Identity.SnapshotUID] = task
@@ -169,9 +174,6 @@ func (m *SandboxManager) validateSnapshotRequest(req *fastletapi.CreateSnapshotR
 	}
 	switch req.Snapshot.Kind {
 	case "", fastletapi.SnapshotKindTemplate:
-		if req.Snapshot.TemplateName == "" {
-			return fastletError(fastletapi.ErrorConflict, "templateName is required for a template snapshot", false)
-		}
 	case fastletapi.SnapshotKindCheckpoint:
 		if req.Snapshot.TemplateName != "" {
 			return fastletError(fastletapi.ErrorConflict, "checkpoint snapshots publish no template index; templateName must be empty", false)
@@ -222,11 +224,10 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 
 	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "dumping vmstate/memory and cloning the rootfs")
 	result, err := snapshotter.CreateSnapshot(ctx, &RuntimeSnapshotInput{
-		SandboxID:      sandboxUID,
-		SnapshotID:     task.snapshotID,
-		Kind:           task.kind,
-		TemplateName:   task.templateName,
-		ActionBindings: task.actionBindings,
+		SandboxID:    sandboxUID,
+		SnapshotID:   task.snapshotID,
+		Kind:         task.kind,
+		TemplateName: task.templateName,
 		// The driver reports Publishing once the pause window closed and the
 		// staged set is complete: from that moment the task no longer
 		// touches the VM and the sandbox fence releases.

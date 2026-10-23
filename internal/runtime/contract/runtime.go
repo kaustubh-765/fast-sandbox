@@ -99,14 +99,6 @@ type SnapshotResult struct {
 	SizeBytes int64
 }
 
-// SnapshotActionBinding is one source-Sandbox action binding recorded in
-// the published manifest: the durable policy record that outlives the
-// SandboxSnapshot CR (the CR is only the in-cluster auto-apply path).
-type SnapshotActionBinding struct {
-	Handler string `json:"handler"`
-	Input   string `json:"input"`
-}
-
 // SnapshotInput carries one snapshot request to the runtime driver.
 type SnapshotInput struct {
 	// SandboxID identifies the running Sandbox to snapshot.
@@ -130,9 +122,6 @@ type SnapshotInput struct {
 	// longer touches the VM and therefore does not block the next snapshot
 	// of the same Sandbox. Optional; drivers must tolerate nil.
 	OnPublishing func()
-	// ActionBindings are the source Sandbox's bindings, recorded verbatim
-	// in the published manifest so the artifact set is self-contained.
-	ActionBindings []SnapshotActionBinding
 }
 
 // Snapshotter is the optional runtime extension for snapshotting a running

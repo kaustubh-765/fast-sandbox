@@ -33,8 +33,8 @@ type RegistryRule struct {
 	RepositoryPrefix string    `json:"repositoryPrefix,omitempty" yaml:"repositoryPrefix,omitempty"`
 	SecretRef        SecretRef `json:"secretRef" yaml:"secretRef"`
 	// WriteSecretRef optionally references an Opaque secret holding the
-	// publish (write) access key pair of an S3-compatible artifact store:
-	// keys accessKeyId and secretAccessKey (the SandboxTemplate
+	// publish (write) credential pair of an artifact store or OCI registry:
+	// keys accessKeyId and secretAccessKey (username/password for OCI; the SandboxTemplate
 	// PublishSecretRef convention). Empty keeps the store read-only.
 	WriteSecretRef *SecretRef `json:"writeSecretRef,omitempty" yaml:"writeSecretRef,omitempty"`
 }
@@ -50,8 +50,9 @@ type Credential struct {
 	Password         string `json:"password,omitempty"`
 	IdentityToken    string `json:"identityToken,omitempty"`
 	// WriteUsername/WritePassword carry the optional publish (write) access
-	// key pair of an S3-compatible artifact store. Empty keeps the store
-	// read-only: pulls work, the runtime-agent refuses to publish. The
+	// key pair of an artifact store, or username/password for OCI checkpoint
+	// publication. Empty keeps the native object store read-only; OCI registries
+	// enforce push permission on the selected registry credential. The
 	// fields are compiled from a RegistryRule's writeSecretRef (plain
 	// accessKeyId/secretAccessKey keys, mirroring the SandboxTemplate
 	// PublishSecretRef convention).

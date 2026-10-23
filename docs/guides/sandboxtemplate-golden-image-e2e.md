@@ -3,8 +3,10 @@
 Reference environment and expected behavior for running the SandboxTemplate
 golden-image build E2E (`scripts/sandboxtemplate-e2e.sh`). The suite builds a
 golden image from an OCI image on real hardware (same host as the Firecracker
-runtime driver E2E), in both `native` and `overlaybd` encodings, and validates
-the produced snapshot by cold boot + restore.
+runtime driver E2E), with `format: native`, and validates the produced snapshot
+by cold boot + restore. OverlayBD templates require OCI publication and use the
+[OverlayBD OCI path](overlaybd-oci-sandboxes.md); this file-set E2E does not
+exercise that path.
 
 ## Host environment
 
@@ -28,15 +30,13 @@ from source on first run (docker layer cache keeps rebuilds fast):
 | Component | Version / source |
 |-----------|------------------|
 | oci2rootfs | built from source (no upstream release), used to materialize the OCI layout into a sparse ext4 rootfs |
-| overlaybd-import-raw | self-written C++ importer (`build/sandboxtemplate-builder/overlaybd-import-raw.cpp`) built against containerd/overlaybd `063821f`, photon + LSMT |
 | Firecracker | v1.16.1 |
 | Kernel | `vmlinux.bin` (firecracker quickstart image; `KERNEL_NAME`/`KERNEL_URL` build args, overridable together) |
 | aws CLI | v2 (official installer — the ubuntu v1 package ignores `AWS_ENDPOINT_URL`); the builder also passes `--endpoint-url` explicitly. Publishing is not exercised by the E2E (`publish` is unset) |
 
 ## Pipeline
 
-Each format runs the same pipeline in a separate directory
-(`.sandboxtemplate-e2e/<format>/`), driven by `spec.json` (alpine:3.19, 2
+The native pipeline runs in `.sandboxtemplate-e2e/native/`, driven by `spec.json` (alpine:3.19, 2
 vCPU / 1 GiB, `init=/usr/local/sbin/sandbox-init`, warmup 15 s, rootfs
 declared 10 Gi). The guest init carrying the readiness marker is always
 injected — an empty `spec.init` defaults to
@@ -53,8 +53,7 @@ injected — an empty `spec.init` defaults to
    re-run after resume), then remove the tap. The restored instance owns the
    baked address; consumers replace only the host tap via
    `network_overrides`
-3. **package** (overlaybd only) — import rootfs and memory into LSMT layers
-4. **manifest** — assemble `manifest.json` (content-addressed, includes the
+3. **manifest** — assemble `manifest.json` (content-addressed, includes the
    `guestNetwork` record) and SHA256SUMS (covering only the published artifact
    set)
 
@@ -65,18 +64,17 @@ digests.
 
 ## Artifacts
 
-Per format, under `.sandboxtemplate-e2e/<format>/build/`:
+Under `.sandboxtemplate-e2e/native/build/`:
 
-| File | native | overlaybd |
-|------|--------|-----------|
-| `rootfs.ext4` | sparse ext4, 11 GiB virtual / 1.1 GiB real (81 extents) | same + `overlaybd/rootfs/layer.lsmt` (11 MiB) |
-| `memory.snap` | 1 GiB sparse (firecracker dirty pages) | same + `overlaybd/memory/layer.lsmt` (~50 MiB) |
-| `vmstate.snap` | 25 KiB | 25 KiB |
-| `manifest.json` / `SHA256SUMS` | yes | yes |
-| `boot.console.log` / `restore.console.log` | guest serial, carries `SANDBOX_READY` / `SANDBOX_HEARTBEAT` | same |
+| File | native |
+|------|--------|
+| `rootfs.ext4` | sparse ext4, 11 GiB virtual / 1.1 GiB real (81 extents) |
+| `memory.snap` | 1 GiB sparse (firecracker dirty pages) |
+| `vmstate.snap` | 25 KiB |
+| `manifest.json` / `SHA256SUMS` | yes |
+| `boot.console.log` / `restore.console.log` | guest serial, carries `SANDBOX_READY` / `SANDBOX_HEARTBEAT` |
 
-The overlaybd encoding is a superset of native: the full snapshot set plus the
-LSMT layers (for random-read and incremental serving), not a size optimization.
+No OverlayBD LSMT sidecars are generated or uploaded by the object-store path.
 
 Notes:
 
@@ -91,18 +89,18 @@ Notes:
 
 ## Observed performance
 
-Last green run (both formats, `main.go` logs via `grep "build stages"`):
+Historical native run (`main.go` logs via `grep "build stages"`); these
+measurements are unchanged and were not remeasured for the path removal:
 
-| Phase | native | overlaybd |
-|-------|--------|-----------|
-| pull | 347 ms | 345 ms |
-| convert (oci2rootfs + inject) | 430 ms | 409 ms |
-| boot → SANDBOX_READY | 16.1 s | 16.1 s |
-| snapshot create | 10.2 s | 10.1 s |
-| restore → SANDBOX_HEARTBEAT | 5.1 s | 5.0 s |
-| import rootfs / memory (overlaybd) | — | 21.7 s / 11.6 s |
-| manifest + checksums | 42.1 s | 42.3 s |
-| **total** | **74.2 s** | **107.5 s** |
+| Phase | native |
+|-------|--------|
+| pull | 347 ms |
+| convert (oci2rootfs + inject) | 430 ms |
+| boot → SANDBOX_READY | 16.1 s |
+| snapshot create | 10.2 s |
+| restore → SANDBOX_HEARTBEAT | 5.1 s |
+| manifest + checksums | 42.1 s |
+| **total** | **74.2 s** |
 
 Notes and known limits:
 
@@ -143,11 +141,10 @@ cd /home/gaoran/fast-sandbox
 git pull && ./scripts/sandboxtemplate-e2e.sh
 ```
 
-- Both formats run by default (native then overlaybd); override with repeated
-  `--format native` / `--format overlaybd` (comma-separated also accepted)
-- Per-format output under `.sandboxtemplate-e2e/<format>/`: `pipeline.log`
+- Runs native output only. `--format native` remains accepted;
+  `--format overlaybd` is rejected because OverlayBD requires OCI publication
+- Output under `.sandboxtemplate-e2e/native/`: `pipeline.log`
   (builder klog, includes the per-stage timing line), `spec.json`,
   `build/` artifacts
 - Timings: `grep -E "build stages|snapshot stage phases" .sandboxtemplate-e2e/*/pipeline.log`
-- The suite fails on the first broken format and continues to the next;
-  the exit code is non-zero if any format failed
+- The suite exits non-zero if pipeline or artifact assertions fail

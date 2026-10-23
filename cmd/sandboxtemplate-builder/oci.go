@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -63,7 +64,7 @@ func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, wo
 	// Pin the platform explicitly: the builder converts for linux/amd64, and
 	// without a platform the registry's multi-arch index resolves against the
 	// builder host (an arm64 host would pull the wrong architecture).
-	descriptor, err := remote.Get(reference, remote.WithContext(ctx), remote.WithPlatform(linuxAMD64))
+	descriptor, err := remote.Get(reference, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithPlatform(linuxAMD64))
 	if err != nil {
 		return "", fmt.Errorf("pull %q: %w", spec.Image, err)
 	}
@@ -130,7 +131,7 @@ func extractExecd(ctx context.Context, image, destination string) error { //noli
 	if err != nil {
 		return err
 	}
-	img, err := remote.Image(reference, remote.WithContext(ctx), remote.WithPlatform(linuxAMD64))
+	img, err := remote.Image(reference, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithPlatform(linuxAMD64))
 	if err != nil {
 		return fmt.Errorf("pull execd %q: %w", image, err)
 	}

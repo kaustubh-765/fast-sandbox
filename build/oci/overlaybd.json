@@ -1,0 +1,10 @@
+{
+  "logConfig": {"logLevel": 1, "logPath": "/tmp/overlaybd.log"},
+  "cacheConfig": {"cacheType": "file", "cacheDir": "/opt/overlaybd/registry_cache", "cacheSizeGB": 4},
+  "gzipCacheConfig": {"enable": false, "cacheDir": "/opt/overlaybd/gzip_cache", "cacheSizeGB": 4},
+  "credentialConfig": {"mode": "file", "path": "/opt/overlaybd/cred.json"},
+  "ioEngine": 0, "workpoolSize": 8,
+  "download": {"enable": false}, "p2pConfig": {"enable": false},
+  "exporterConfig": {"enable": true, "uriPrefix": "/metrics", "port": 9863, "updateInterval": 1000000},
+  "registryFsVersion": "v2", "serviceConfig": {"enable": false}
+}

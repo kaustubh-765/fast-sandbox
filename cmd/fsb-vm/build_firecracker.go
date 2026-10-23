@@ -183,6 +183,11 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	if err := client.setMachineConfig(ctx, machineConfig{VCPUCount: options.vcpu, MemSizeMiB: options.memoryMB}); err != nil {
 		return "", "", fmt.Errorf("configure machine: %w", err)
 	}
+	if options.tapName != "" {
+		if err := client.do(ctx, "PUT", "/network-interfaces/eth0", map[string]string{"iface_id": "eth0", "host_dev_name": options.tapName, "guest_mac": options.guestMAC}, nil); err != nil {
+			return "", "", err
+		}
+	}
 	if err := client.startInstance(ctx); err != nil {
 		return "", "", fmt.Errorf("start instance: %w", err)
 	}

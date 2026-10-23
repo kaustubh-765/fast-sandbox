@@ -246,7 +246,7 @@ spec:
     warmupSeconds: 60
   output:
     rootfsSize: "30Gi"
-    format: overlaybd
+    format: native
     publish: s3://sandbox-images/publish
     publishSecretRef:
       name: sandbox-images-readwrite
@@ -268,9 +268,9 @@ spec:
 | `readiness.warmupSeconds` | Yes | `60` | Fallback time-based warmup |
 | `readiness.healthCheck` | No | — | Fallback health command; empty uses image `CMD-SHELL` |
 | `output.rootfsSize` | Yes | `"30Gi"` | Logical rootfs capacity (minimum, rounded up to SI GiB) |
-| `output.format` | Yes | `overlaybd` | `native` or `overlaybd` (both contain the full snapshot set) |
-| `output.publish` | Yes | — | S3-compatible digest-addressed publish target, e.g. `s3://bucket/prefix` |
-| `output.publishSecretRef` | No | — | Write-credential Secret name in the template's namespace (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`) |
+| `output.format` | Yes | `overlaybd` | `native` for S3-compatible storage; `overlaybd` requires `output.publish: oci://...` |
+| `output.publish` | No for native; yes for OCI | platform store for native | `native`: S3-compatible target, e.g. `s3://bucket/prefix`, or omit to use the platform store. `overlaybd`: Repository-only `oci://registry/repository` required; tags and digests are rejected before starting a build Pod. The system generates a UUID per build; S3 is rejected |
+| `output.publishSecretRef` | No for native; yes for OCI | — | Secret in the template's namespace: S3 keys for native; `.dockerconfigjson` for OCI |
 | `output.prime` | No | — | Reserved: seed-node cache priming; not yet implemented |
 
 Readiness precedence: custom `probe` → execd `/ping` → `warmupSeconds` +
@@ -282,7 +282,7 @@ Readiness precedence: custom `probe` → execd `/ping` → `warmupSeconds` +
 | --- | --- |
 | `phase` | `Pending`, `Building`, `Succeeded`, or `Failed` |
 | `conditions` | `BuildSucceeded` with reason/message on terminal states |
-| `manifestRef` | Published manifest URI (`s3://…/<sha256(manifest)[:16]>/manifest.json`) |
+| `manifestRef` | Published manifest URI: `s3://…/<sha256(manifest)[:16]>/manifest.json` for native output; immutable `oci://registry/repository@sha256:...` snapfiles reference for OCI output |
 | `artifactDigest` | sha256 of the manifest document itself |
 | `lastBuildTime` | When the latest build completed |
 | `observedGeneration` | Generation of the last applied build |
@@ -291,7 +291,12 @@ Build Pods run in the template's own namespace as
 `<template>-build-<generation>`, owned by the template (deleting the
 template cascades to its Pods via the garbage collector), pinned to
 `sandbox.fast.io/kvm=true` nodes; editing the spec triggers a rebuild
-(generation bump). Finished Pods are reaped after the build TTL (24 h).
+(generation bump). Finished Pods are reaped after the build TTL (24 h). For OCI
+output, the UUID is fixed in the build Pod: retries of that Pod reuse it,
+while a new generation or replacement build Pod receives a new UUID. The two
+tags are `<uuid>_rootfs` and `<uuid>_snapfiles`; `status.manifestRef` points to
+the latest successful build. Applying an unchanged spec does not rebuild.
+
 
 See the [SandboxTemplate guide](../guides/sandboxtemplate-golden-images.md)
 for the end-to-end workflow, artifact layout, and consumption contract.
@@ -359,7 +364,7 @@ The protobuf contract is
 | `ResolveEndpoint` | Non-blocking resolution of a named component or raw user port in central/direct mode; requires live aggregate Ready |
 | `CreateSandboxSnapshot` | One-shot live checkpoint of a Ready Sandbox; `request_id` is the idempotency key, sandbox fence until `Publishing`, template-name fence until terminal |
 | `GetSandboxSnapshot` | CR-backed phase/artifact/placement observation |
-| `DeleteSandboxSnapshot` | Deletes the object (`expected_uid` fenced); never unpublishes stored artifacts |
+| `DeleteSandboxSnapshot` | Accepts deletion (`expected_uid` fenced); for OCI, deletes both published manifests before the object disappears. Native store lifecycle is managed separately |
 | `PauseSandbox` | Persist `spec.state=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
 | `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
