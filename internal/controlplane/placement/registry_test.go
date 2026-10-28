@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/testutil"
@@ -118,6 +120,26 @@ func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	stored, ok := registry.GetFastletByID("cache-hit")
 	require.True(t, ok)
 	require.Equal(t, 4, stored.Used(), "selection must not consume Registry capacity")
+}
+
+// A firecracker Fastlet reports its node cache as content-addressed keys
+// (the cache directory names: sha256 of the raw reference). The hit check
+// must recognise them, or image affinity never applies to that runtime.
+func TestTopKMatchesContentAddressedCacheKeys(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	reference := "checkpoint:sha256:" + strings.Repeat("ab", 32)
+	seedFastlet(t, registry, readyFastlet("holds-checkpoint", 15, 20, artifacts.ImageIndexKey(reference)))
+	for _, id := range []string{"idle-1", "idle-2", "idle-3"} {
+		seedFastlet(t, registry, readyFastlet(id, 0, 20, artifacts.ImageIndexKey("tpl-other")))
+	}
+
+	selected := registry.TopK(candidate(reference, "request-a"), 3)
+	require.Len(t, selected, 3)
+	require.Equal(t, FastletID("holds-checkpoint"), selected[0].ID,
+		"the Fastlet whose cache holds the reference ranks first, ahead of less-loaded misses and before the Top-K cut")
+
+	selected = registry.TopK(candidate("tpl-other", "request-b"), 1)
+	require.NotEqual(t, FastletID("holds-checkpoint"), selected[0].ID, "a hashed template key is a hit as well")
 }
 
 func TestTopKDoesNotMutateAdmission(t *testing.T) {
