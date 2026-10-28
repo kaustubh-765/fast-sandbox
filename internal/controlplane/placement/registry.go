@@ -9,6 +9,7 @@ import (
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -262,6 +263,13 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	if request.Now.IsZero() {
 		request.Now = r.clock()
 	}
+	// Runtimes that cache under a content-addressed key (firecracker: the
+	// directory name is sha256 of the raw reference) report that key in their
+	// inventory, so the hit check accepts it next to the plain reference.
+	imageCacheKey := ""
+	if request.Image != "" {
+		imageCacheKey = artifacts.ImageIndexKey(request.Image)
+	}
 	request.Image = fastletcache.NormalizeReference(request.Image)
 	staleAfter := time.Duration(r.staleAfter.Load())
 	r.mu.RLock()
@@ -285,7 +293,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 			slot:        slot,
 			id:          info.ID,
 			capacity:    info.Capacity(),
-			imageHit:    imageHit(info, request.Image),
+			imageHit:    imageHit(info, request.Image, imageCacheKey),
 			used:        info.Used(),
 			stableOrder: stableOrder(request.StableKey, info.ID),
 		})
@@ -357,12 +365,17 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 	return true
 }
 
-func imageHit(info FastletInfo, image string) bool {
+func imageHit(info FastletInfo, image, cacheKey string) bool {
 	if image == "" || !info.CacheComplete {
 		return false
 	}
-	index := sort.SearchStrings(info.Images, image)
-	return index < len(info.Images) && info.Images[index] == image
+	return hasImage(info.Images, image) || (cacheKey != "" && hasImage(info.Images, cacheKey))
+}
+
+// hasImage reports whether the sorted inventory holds image.
+func hasImage(images []string, image string) bool {
+	index := sort.SearchStrings(images, image)
+	return index < len(images) && images[index] == image
 }
 
 func stableOrder(key string, id FastletID) uint64 {
