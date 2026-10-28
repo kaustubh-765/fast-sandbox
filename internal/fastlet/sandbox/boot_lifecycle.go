@@ -20,10 +20,17 @@ import (
 )
 
 const (
-	// initialImageBootPoll is the first delivery poll delay; it doubles up to
-	// maxImageBootPoll between polls.
-	initialImageBootPoll = 300 * time.Millisecond
-	maxImageBootPoll     = 5 * time.Second
+	// initialImageBootPoll is the first delay while the delivery is still in
+	// flight; it doubles up to maxImageBootPoll between polls. A poll is a
+	// local cache check, so the cap stays short: a long cap made a restore
+	// whose download just finished wait up to 5 s for the next poll.
+	initialImageBootPoll = 100 * time.Millisecond
+	maxImageBootPoll     = 500 * time.Millisecond
+	// initialImageFailureBackoff / maxImageFailureBackoff space the polls
+	// after a reported delivery error, so imageDeliveryFailLimit still spans
+	// seconds rather than the fast in-flight poll.
+	initialImageFailureBackoff = 300 * time.Millisecond
+	maxImageFailureBackoff     = 5 * time.Second
 	// imageDeliveryFailLimit is the number of consecutive reported delivery
 	// failures after which the Sandbox transitions to create-failed.
 	imageDeliveryFailLimit = 3
@@ -149,6 +156,7 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 	}()
 
 	pollDelay := initialImageBootPoll
+	failureDelay := initialImageFailureBackoff
 	failures := 0
 	for {
 		if ctx.Err() != nil {
@@ -169,13 +177,14 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 				m.markCreateFailed(metadata, fmt.Errorf("deliver sandbox artifacts for %q: %w", uid, err))
 				return
 			}
-			if !sleepImageBootPoll(ctx, pollDelay) {
+			if !sleepImageBootPoll(ctx, failureDelay) {
 				return
 			}
-			pollDelay = min(pollDelay*2, maxImageBootPoll)
+			failureDelay = min(failureDelay*2, maxImageFailureBackoff)
 			continue
 		}
 		failures = 0
+		failureDelay = initialImageFailureBackoff
 		if status == ImageDelivering {
 			if !sleepImageBootPoll(ctx, pollDelay) {
 				return
