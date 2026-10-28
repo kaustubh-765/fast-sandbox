@@ -120,6 +120,26 @@ type Driver struct {
 // to Sandbox lifecycle events.
 const defaultImageGCInterval = time.Hour
 
+// imageGCIntervalEnv overrides the GC period (a Go duration, e.g. "10m"):
+// under a sustained pause/snapshot load the cache outgrows its limit by far
+// between hourly passes.
+const imageGCIntervalEnv = "FAST_SANDBOX_IMAGE_GC_INTERVAL"
+
+// imageGCInterval returns the configured GC period; an empty, invalid or
+// non-positive value keeps the default.
+func imageGCInterval() time.Duration {
+	value := strings.TrimSpace(os.Getenv(imageGCIntervalEnv))
+	if value == "" {
+		return defaultImageGCInterval
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		klog.InfoS("ignoring invalid image GC interval", "env", imageGCIntervalEnv, "value", value, "default", defaultImageGCInterval.String())
+		return defaultImageGCInterval
+	}
+	return interval
+}
+
 // New validates the runtime profile configuration and returns the driver.
 func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 	if profile.Firecracker == nil {
@@ -133,7 +153,7 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
 		checkStorage:           checkStateRootStorage,
 		writeVMMetadataPayload: writeVMMetadataPayload,
-		imageGCInterval:        defaultImageGCInterval,
+		imageGCInterval:        imageGCInterval(),
 		imageCacheLimitBytes:   defaultImageCacheLimitBytes,
 	}, nil
 }
