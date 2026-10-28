@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/controlplane/placement"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -26,11 +28,13 @@ type fakeRegistry struct {
 	feedback    []placement.FastletID
 	feedbacks   []placement.LocalFeedback
 	lastRequest placement.CandidateRequest
+	requests    []placement.CandidateRequest
 	reserve     func(placement.FastletID, placement.ResourceDemand) bool
 }
 
 func (r *fakeRegistry) TopK(request placement.CandidateRequest, _ int) []placement.FastletInfo {
 	r.lastRequest = request
+	r.requests = append(r.requests, request)
 	return append([]placement.FastletInfo(nil), r.candidates...)
 }
 
@@ -790,6 +794,39 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 		Spec: apiv1alpha2.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a"},
 	}
 	return orchestrator, registry, fastletClient, sandbox
+}
+
+// A resume ranks on the checkpoint it restores, not on its image: the Top-K
+// image affinity then lifts the Fastlets whose node cache holds the
+// checkpoint above the cut (see placement.TopK).
+func TestCandidatesRankResumeOnCheckpointReference(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	registry.candidates = []placement.FastletInfo{candidateFor(parameters)}
+
+	_, _, err = orchestrator.Candidates(context.Background(), sandbox, "key")
+	require.NoError(t, err)
+	require.Equal(t, "alpine:latest", registry.requests[len(registry.requests)-1].Image, "a fresh create ranks on its image")
+
+	digest := strings.Repeat("cd", 32)
+	sandbox.Spec.State = apiv1alpha2.SandboxStateRunning
+	sandbox.Status.Runtime.Checkpoint = &apiv1alpha2.CheckpointStatus{
+		CheckpointID: "checkpoint-a", ManifestRef: "s3://bucket/publish/0123456789abcdef/manifest.json", ArtifactDigest: digest,
+	}
+	_, _, err = orchestrator.Candidates(context.Background(), sandbox, "key")
+	require.NoError(t, err)
+	require.Equal(t, artifacts.CheckpointReference(digest), registry.requests[len(registry.requests)-1].Image)
+
+	sandbox.Status.Runtime.Checkpoint.ManifestRef = "oci://registry/checkpoints@sha256:" + digest
+	_, _, err = orchestrator.Candidates(context.Background(), sandbox, "key")
+	require.NoError(t, err)
+	require.Equal(t, sandbox.Status.Runtime.Checkpoint.ManifestRef, registry.requests[len(registry.requests)-1].Image)
+
+	sandbox.Spec.State = apiv1alpha2.SandboxStatePaused
+	_, _, err = orchestrator.Candidates(context.Background(), sandbox, "key")
+	require.NoError(t, err)
+	require.Equal(t, "alpine:latest", registry.requests[len(registry.requests)-1].Image, "the pause FSM owns a paused Sandbox's checkpoint")
 }
 
 func TestPreferFastletMovesResumeTargetFirst(t *testing.T) {

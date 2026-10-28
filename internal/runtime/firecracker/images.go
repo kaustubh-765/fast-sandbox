@@ -3,7 +3,6 @@ package firecracker
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -37,10 +36,11 @@ const rootfsImageName = "rootfs.img"
 // pull layer can reuse it; this alias keeps the driver's exported identity.
 var ErrImageNotReady = runtimecontract.ErrImageNotReady
 
-// imageKey derives the content-addressed cache key of an image reference.
+// imageKey derives the content-addressed cache key of an image reference:
+// artifacts.ImageIndexKey, the one definition the Fastlet cache inventory and
+// the controller's Top-K image affinity also rely on.
 func imageKey(image string) string {
-	digest := sha256.Sum256([]byte(image))
-	return hex.EncodeToString(digest[:])
+	return artifacts.ImageIndexKey(image)
 }
 
 // imageCachePath returns the rootfs image path for an image reference. The

@@ -40,10 +40,11 @@ const (
 	nativeRootfsCacheName = "rootfs.img"
 )
 
-// imageKey derives the content-addressed cache key of an image reference.
+// imageKey derives the content-addressed cache key of an image reference:
+// artifacts.ImageIndexKey, the one definition the Fastlet cache inventory and
+// the controller's Top-K image affinity also rely on.
 func imageKey(image string) string {
-	digest := sha256.Sum256([]byte(image))
-	return hex.EncodeToString(digest[:])
+	return artifacts.ImageIndexKey(image)
 }
 
 // imageDir returns the cache directory of an image reference.
