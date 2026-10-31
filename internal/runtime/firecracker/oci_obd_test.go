@@ -225,3 +225,15 @@ func TestOCIDiskManagerPrefersOverlayBDAndFallsBack(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, strings.Contains(err.Error(), "converting"), "the ext4 error is returned, not convertd's: %v", err)
 }
+
+func TestOBDReleaseDoesNotWaitWithoutHolders(t *testing.T) {
+	regular := filepath.Join(t.TempDir(), "not-a-device")
+	require.NoError(t, os.WriteFile(regular, []byte("x"), 0o600))
+	require.Empty(t, deviceOpenBy("/proc", regular), "only block devices have holders")
+	require.Empty(t, deviceOpenBy("/proc", "/dev/ublkb-missing"))
+
+	manager := newOBDManagerAt(t.TempDir(), "/nonexistent", "")
+	started := time.Now()
+	manager.waitClosed(context.Background(), "sandbox-a", "/dev/ublkb-missing")
+	require.Less(t, time.Since(started), time.Second)
+}
