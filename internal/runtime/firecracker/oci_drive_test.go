@@ -1,13 +1,20 @@
 package firecracker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
@@ -133,7 +140,65 @@ func TestResolveOCIDriveRejectsCorruptRecord(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 }
 
-func TestOCIDiskSizeGBRoundsUp(t *testing.T) {
-	require.Equal(t, int64(1), ceilGB(0))
-	require.Equal(t, int64(2), ceilGB(1_000_000_001))
+func TestOCIDiskSizeLeavesHeadroom(t *testing.T) {
+	require.Equal(t, int64(256*1024), ociDiskSizeKiB(0))
+	require.Greater(t, ociDiskSizeKiB(100<<20), int64(150<<10))
+}
+
+func tarLayer(t *testing.T, entries []tar.Header, bodies map[string]string) v1.Layer {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	for _, header := range entries {
+		header := header
+		header.Uid, header.Gid = os.Getuid(), os.Getgid()
+		body := bodies[header.Name]
+		header.Size = int64(len(body))
+		require.NoError(t, writer.WriteHeader(&header))
+		_, err := writer.Write([]byte(body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	payload := buffer.Bytes()
+	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(payload)), nil })
+	require.NoError(t, err)
+	return layer
+}
+
+// A hostile image may plant a symlink to an absolute host path and then write
+// through it; every entry must still land inside the extraction root.
+func TestExtractImageStaysInsideRoot(t *testing.T) {
+	outside := t.TempDir()
+	layer := tarLayer(t, []tar.Header{
+		{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "usr/bin/tool", Typeflag: tar.TypeReg, Mode: 0o4755},
+		{Name: "usr/bin/alias", Typeflag: tar.TypeLink, Linkname: "usr/bin/tool"},
+		{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: outside},
+		{Name: "escape/owned", Typeflag: tar.TypeReg, Mode: 0o644},
+		{Name: "../../dotdot", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, map[string]string{"usr/bin/tool": "#!/bin/sh\n", "escape/owned": "x", "../../dotdot": "y"})
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	require.NoError(t, err)
+
+	parent := t.TempDir()
+	root := filepath.Join(parent, "rootfs")
+	total, err := extractImage(img, root)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, total, int64(len("#!/bin/sh\n")))
+
+	info, err := os.Stat(filepath.Join(root, "usr/bin/tool"))
+	require.NoError(t, err)
+	require.Equal(t, os.ModeSetuid|0o755, info.Mode()&(os.ModeSetuid|os.ModePerm))
+	alias, err := os.Stat(filepath.Join(root, "usr/bin/alias"))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(info, alias), "hard link resolves inside root")
+	target, err := os.Readlink(filepath.Join(root, "escape"))
+	require.NoError(t, err)
+	require.Equal(t, outside, target, "the symlink itself is preserved for the guest")
+
+	entries, err := os.ReadDir(outside)
+	require.NoError(t, err)
+	require.Empty(t, entries, "nothing was written through the symlink on the host")
+	_, err = os.Stat(filepath.Join(parent, "dotdot"))
+	require.True(t, os.IsNotExist(err), "dot-dot names never land above the root")
 }

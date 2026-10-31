@@ -1,24 +1,27 @@
 package firecracker
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/empty"
-	"github.com/google/go-containerregistry/pkg/v1/layout"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
@@ -50,7 +53,6 @@ const (
 	// ociGuestMetaDir holds the image config and drive record inside the
 	// converted disk, next to the image rootfs.
 	ociGuestMetaDir = ".fsb-oci"
-	oci2rootfsBin   = "oci2rootfs"
 )
 
 var ociDrivePlatform = v1.Platform{OS: "linux", Architecture: "amd64"}
@@ -188,9 +190,9 @@ func (m *ociDiskManager) lock(key string) func() {
 	return keyLock.Unlock
 }
 
-// convert writes the image as an OCI layout, renders it to ext4 with
-// oci2rootfs (the template builder's converter), adds the image config under
-// /.fsb-oci, verifies the filesystem, and commits it read-only.
+// convert flattens the image into a directory, adds the image config under
+// /.fsb-oci, renders the tree into a sparse ext4 disk with mkfs.ext4 -d (no
+// loop mount), verifies it, and commits it read-only.
 func (m *ociDiskManager) convert(ctx context.Context, img v1.Image, drive artifacts.OCIDrive) (string, error) {
 	unlock := m.lock(drive.DiskKey)
 	defer unlock()
@@ -208,30 +210,20 @@ func (m *ociDiskManager) convert(ctx context.Context, img v1.Image, drive artifa
 	}
 	defer os.RemoveAll(work)
 
-	layoutDir := filepath.Join(work, "layout")
-	index, err := layout.Write(layoutDir, empty.Index)
+	tree := filepath.Join(work, "rootfs")
+	contentBytes, err := extractImage(img, tree)
 	if err != nil {
-		return "", fmt.Errorf("write OCI layout: %w", err)
+		return "", fmt.Errorf("unpack OCI image %s: %w", drive.Image, err)
 	}
-	if err := index.AppendImage(img, layout.WithPlatform(ociDrivePlatform)); err != nil {
-		return "", fmt.Errorf("download OCI image %s: %w", drive.Image, err)
-	}
-	sizeGB, err := ociDiskSizeGB(img)
-	if err != nil {
+	if err := writeGuestMetadata(img, drive, tree); err != nil {
 		return "", err
 	}
 	disk := filepath.Join(work, ociDiskName)
-	if output, err := m.runner(ctx, oci2rootfsBin, layoutDir, "--output", disk,
-		"--size", fmt.Sprintf("%dG", sizeGB), "--platform", "linux/amd64"); err != nil {
-		return "", fmt.Errorf("oci2rootfs: %w: %s", err, strings.TrimSpace(string(output)))
+	if output, err := m.runner(ctx, "mkfs.ext4", "-F", "-q", "-L", "fsb-oci", "-d", tree,
+		disk, fmt.Sprintf("%dk", ociDiskSizeKiB(contentBytes))); err != nil {
+		return "", fmt.Errorf("mkfs.ext4: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	if err := m.fsck(ctx, disk, "-fy"); err != nil {
-		return "", err
-	}
-	if err := m.writeGuestMetadata(ctx, img, drive, disk, work); err != nil {
-		return "", err
-	}
-	if err := m.fsck(ctx, disk, "-fn"); err != nil {
+	if err := m.fsck(ctx, disk); err != nil {
 		return "", err
 	}
 	if err := os.Chmod(disk, 0o444); err != nil {
@@ -250,27 +242,128 @@ func (m *ociDiskManager) convert(ctx context.Context, img v1.Image, drive artifa
 	if err := os.Rename(disk, final); err != nil {
 		return "", err
 	}
-	klog.InfoS("converted OCI image into a drive disk", "image", drive.Image, "digest", drive.Digest, "diskKey", drive.DiskKey, "sizeGB", sizeGB)
+	klog.InfoS("converted OCI image into a drive disk", "image", drive.Image, "digest", drive.Digest,
+		"diskKey", drive.DiskKey, "contentMiB", contentBytes>>20)
 	return final, nil
 }
 
-// fsck runs e2fsck; with -fy exit status 1 means errors were corrected.
-func (m *ociDiskManager) fsck(ctx context.Context, disk, mode string) error {
-	output, err := m.runner(ctx, "e2fsck", mode, disk)
-	if err == nil {
-		return nil
+// fsck verifies the fresh filesystem read-only.
+func (m *ociDiskManager) fsck(ctx context.Context, disk string) error {
+	if output, err := m.runner(ctx, "e2fsck", "-fn", disk); err != nil {
+		return fmt.Errorf("e2fsck: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	var exitErr *exec.ExitError
-	if mode == "-fy" && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		return nil
+	return nil
+}
+
+// extractImage writes the flattened image filesystem under root with its
+// ownership, modes, and device nodes, and returns the regular file bytes.
+// Every path is resolved inside root (symlinks included), so a hostile
+// image cannot write outside it.
+func extractImage(img v1.Image, root string) (int64, error) { //nolint:gocognit // one switch over tar entry types
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return 0, err
 	}
-	return fmt.Errorf("e2fsck %s: %w: %s", mode, err, strings.TrimSpace(string(output)))
+	stream := mutate.Extract(img)
+	defer stream.Close()
+	reader := tar.NewReader(stream)
+	type dirMode struct {
+		path string
+		mode os.FileMode
+	}
+	var dirs []dirMode
+	total := int64(0)
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		target, err := securejoin.SecureJoin(root, header.Name)
+		if err != nil {
+			return 0, err
+		}
+		if target == root {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return 0, err
+		}
+		mode := header.FileInfo().Mode()
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return 0, err
+			}
+			dirs = append(dirs, dirMode{path: target, mode: mode})
+		case tar.TypeReg:
+			_ = os.RemoveAll(target)
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			if err != nil {
+				return 0, err
+			}
+			written, copyErr := io.Copy(file, reader) //nolint:gosec // image size is bounded by the registry blob
+			closeErr := file.Close()
+			if err := errors.Join(copyErr, closeErr); err != nil {
+				return 0, err
+			}
+			total += written
+		case tar.TypeSymlink:
+			_ = os.RemoveAll(target)
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return 0, err
+			}
+		case tar.TypeLink:
+			source, err := securejoin.SecureJoin(root, header.Linkname)
+			if err != nil {
+				return 0, err
+			}
+			_ = os.RemoveAll(target)
+			if err := os.Link(source, target); err != nil {
+				return 0, err
+			}
+			continue
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			_ = os.RemoveAll(target)
+			kind := uint32(unix.S_IFIFO)
+			switch header.Typeflag {
+			case tar.TypeChar:
+				kind = unix.S_IFCHR
+			case tar.TypeBlock:
+				kind = unix.S_IFBLK
+			}
+			device := int(unix.Mkdev(uint32(header.Devmajor), uint32(header.Devminor))) //nolint:gosec // tar device numbers fit
+			if err := unix.Mknod(target, kind|uint32(mode.Perm()), device); err != nil {
+				return 0, err
+			}
+		default:
+			continue
+		}
+		if err := os.Lchown(target, header.Uid, header.Gid); err != nil {
+			return 0, err
+		}
+		if header.Typeflag != tar.TypeSymlink && header.Typeflag != tar.TypeDir {
+			if err := os.Chmod(target, mode&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky)); err != nil {
+				return 0, err
+			}
+		}
+	}
+	// Directory modes last: a read-only directory must not block its
+	// children from being written.
+	for index := len(dirs) - 1; index >= 0; index-- {
+		mode := dirs[index].mode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+		if err := os.Chmod(dirs[index].path, mode); err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
 }
 
 // writeGuestMetadata stores the raw image config and the drive record at
-// /.fsb-oci in the disk, where the guest agent reads entrypoint, env and
+// /.fsb-oci in the tree, where the guest agent reads entrypoint, env and
 // working directory.
-func (m *ociDiskManager) writeGuestMetadata(ctx context.Context, img v1.Image, drive artifacts.OCIDrive, disk, work string) error {
+func writeGuestMetadata(img v1.Image, drive artifacts.OCIDrive, tree string) error {
 	config, err := img.RawConfigFile()
 	if err != nil {
 		return fmt.Errorf("read image config: %w", err)
@@ -279,58 +372,21 @@ func (m *ociDiskManager) writeGuestMetadata(ctx context.Context, img v1.Image, d
 	if err != nil {
 		return err
 	}
-	if err := ensureLoopDevices(); err != nil {
+	dir := filepath.Join(tree, ociGuestMetaDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	mountpoint := filepath.Join(work, "mnt")
-	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "image-config.json"), config, 0o644); err != nil { //nolint:gosec // image config is public metadata
 		return err
 	}
-	if output, err := m.runner(ctx, "mount", "-o", "loop", disk, mountpoint); err != nil {
-		return fmt.Errorf("mount OCI drive disk: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	writeErr := func() error {
-		dir := filepath.Join(mountpoint, ociGuestMetaDir)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(dir, "image-config.json"), config, 0o644); err != nil { //nolint:gosec // image config is public metadata
-			return err
-		}
-		return os.WriteFile(filepath.Join(dir, ociDiskMetaName), record, 0o644) //nolint:gosec // non-secret drive record
-	}()
-	if output, err := m.runner(context.Background(), "umount", mountpoint); err != nil {
-		return errors.Join(writeErr, fmt.Errorf("umount OCI drive disk: %w: %s", err, strings.TrimSpace(string(output))))
-	}
-	return writeErr
+	return os.WriteFile(filepath.Join(dir, ociDiskMetaName), record, 0o644) //nolint:gosec // non-secret drive record
 }
 
-// ociDiskSizeGB sizes the sparse ext4 disk generously from the compressed
-// layer sizes (an image unpacks to a few times its compressed size).
-func ociDiskSizeGB(img v1.Image) (int64, error) {
-	layers, err := img.Layers()
-	if err != nil {
-		return 0, err
-	}
-	compressed := int64(0)
-	for _, layer := range layers {
-		size, err := layer.Size()
-		if err != nil {
-			return 0, err
-		}
-		compressed += size
-	}
-	return ceilGB(compressed*4 + 512*1000*1000), nil
-}
-
-// ceilGB rounds a byte count up to whole SI gigabytes (oci2rootfs --size),
-// never below one.
-func ceilGB(bytes int64) int64 {
-	const gb = 1000 * 1000 * 1000
-	if bytes <= gb {
-		return 1
-	}
-	return (bytes + gb - 1) / gb
+// ociDiskSizeKiB sizes the sparse disk from the unpacked content: ext4
+// metadata and small-file slack need headroom, and the guest mounts the disk
+// read-only, so unused space costs nothing.
+func ociDiskSizeKiB(contentBytes int64) int64 {
+	return (contentBytes+contentBytes/2)/1024 + 256*1024
 }
 
 // placeOCIDrive provides artifacts.OCIDriveFileName in the VMM working
