@@ -142,6 +142,14 @@ func (c *Client) AttachDrive(ctx context.Context, request DriveRequest) error {
 	return c.do(ctx, http.MethodPut, "/drives/"+pathEscape(request.DriveID), request, nil)
 }
 
+// PatchDrive tells Firecracker that the backing file of an attached drive
+// changed (PATCH /drives/{drive_id}); the guest sees the new size through a
+// virtio config change.
+func (c *Client) PatchDrive(ctx context.Context, driveID, pathOnHost string) error {
+	return c.do(ctx, http.MethodPatch, "/drives/"+pathEscape(driveID),
+		map[string]string{"drive_id": driveID, "path_on_host": pathOnHost}, nil)
+}
+
 // AttachNetworkInterface registers a virtio-net device backed by host_dev_name.
 func (c *Client) AttachNetworkInterface(ctx context.Context, request NetworkInterfaceRequest) error {
 	return c.do(ctx, http.MethodPut, "/network-interfaces/"+pathEscape(request.IfaceID), request, nil)

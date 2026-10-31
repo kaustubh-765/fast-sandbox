@@ -27,15 +27,18 @@ const (
 // Platform is optional for standalone fsb-vm use. Files lists native VM
 // artifacts only; platform state is described once in Platform.StateFiles.
 type VMManifest struct {
-	SchemaVersion int                     `json:"schemaVersion"`
-	Runtime       string                  `json:"runtime"`
-	Machine       VMMachine               `json:"machine"`
-	Kernel        VMKernel                `json:"kernel"`
-	Compatibility SnapshotCompatibility   `json:"compatibility"`
-	GuestNetwork  *VMGuestNetwork         `json:"guestNetwork,omitempty"`
-	Lineage       *VMLineage              `json:"lineage,omitempty"`
-	Platform      *VMPlatform             `json:"platform,omitempty"`
-	Files         map[string]ManifestFile `json:"files,omitempty"`
+	SchemaVersion int                   `json:"schemaVersion"`
+	Runtime       string                `json:"runtime"`
+	Machine       VMMachine             `json:"machine"`
+	Kernel        VMKernel              `json:"kernel"`
+	Compatibility SnapshotCompatibility `json:"compatibility"`
+	GuestNetwork  *VMGuestNetwork       `json:"guestNetwork,omitempty"`
+	Lineage       *VMLineage            `json:"lineage,omitempty"`
+	Platform      *VMPlatform           `json:"platform,omitempty"`
+	// OCIDrive records the converted OCI image disk the guest had attached
+	// when the snapshot was taken (oci_drive.go); a restore re-attaches it.
+	OCIDrive *OCIDrive               `json:"ociDrive,omitempty"`
+	Files    map[string]ManifestFile `json:"files,omitempty"`
 }
 
 type VMMachine struct {
@@ -143,6 +146,11 @@ func (m VMManifest) Validate() error {
 	if network := m.GuestNetwork; network != nil {
 		if _, err := net.ParseMAC(network.MAC); err != nil || network.Iface == "" {
 			return fmt.Errorf("guestNetwork requires an interface and valid MAC")
+		}
+	}
+	if m.OCIDrive != nil {
+		if err := m.OCIDrive.Validate(); err != nil {
+			return err
 		}
 	}
 	return validateVMPlatform(m.Platform)
