@@ -1,0 +1,21 @@
+# Stage B (OCI image drives) node image: the OverlayBD ublkd node daemon and
+# the oci-convertd conversion service share it. Built from the oci-tools
+# artifact image so the pinned OverlayBD and convertor builds are reused.
+ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
+FROM ${OCI_TOOLS_IMAGE} AS oci-tools
+
+FROM ubuntu:22.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl e2fsprogs kmod libaio1 libcurl4 libgflags2.2 libglib2.0-0 \
+        libnl-3-200 libnl-genl-3-200 libssl3 libzstd1 util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=oci-tools /opt/overlaybd/ /opt/overlaybd/
+COPY --from=oci-tools /usr/local/bin/convertor /usr/local/bin/convertor
+COPY --from=oci-tools /bundle /opt/fast-sandbox/oci-bundle
+COPY build/oci/stage-b-node-daemon.sh /usr/local/bin/overlaybd-node
+# Fail the build, not the node, when a shared library is missing.
+RUN for b in /opt/fast-sandbox/oci-bundle/libexec/*; do \
+        LD_LIBRARY_PATH=/opt/fast-sandbox/oci-bundle/lib ldd "$b" | grep 'not found' && exit 1 || true; \
+    done; \
+    for b in /opt/overlaybd/bin/*; do LD_LIBRARY_PATH=/opt/overlaybd/lib ldd "$b" | grep 'not found' && exit 1 || true; done; \
+    chmod 0755 /usr/local/bin/overlaybd-node
