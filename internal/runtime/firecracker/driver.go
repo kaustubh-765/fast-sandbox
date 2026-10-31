@@ -534,6 +534,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if err != nil {
 		return nil, err
 	}
+	// Launch overrides only apply to a fresh create; a restore resumes a
+	// container that is already running.
+	var ociLaunch artifacts.OCILaunch
+	if ociFresh {
+		if ociLaunch, err = ociLaunchFromSpec(spec); err != nil {
+			return nil, err
+		}
+	}
 
 	directory, err := ensureSandboxDir(stateRoot, identity.SandboxUID)
 	if err != nil {
@@ -690,6 +698,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			vmDir = jailRoot
 		}
 		if err := placeOCIDrive(vmDir, ociDisk); err != nil {
+			releaseSlot()
+			return nil, err
+		}
+		if err := placeOCILaunch(vmDir, ociLaunch); err != nil {
 			releaseSlot()
 			return nil, err
 		}

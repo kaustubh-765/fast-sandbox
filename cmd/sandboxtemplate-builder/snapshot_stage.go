@@ -382,6 +382,18 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 			return fmt.Errorf("attach OCI placeholder drive: %w", err)
 		}
 	}
+	// The launch drive follows the image drive (guest /dev/vdc) and carries
+	// per-Sandbox launch parameters on fresh creates.
+	if _, err := os.Stat(filepath.Join(vm.dir, artifacts.OCILaunchFileName)); err == nil {
+		if err := api(vm.socket, "PUT", "/drives/"+artifacts.OCILaunchDriveID, map[string]any{
+			"drive_id":       artifacts.OCILaunchDriveID,
+			"path_on_host":   artifacts.OCILaunchFileName,
+			"is_root_device": false,
+			"is_read_only":   true,
+		}); err != nil {
+			return fmt.Errorf("attach OCI launch placeholder drive: %w", err)
+		}
+	}
 	if err := api(vm.socket, "PUT", "/network-interfaces/eth0", map[string]any{
 		"iface_id":      "eth0",
 		"host_dev_name": buildTap,
@@ -414,7 +426,15 @@ func prepareOCIDrivePlaceholder(workdir string) error {
 	if err := file.Truncate(artifacts.OCIDrivePlaceholderBytes); err != nil {
 		return fmt.Errorf("size OCI placeholder drive: %w", err)
 	}
-	klog.InfoS("attaching OCI placeholder drive", "path", path, "bytes", artifacts.OCIDrivePlaceholderBytes)
+	placeholder, err := artifacts.EncodeOCILaunch(artifacts.OCILaunch{})
+	if err != nil {
+		return err
+	}
+	launchPath := filepath.Join(workdir, artifacts.OCILaunchFileName)
+	if err := os.WriteFile(launchPath, placeholder, 0o644); err != nil { //nolint:gosec // zero placeholder, no secrets
+		return fmt.Errorf("create OCI launch placeholder drive: %w", err)
+	}
+	klog.InfoS("attaching OCI placeholder drives", "image", path, "launch", launchPath)
 	return nil
 }
 
