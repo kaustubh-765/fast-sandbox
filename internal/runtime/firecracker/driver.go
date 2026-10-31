@@ -303,6 +303,11 @@ func (d *Driver) gcImageCache() {
 	if len(removed) > 0 {
 		klog.InfoS("firecracker image cache GC removed unreferenced images", "digests", removed)
 	}
+	if d.ociDisks != nil && d.ociDisks.obd != nil {
+		if released := d.ociDisks.obd.sweep(context.Background(), time.Now()); len(released) > 0 {
+			klog.InfoS("released orphaned OverlayBD OCI drive devices", "sandboxIDs", released)
+		}
+	}
 	// The converted-disk cache is node-wide like the image cache, and the
 	// references it honours are read from the whole StateRoot, so every
 	// Fastlet collects it: a node whose OCI-drive Fastlet moved away must
@@ -561,6 +566,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		if ociLaunch, err = ociLaunchFromSpec(spec); err != nil {
 			return nil, err
 		}
+		if ociDrive != nil && ociDrive.Format == artifacts.OCIDriveFormatOverlayBD {
+			ociLaunch.ImageConfig = ociDrive.Config
+		}
 	}
 
 	directory, err := ensureSandboxDir(stateRoot, identity.SandboxUID)
@@ -717,7 +725,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		if jailRoot != "" {
 			vmDir = jailRoot
 		}
-		if err := placeOCIDrive(vmDir, ociDisk); err != nil {
+		if err := d.placeOCIDriveFor(ctx, vmDir, identity.SandboxUID, ociDrive, ociDisk); err != nil {
 			releaseSlot()
 			return nil, err
 		}
@@ -1357,7 +1365,7 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// otherwise descend into the SHARED spill root and delete other
 	// sandboxes' dumps.
 	_ = unmountPath(filepath.Join(root, jailerSpillDirName))
-	for _, target := range []string{"rootfs.dev", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
+	for _, target := range []string{"rootfs.dev", artifacts.OCIDriveFileName, filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
 	if err := os.RemoveAll(filepath.Dir(root)); err != nil {

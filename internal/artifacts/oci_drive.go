@@ -31,14 +31,48 @@ const (
 	OCIDriveImageLabelValue = "oci"
 )
 
+// OCIDriveFormatOverlayBD marks a drive served by the node's OverlayBD ublk
+// daemon from per-layer OverlayBD blobs in a registry, instead of an ext4
+// disk converted on the node (the default, empty format). Every node can
+// attach it without converting: blocks are fetched on first read.
+const OCIDriveFormatOverlayBD = "overlaybd"
+
 // OCIDrive identifies the converted image disk attached to a Sandbox.
 type OCIDrive struct {
 	// Image is the reference the Sandbox asked for.
 	Image string `json:"image"`
 	// Digest is the resolved linux/amd64 image manifest digest.
 	Digest string `json:"digest"`
-	// DiskKey addresses the converted disk in the node cache.
+	// DiskKey addresses the converted disk in the node cache. For an
+	// OverlayBD drive it is the hex of the OverlayBD manifest digest.
 	DiskKey string `json:"diskKey"`
+	// Format is empty (ext4 disk on the node) or OCIDriveFormatOverlayBD.
+	Format string `json:"format,omitempty"`
+	// Repository is the registry/repository the OverlayBD layers are read
+	// from over plain HTTP, e.g. "oci-zot.oci-poc.svc:5000/library/python".
+	Repository string `json:"repository,omitempty"`
+	// Lowers are the OverlayBD layers, bottom first.
+	Lowers []OCIDriveLayer `json:"lowers,omitempty"`
+	// Config is the image config an OverlayBD drive cannot carry in its
+	// filesystem; the guest receives it through the launch drive.
+	Config *OCIImageConfig `json:"config,omitempty"`
+}
+
+// OCIDriveLayer is one OverlayBD layer blob.
+type OCIDriveLayer struct {
+	Digest string `json:"digest"`
+	Size   int64  `json:"size"`
+}
+
+// OCIImageConfig is the part of an OCI image config the guest agent needs to
+// start the container. Field names follow the image config so the guest can
+// read it like /.fsb-oci/image-config.json's "config" object.
+type OCIImageConfig struct {
+	Env        []string `json:"Env,omitempty"`
+	Entrypoint []string `json:"Entrypoint,omitempty"`
+	Cmd        []string `json:"Cmd,omitempty"`
+	WorkingDir string   `json:"WorkingDir,omitempty"`
+	User       string   `json:"User,omitempty"`
 }
 
 // Validate rejects an incomplete or path-unsafe record.
@@ -46,13 +80,36 @@ func (d OCIDrive) Validate() error {
 	if strings.TrimSpace(d.Image) == "" {
 		return fmt.Errorf("OCI drive image is required")
 	}
-	if !strings.HasPrefix(d.Digest, "sha256:") || !validHex(strings.TrimPrefix(d.Digest, "sha256:")) {
+	if !validDigest(d.Digest) {
 		return fmt.Errorf("OCI drive digest %q is not a sha256 digest", d.Digest)
 	}
 	if !validHex(d.DiskKey) {
 		return fmt.Errorf("OCI drive disk key %q is not a sha256 hex key", d.DiskKey)
 	}
-	return nil
+	switch d.Format {
+	case "":
+		return nil
+	case OCIDriveFormatOverlayBD:
+		if d.Repository == "" || strings.Contains(d.Repository, "://") || strings.ContainsAny(d.Repository, " \t\n?#@") ||
+			!strings.Contains(d.Repository, "/") {
+			return fmt.Errorf("OCI drive repository %q is not a registry/repository", d.Repository)
+		}
+		if len(d.Lowers) == 0 {
+			return fmt.Errorf("OverlayBD OCI drive has no layers")
+		}
+		for _, layer := range d.Lowers {
+			if !validDigest(layer.Digest) || layer.Size <= 0 {
+				return fmt.Errorf("OverlayBD OCI drive layer %q (size %d) is invalid", layer.Digest, layer.Size)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown OCI drive format %q", d.Format)
+	}
+}
+
+func validDigest(value string) bool {
+	return strings.HasPrefix(value, "sha256:") && validHex(strings.TrimPrefix(value, "sha256:"))
 }
 
 func validHex(value string) bool {
@@ -83,11 +140,14 @@ type OCILaunch struct {
 	Env        map[string]string `json:"env,omitempty"`
 	WorkingDir string            `json:"workingDir,omitempty"`
 	User       string            `json:"user,omitempty"`
+	// ImageConfig carries the image defaults for drives whose filesystem
+	// holds no /.fsb-oci metadata (OverlayBD).
+	ImageConfig *OCIImageConfig `json:"imageConfig,omitempty"`
 }
 
 // Empty reports whether the launch keeps every image default.
 func (l OCILaunch) Empty() bool {
-	return len(l.Entrypoint) == 0 && len(l.Env) == 0 && l.WorkingDir == "" && l.User == ""
+	return len(l.Entrypoint) == 0 && len(l.Env) == 0 && l.WorkingDir == "" && l.User == "" && l.ImageConfig == nil
 }
 
 // EncodeOCILaunch renders the drive content: magic, the decimal payload
