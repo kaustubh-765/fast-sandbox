@@ -281,3 +281,37 @@ func TestWaitForOCIContainer(t *testing.T) {
 	err = waitForOCIContainer(context.Background(), "127.0.0.1", 300*time.Millisecond)
 	require.ErrorContains(t, err, "not ready")
 }
+
+func TestOCILaunchFromSpecAndPlacement(t *testing.T) {
+	spec := fastletapi.SandboxSpec{Env: map[string]string{
+		OCILaunchEntrypointEnv: `["python3","-m","http.server","8080"]`,
+		OCILaunchEnvEnv:        `{"FOO":"bar"}`,
+		OCILaunchWorkdirEnv:    "/tmp",
+		OCILaunchUserEnv:       "nobody",
+	}}
+	launch, err := ociLaunchFromSpec(spec)
+	require.NoError(t, err)
+	require.Equal(t, []string{"python3", "-m", "http.server", "8080"}, launch.Entrypoint)
+	require.Equal(t, "bar", launch.Env["FOO"])
+
+	dir := t.TempDir()
+	require.NoError(t, placeOCILaunch(dir, launch))
+	content, err := os.ReadFile(filepath.Join(dir, artifacts.OCILaunchFileName))
+	require.NoError(t, err)
+	require.Len(t, content, artifacts.OCILaunchDriveBytes)
+	decoded, err := artifacts.DecodeOCILaunch(content)
+	require.NoError(t, err)
+	require.Equal(t, launch, decoded)
+
+	// A restore gets the zero placeholder of the same size.
+	require.NoError(t, placeOCILaunch(dir, artifacts.OCILaunch{}))
+	content, err = os.ReadFile(filepath.Join(dir, artifacts.OCILaunchFileName))
+	require.NoError(t, err)
+	require.Len(t, content, artifacts.OCILaunchDriveBytes)
+	empty, err := artifacts.DecodeOCILaunch(content)
+	require.NoError(t, err)
+	require.True(t, empty.Empty())
+
+	_, err = ociLaunchFromSpec(fastletapi.SandboxSpec{Env: map[string]string{OCILaunchEntrypointEnv: "python3 -m"}})
+	require.ErrorIs(t, err, ErrInvalidConfig)
+}

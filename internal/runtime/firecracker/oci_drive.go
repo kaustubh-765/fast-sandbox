@@ -47,6 +47,13 @@ const (
 	ociDriveMirrorEnv = "FAST_SANDBOX_OCI_DOCKERHUB_MIRROR"
 	// OCIDriveImageEnv is the Sandbox env key that carries the image to run.
 	OCIDriveImageEnv = "FSB_OCI_IMAGE"
+	// Sandbox env keys carrying launch overrides for the image's container
+	// (written to the launch drive on a fresh create): a JSON argv, a JSON
+	// string map, a directory, and a user ("name", "uid" or "uid:gid").
+	OCILaunchEntrypointEnv = "FSB_OCI_ENTRYPOINT"
+	OCILaunchEnvEnv        = "FSB_OCI_ENV"
+	OCILaunchWorkdirEnv    = "FSB_OCI_WORKDIR"
+	OCILaunchUserEnv       = "FSB_OCI_USER"
 
 	ociDiskCacheDir = "oci-disks"
 	ociDiskName     = "disk.img"
@@ -583,6 +590,40 @@ func waitForOCIContainer(ctx context.Context, address string, timeout time.Durat
 		case <-time.After(ociReadyPoll):
 		}
 	}
+}
+
+// ociLaunchFromSpec builds the launch overrides of a fresh create from the
+// Sandbox env, validating that they fit on the launch drive.
+func ociLaunchFromSpec(spec fastletapi.SandboxSpec) (artifacts.OCILaunch, error) {
+	var launch artifacts.OCILaunch
+	if raw := strings.TrimSpace(spec.Env[OCILaunchEntrypointEnv]); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &launch.Entrypoint); err != nil {
+			return launch, fmt.Errorf("%w: %s must be a JSON array of strings: %w", ErrInvalidConfig, OCILaunchEntrypointEnv, err)
+		}
+	}
+	if raw := strings.TrimSpace(spec.Env[OCILaunchEnvEnv]); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &launch.Env); err != nil {
+			return launch, fmt.Errorf("%w: %s must be a JSON object of strings: %w", ErrInvalidConfig, OCILaunchEnvEnv, err)
+		}
+	}
+	launch.WorkingDir = strings.TrimSpace(spec.Env[OCILaunchWorkdirEnv])
+	launch.User = strings.TrimSpace(spec.Env[OCILaunchUserEnv])
+	if _, err := artifacts.EncodeOCILaunch(launch); err != nil {
+		return launch, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	return launch, nil
+}
+
+// placeOCILaunch writes the launch drive into the VMM working directory: the
+// Sandbox's launch overrides on a fresh create, a zero placeholder otherwise.
+func placeOCILaunch(dir string, launch artifacts.OCILaunch) error {
+	content, err := artifacts.EncodeOCILaunch(launch)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(dir, artifacts.OCILaunchFileName)
+	_ = os.Remove(target)
+	return os.WriteFile(target, content, 0o444) //nolint:gosec // read-only drive image, no secrets beyond the Sandbox's own env
 }
 
 func fileExists(path string) bool {
