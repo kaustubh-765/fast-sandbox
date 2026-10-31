@@ -26,6 +26,23 @@ type fakeUblkd struct {
 	next    int
 	devices map[int]string // dev_id -> config path
 	fail    bool
+	// inflight/maxInflight count overlapping control requests.
+	inflight, maxInflight int
+	delay                 time.Duration
+}
+
+func (f *fakeUblkd) enter() func() {
+	f.mu.Lock()
+	f.inflight++
+	f.maxInflight = max(f.maxInflight, f.inflight)
+	delay := f.delay
+	f.mu.Unlock()
+	time.Sleep(delay)
+	return func() {
+		f.mu.Lock()
+		f.inflight--
+		f.mu.Unlock()
+	}
 }
 
 func startFakeUblkd(t *testing.T) (*fakeUblkd, string) {
@@ -40,6 +57,7 @@ func startFakeUblkd(t *testing.T) (*fakeUblkd, string) {
 	fake := &fakeUblkd{devices: map[int]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/add", func(w http.ResponseWriter, r *http.Request) {
+		defer fake.enter()()
 		var request map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&request)
 		fake.mu.Lock()
@@ -58,6 +76,7 @@ func startFakeUblkd(t *testing.T) (*fakeUblkd, string) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dev_id": id, "dev": "/dev/ublkb" + string(rune('0'+id))})
 	})
 	mux.HandleFunc("/v1/del", func(w http.ResponseWriter, r *http.Request) {
+		defer fake.enter()()
 		var request map[string]int
 		_ = json.NewDecoder(r.Body).Decode(&request)
 		fake.mu.Lock()
@@ -236,4 +255,35 @@ func TestOBDReleaseDoesNotWaitWithoutHolders(t *testing.T) {
 	started := time.Now()
 	manager.waitClosed(context.Background(), "sandbox-a", "/dev/ublkb-missing")
 	require.Less(t, time.Since(started), time.Second)
+}
+
+// ublkd must never see an add overlapping a delete: concurrent creates and
+// teardowns are serialized through the node-wide control lock.
+func TestOBDControlRequestsAreSerialized(t *testing.T) {
+	fake, socket := startFakeUblkd(t)
+	fake.delay = 20 * time.Millisecond
+	manager := newOBDManagerAt(t.TempDir(), socket, "")
+	ctx := context.Background()
+	for i := range 4 {
+		_, err := manager.attach(ctx, "warm-"+string(rune('a'+i)), testOBDDrive())
+		require.NoError(t, err)
+	}
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, manager.release(ctx, "warm-"+string(rune('a'+i))))
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := manager.attach(ctx, "new-"+string(rune('a'+i)), testOBDDrive())
+			require.NoError(t, err)
+		}()
+	}
+	wg.Wait()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, 1, fake.maxInflight, "add and del requests overlapped")
+	require.Len(t, fake.devices, 4)
 }

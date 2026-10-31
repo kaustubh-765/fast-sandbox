@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -48,6 +49,15 @@ const (
 	// bounded synchronous delete, which was seen to crash the daemon.
 	ociOBDCloseWait = 10 * time.Second
 	ociOBDClosePoll = 50 * time.Millisecond
+	// ociOBDControlLock serializes ublkd add/del node-wide (all Fastlets on
+	// a node share StateRoot). ublkd handles control requests concurrently,
+	// and an add racing the bounded synchronous delete of the device number
+	// it is about to reuse crashes the daemon (kernels without
+	// UBLK_CMD_DEL_DEV_ASYNC).
+	ociOBDControlLock = "oci-obd/ublkd-control.lock"
+	// ociOBDGoneWait bounds how long a delete waits, still holding the
+	// control lock, for the kernel to remove the block device.
+	ociOBDGoneWait = 5 * time.Second
 )
 
 // obdConfig is the overlaybd device config (config.v1.json): read-only, so
@@ -196,7 +206,14 @@ func (m *obdManager) attach(ctx context.Context, id string, drive artifacts.OCID
 		Dev   string `json:"dev"`
 		Error string `json:"error"`
 	}
-	if err := m.call(ctx, http.MethodPost, "/v1/add", map[string]string{"config": configPath}, &added); err != nil {
+	unlock, err := m.lockControl()
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	err = m.call(ctx, http.MethodPost, "/v1/add", map[string]string{"config": configPath}, &added)
+	unlock()
+	if err != nil {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("attach OverlayBD drive %s: %w", drive.Image, err)
 	}
@@ -209,7 +226,7 @@ func (m *obdManager) attach(ctx context.Context, id string, drive artifacts.OCID
 		err = os.WriteFile(filepath.Join(dir, ociOBDDeviceName), record, 0o600)
 	}
 	if err != nil {
-		_ = m.del(context.Background(), added.DevID)
+		_ = m.del(context.Background(), added.DevID, added.Dev)
 		_ = os.RemoveAll(dir)
 		return "", err
 	}
@@ -236,7 +253,7 @@ func (m *obdManager) release(ctx context.Context, id string) error {
 		return os.RemoveAll(dir)
 	}
 	m.waitClosed(ctx, id, device.Dev)
-	if err := m.del(ctx, device.DevID); err != nil {
+	if err := m.del(ctx, device.DevID, device.Dev); err != nil {
 		return fmt.Errorf("release OverlayBD drive of sandbox %s: %w", id, err)
 	}
 	return os.RemoveAll(dir)
@@ -262,13 +279,43 @@ func (m *obdManager) waitClosed(ctx context.Context, id, dev string) {
 	}
 }
 
-// del removes a ublkd device; one the daemon no longer knows is gone.
-func (m *obdManager) del(ctx context.Context, devID int) error {
+// lockControl takes the node-wide ublkd control lock.
+func (m *obdManager) lockControl() (func(), error) {
+	path := filepath.Join(m.stateRoot, ociOBDControlLock)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("lock ublkd control: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		file.Close()
+	}, nil
+}
+
+// del removes a ublkd device; one the daemon no longer knows is gone. It
+// holds the control lock until the kernel has removed dev, so no add can
+// reuse the device number while the delete is still in progress.
+func (m *obdManager) del(ctx context.Context, devID int, dev string) error {
+	unlock, err := m.lockControl()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var answer struct {
 		OK    bool   `json:"ok"`
 		Error string `json:"error"`
 	}
-	err := m.call(ctx, http.MethodPost, "/v1/del", map[string]int{"dev_id": devID}, &answer)
+	err = m.call(ctx, http.MethodPost, "/v1/del", map[string]int{"dev_id": devID}, &answer)
+	if err == nil && answer.OK {
+		waitDeviceGone(dev, ociOBDGoneWait)
+	}
 	var status *ublkdStatusError
 	if errors.As(err, &status) && status.code == http.StatusNotFound {
 		return nil
@@ -280,6 +327,25 @@ func (m *obdManager) del(ctx context.Context, devID int) error {
 		return fmt.Errorf("ublkd: %s", answer.Error)
 	}
 	return nil
+}
+
+// waitDeviceGone waits until the kernel no longer lists dev's block device.
+func waitDeviceGone(dev string, timeout time.Duration) {
+	if !strings.HasPrefix(dev, "/dev/ublkb") {
+		return
+	}
+	sys := filepath.Join("/sys/block", filepath.Base(dev))
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(sys); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if time.Now().After(deadline) {
+			klog.InfoS("ublk block device still present after delete", "dev", dev, "waited", timeout)
+			return
+		}
+		time.Sleep(ociOBDClosePoll)
+	}
 }
 
 // sweep releases devices whose Sandbox no longer has a state directory on
