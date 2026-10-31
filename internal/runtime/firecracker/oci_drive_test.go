@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -248,4 +250,34 @@ func TestOCIDeliverParksThenReportsFailureOnce(t *testing.T) {
 	status, err = manager.deliver(broken)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status, "a new attempt starts after the failure was reported")
+}
+
+// The create waits until execd in the attached image's container answers;
+// a container that never starts fails the create instead of reporting a
+// false ready.
+func TestWaitForOCIContainer(t *testing.T) {
+	ready := make(chan struct{})
+	listener, err := net.Listen("tcp", "127.0.0.1:"+ociExecdPort)
+	if err != nil {
+		t.Skipf("execd port %s is busy on this host: %v", ociExecdPort, err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-ready:
+			writer.WriteHeader(http.StatusOK)
+		default:
+			writer.WriteHeader(http.StatusServiceUnavailable)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	time.AfterFunc(200*time.Millisecond, func() { close(ready) })
+	started := time.Now()
+	require.NoError(t, waitForOCIContainer(context.Background(), "127.0.0.1", 5*time.Second))
+	require.GreaterOrEqual(t, time.Since(started), 150*time.Millisecond)
+
+	require.NoError(t, server.Close())
+	err = waitForOCIContainer(context.Background(), "127.0.0.1", 300*time.Millisecond)
+	require.ErrorContains(t, err, "not ready")
 }

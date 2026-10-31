@@ -90,6 +90,15 @@ type Driver struct {
 	// in memory: the GC evicts by this instead of filesystem timestamps.
 	// Guarded by mu.
 	imageUseCount map[string]int64
+	// pinnedImages (warm images) and recentImages (last pull/boot/delivery)
+	// are published node-wide so other Fastlets' GC keeps them (pins.go).
+	pinnedImages map[string]struct{}
+	recentImages map[string]time.Time
+	// pinSignature/pinPublishedAt suppress redundant pin-file rewrites;
+	// pinsClosed stops publishing after Close.
+	pinSignature   string
+	pinPublishedAt time.Time
+	pinsClosed     bool
 	// imageDeliveries tracks the asynchronous artifact delivery of images
 	// requested by DeliverImage (image_delivery.go). The map itself is
 	// guarded by mu; each tracker has its own mutex.
@@ -148,7 +157,7 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
 		checkStorage:         checkStateRootStorage,
 		imageGCInterval:      imageGCInterval(),
-		imageCacheLimitBytes: defaultImageCacheLimitBytes,
+		imageCacheLimitBytes: imageCacheLimitBytes(),
 	}, nil
 }
 
@@ -210,6 +219,7 @@ func (d *Driver) touchImage(image string) {
 		d.imageUseCount[imageKey(image)]++
 	}
 	d.mu.Unlock()
+	d.noteImageUse(image)
 }
 
 // TriggerImageGC requests an out-of-band collection from the independent GC
@@ -262,11 +272,20 @@ func (d *Driver) gcImageCache() {
 		useCount[digest] = uses
 	}
 	limitBytes := d.imageCacheLimitBytes
+	interval := d.imageGCInterval
 	d.mu.RUnlock()
 	if limitBytes <= 0 {
 		limitBytes = defaultImageCacheLimitBytes
 	}
-	removed, err := garbageCollectImages(stateRoot, limitBytes, useCount)
+	// Refresh this Fastlet's pins first, then honour every Fastlet's pins:
+	// the cache is shared by all Pools on the node.
+	d.publishImagePins(false)
+	pinned, err := loadNodeImagePins(stateRoot, time.Now(), imagePinTTL(interval))
+	if err != nil {
+		klog.V(2).InfoS("firecracker image cache GC skipped: node pins unreadable", "err", err)
+		return
+	}
+	removed, err := garbageCollectImages(stateRoot, limitBytes, useCount, pinned)
 	if err != nil {
 		klog.V(2).InfoS("firecracker image cache GC skipped", "err", err)
 		return
@@ -823,6 +842,11 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		_, patchSpan := observability.Start(ctx, "fastlet.firecracker.oci_drive")
 		err = client.PatchDrive(ctx, artifacts.OCIDriveID, artifacts.OCIDriveFileName)
 		observability.End(patchSpan, err)
+		if err == nil {
+			// Ready means the image's container answers, not just that the
+			// VM resumed: the guest agent mounts the drive and starts it.
+			err = waitForOCIContainer(ctx, slot.IP, ociReadyTimeout)
+		}
 		if err != nil {
 			d.killAndForget(identity.SandboxUID, process.PID())
 			releaseSlot()
@@ -1092,6 +1116,7 @@ func (d *Driver) Close() error {
 		close(d.gcStop)
 		d.gcStop = nil
 	}
+	d.removeImagePinsLocked()
 	d.agentClient = nil
 	d.sandboxLeases = nil
 	d.initialized = false

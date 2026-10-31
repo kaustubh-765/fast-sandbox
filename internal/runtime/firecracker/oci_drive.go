@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,6 +63,13 @@ const (
 	ociResolveTTL = 10 * time.Minute
 	// ociConvertTimeout bounds one background conversion.
 	ociConvertTimeout = 30 * time.Minute
+	// ociExecdPort is where execd inside the image's container listens; the
+	// OpenSandbox ingress reaches the Sandbox there.
+	ociExecdPort = "44772"
+	// ociReadyTimeout bounds the wait for the container's execd after the
+	// drive is attached; the guest agent normally starts it in ~0.3 s.
+	ociReadyTimeout = 15 * time.Second
+	ociReadyPoll    = 50 * time.Millisecond
 )
 
 var ociDrivePlatform = v1.Platform{OS: "linux", Architecture: "amd64"}
@@ -541,6 +550,39 @@ func (d *Driver) resolveOCIDrive(ctx context.Context, stateRoot, restoreRef stri
 		return nil, "", false, err
 	}
 	return &resolved, path, true, nil
+}
+
+// waitForOCIContainer blocks until execd inside the attached image's
+// container answers GET /ping at address (the Sandbox slot IP, reachable from
+// the Fastlet the same way Infra probes reach it). Without this the create
+// reports ready while the guest agent is still mounting the drive, so the
+// first client health check misses and backs off.
+func waitForOCIContainer(ctx context.Context, address string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	url := "http://" + net.JoinHostPort(address, ociExecdPort) + "/ping"
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
+	var lastErr error
+	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		response, err := client.Do(request)
+		if err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				return nil
+			}
+			err = fmt.Errorf("execd /ping returned %s", response.Status)
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("image container execd at %s not ready after %s: %w", url, timeout, lastErr)
+		case <-time.After(ociReadyPoll):
+		}
+	}
 }
 
 func fileExists(path string) bool {
