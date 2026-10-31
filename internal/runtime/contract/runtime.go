@@ -76,6 +76,15 @@ type ImageDelivery interface {
 	DeliverImage(ctx context.Context, image string) (ImageDeliveryStatus, error)
 }
 
+// SandboxDelivery is the optional runtime extension for fresh creates whose
+// artifacts depend on more than the image reference (for example an OCI image
+// drive requested in the spec env). When implemented it replaces
+// ImageDelivery for fresh creates; the create parks while it reports
+// ImageDelivering.
+type SandboxDelivery interface {
+	DeliverSandbox(ctx context.Context, spec fastletapi.SandboxSpec) (ImageDeliveryStatus, error)
+}
+
 // CheckpointDelivery is the optional runtime extension for restoring a paused
 // Sandbox from an instance-private checkpoint (RestoreSpec) instead of an
 // image index. It mirrors ImageDelivery: the checkpoint artifact set is
