@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -314,4 +315,56 @@ func TestOCILaunchFromSpecAndPlacement(t *testing.T) {
 
 	_, err = ociLaunchFromSpec(fastletapi.SandboxSpec{Env: map[string]string{OCILaunchEntrypointEnv: "python3 -m"}})
 	require.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func seedOCIDiskEntry(t *testing.T, root, digest string, size int, lastUsed time.Time) string {
+	t.Helper()
+	key := ociDiskKey(digest)
+	dir := filepath.Join(root, ociDiskCacheDir, key)
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ociDiskName), bytes.Repeat([]byte{1}, size), 0o444))
+	meta := filepath.Join(dir, ociDiskMetaName)
+	require.NoError(t, os.WriteFile(meta, []byte("{}"), 0o644))
+	require.NoError(t, os.Chtimes(meta, lastUsed, lastUsed))
+	return key
+}
+
+func TestGarbageCollectOCIDisks(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	old := now.Add(-3 * time.Hour)
+	digest := func(b byte) string { return "sha256:" + strings.Repeat(string("0123456789abcdef"[b]), 64) }
+
+	oldest := seedOCIDiskEntry(t, root, digest(1), 64<<10, old.Add(-time.Hour))
+	older := seedOCIDiskEntry(t, root, digest(2), 64<<10, old)
+	recent := seedOCIDiskEntry(t, root, digest(3), 64<<10, now.Add(-10*time.Minute))
+	bySandbox := seedOCIDiskEntry(t, root, digest(4), 64<<10, old.Add(-2*time.Hour))
+	byManifest := seedOCIDiskEntry(t, root, digest(5), 64<<10, old.Add(-2*time.Hour))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ociDiskCacheDir, ".convert-abc-123"), 0o750))
+
+	directory, err := ensureSandboxDir(root, "sbx-1")
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config:   fastletapi.RuntimeSandboxConfig{Spec: fastletapi.SandboxSpec{Image: "tpl-golden"}, Identity: fastletapi.SandboxIdentity{SandboxUID: "sbx-1"}},
+		Phase:    PhaseRunning,
+		OCIDrive: &artifacts.OCIDrive{Image: "x", Digest: digest(4), DiskKey: bySandbox},
+	}))
+	drive := artifacts.OCIDrive{Image: "y", Digest: digest(5), DiskKey: byManifest}
+	writeOCIManifest(t, root, "osb-snap-1", &drive)
+
+	removed, err := garbageCollectOCIDisks(root, 0, now)
+	require.NoError(t, err)
+	require.Equal(t, []string{oldest, older}, removed, "least recently attached first; referenced and recent disks stay")
+	for _, kept := range []string{recent, bySandbox, byManifest} {
+		_, err := os.Stat(filepath.Join(root, ociDiskCacheDir, kept, ociDiskName))
+		require.NoError(t, err)
+	}
+	_, err = os.Stat(filepath.Join(root, ociDiskCacheDir, ".convert-abc-123"))
+	require.NoError(t, err, "in-flight conversions are never touched")
+
+	// Under the limit nothing is removed.
+	seedOCIDiskEntry(t, root, digest(6), 64<<10, old)
+	removed, err = garbageCollectOCIDisks(root, 1<<40, now)
+	require.NoError(t, err)
+	require.Empty(t, removed)
 }

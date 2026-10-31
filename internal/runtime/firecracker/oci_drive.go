@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +79,13 @@ const (
 	// drive is attached; the guest agent normally starts it in ~0.3 s.
 	ociReadyTimeout = 15 * time.Second
 	ociReadyPoll    = 50 * time.Millisecond
+
+	// ociDiskCacheLimitEnv bounds the converted-disk cache (GiB, allocated
+	// bytes); defaultOCIDiskCacheLimitBytes applies otherwise.
+	ociDiskCacheLimitEnv          = "FAST_SANDBOX_OCI_DISK_CACHE_LIMIT_GB"
+	defaultOCIDiskCacheLimitBytes = 50 << 30
+	// ociDiskRecentUse keeps a disk for this long after its last attach.
+	ociDiskRecentUse = time.Hour
 )
 
 var ociDrivePlatform = v1.Platform{OS: "linux", Architecture: "amd64"}
@@ -516,6 +525,9 @@ func placeOCIDrive(dir, disk string) error {
 	target := filepath.Join(dir, artifacts.OCIDriveFileName)
 	_ = os.Remove(target)
 	if disk != "" {
+		// The drive record's mtime is the disk's last use for the cache GC.
+		now := time.Now()
+		_ = os.Chtimes(filepath.Join(filepath.Dir(disk), ociDiskMetaName), now, now)
 		return linkOrCopy(disk, target)
 	}
 	file, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
@@ -624,6 +636,122 @@ func placeOCILaunch(dir string, launch artifacts.OCILaunch) error {
 	target := filepath.Join(dir, artifacts.OCILaunchFileName)
 	_ = os.Remove(target)
 	return os.WriteFile(target, content, 0o444) //nolint:gosec // read-only drive image, no secrets beyond the Sandbox's own env
+}
+
+// ociDiskCacheLimit returns the configured disk-cache limit in bytes.
+func ociDiskCacheLimit() int64 {
+	value := strings.TrimSpace(os.Getenv(ociDiskCacheLimitEnv))
+	if value == "" {
+		return defaultOCIDiskCacheLimitBytes
+	}
+	gib, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || gib <= 0 || gib > 1<<20 {
+		klog.InfoS("ignoring invalid OCI disk cache limit", "env", ociDiskCacheLimitEnv, "value", value)
+		return defaultOCIDiskCacheLimitBytes
+	}
+	return gib << 30
+}
+
+// referencedOCIDisks returns the disk keys a restore could still attach: the
+// drive of every Sandbox on the node and of every cached snapshot manifest.
+func referencedOCIDisks(stateRoot string) (map[string]struct{}, error) {
+	referenced := make(map[string]struct{})
+	directories, err := listSandboxDirs(stateRoot)
+	if err != nil {
+		return nil, err
+	}
+	for _, directory := range directories {
+		state, err := loadState(directory)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("read Sandbox state %s for OCI disk GC: %w", directory, err)
+		}
+		if state.OCIDrive != nil {
+			referenced[state.OCIDrive.DiskKey] = struct{}{}
+		}
+	}
+	manifests, _ := filepath.Glob(filepath.Join(stateRoot, imageCacheDir, "*", "manifest.json"))
+	for _, path := range manifests {
+		payload, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var document struct {
+			OCIDrive *artifacts.OCIDrive `json:"ociDrive"`
+		}
+		if json.Unmarshal(payload, &document) == nil && document.OCIDrive != nil {
+			referenced[document.OCIDrive.DiskKey] = struct{}{}
+		}
+	}
+	return referenced, nil
+}
+
+// garbageCollectOCIDisks keeps the converted-disk cache under limitBytes
+// (allocated bytes). Disks a Sandbox or a cached snapshot references, and
+// disks attached within ociDiskRecentUse, are never removed; the rest go in
+// least-recently-attached order. In-flight conversions live in .convert-*
+// directories and only appear under their key once committed, so they are
+// never candidates. A VM that still has a removed disk attached keeps it
+// through its hard link.
+func garbageCollectOCIDisks(stateRoot string, limitBytes int64, now time.Time) ([]string, error) {
+	referenced, err := referencedOCIDisks(stateRoot)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(stateRoot, ociDiskCacheDir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		key      string
+		bytes    int64
+		lastUsed time.Time
+	}
+	var candidates []candidate
+	total := int64(0)
+	for _, entry := range entries {
+		key := entry.Name()
+		if !entry.IsDir() || !validImageDigest(key) {
+			continue
+		}
+		disk, err := os.Stat(filepath.Join(stateRoot, ociDiskCacheDir, key, ociDiskName))
+		if err != nil {
+			continue
+		}
+		size := allocatedBytes(disk)
+		total += size
+		lastUsed := disk.ModTime()
+		if meta, err := os.Stat(filepath.Join(stateRoot, ociDiskCacheDir, key, ociDiskMetaName)); err == nil {
+			lastUsed = meta.ModTime()
+		}
+		if _, used := referenced[key]; used || now.Sub(lastUsed) < ociDiskRecentUse {
+			continue
+		}
+		candidates = append(candidates, candidate{key: key, bytes: size, lastUsed: lastUsed})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].lastUsed.Equal(candidates[j].lastUsed) {
+			return candidates[i].lastUsed.Before(candidates[j].lastUsed)
+		}
+		return candidates[i].key < candidates[j].key
+	})
+	var removed []string
+	for _, victim := range candidates {
+		if total <= limitBytes {
+			break
+		}
+		if err := os.RemoveAll(filepath.Join(stateRoot, ociDiskCacheDir, victim.key)); err != nil {
+			return removed, err
+		}
+		total -= victim.bytes
+		removed = append(removed, victim.key)
+	}
+	return removed, nil
 }
 
 func fileExists(path string) bool {

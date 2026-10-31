@@ -303,6 +303,17 @@ func (d *Driver) gcImageCache() {
 	if len(removed) > 0 {
 		klog.InfoS("firecracker image cache GC removed unreferenced images", "digests", removed)
 	}
+	d.mu.RLock()
+	disks := d.ociDisks
+	d.mu.RUnlock()
+	if disks != nil {
+		evicted, err := garbageCollectOCIDisks(stateRoot, ociDiskCacheLimit(), time.Now())
+		if err != nil {
+			klog.V(2).InfoS("OCI disk cache GC skipped", "err", err)
+		} else if len(evicted) > 0 {
+			klog.InfoS("OCI disk cache GC removed unreferenced disks", "diskKeys", evicted)
+		}
+	}
 }
 
 func validateConfig(config runtimecatalog.FirecrackerConfig) error {
