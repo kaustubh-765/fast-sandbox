@@ -248,6 +248,9 @@ func readPreparedOCIManifest(ociRoot, id string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(ociRoot, "sandboxes", id, "mnt", snapshotManifestName))
 }
 func (d *Driver) releaseOCI(ctx context.Context, id string) error {
+	if err := d.releaseOCIDriveDevice(ctx, id); err != nil {
+		return err
+	}
 	home := filepath.Join(d.ociRoot(), "sandboxes", id)
 	if _, err := os.Stat(home); errors.Is(err, os.ErrNotExist) {
 		return nil

@@ -107,6 +107,11 @@ type ociDiskManager struct {
 	stateRoot string
 	mirror    string
 	runner    func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// obd attaches OverlayBD drives (always available for restores of
+	// recorded OverlayBD drives); preferOBD makes fresh drives OverlayBD,
+	// falling back to the ext4 conversion when that fails.
+	obd       *obdManager
+	preferOBD bool
 
 	mu       sync.Mutex
 	inflight map[string]*sync.Mutex
@@ -136,6 +141,8 @@ func newOCIDiskManager(stateRoot string) *ociDiskManager {
 		runner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
+		obd:        newOBDManager(stateRoot),
+		preferOBD:  ociOBDPreferred(),
 		inflight:   map[string]*sync.Mutex{},
 		recent:     map[string]ociResolved{},
 		deliveries: map[string]*ociDelivery{},
@@ -204,6 +211,10 @@ func (m *ociDiskManager) cached(image string) (artifacts.OCIDrive, string, bool)
 	if !ok || m.now().Sub(resolved.at) > ociResolveTTL {
 		return artifacts.OCIDrive{}, "", false
 	}
+	if resolved.drive.Format == artifacts.OCIDriveFormatOverlayBD {
+		// Served from the registry; nothing to find on this node.
+		return resolved.drive, "", true
+	}
 	path := m.diskPath(resolved.drive.DiskKey)
 	if !fileExists(path) {
 		return artifacts.OCIDrive{}, "", false
@@ -215,6 +226,16 @@ func (m *ociDiskManager) cached(image string) (artifacts.OCIDrive, string, bool)
 func (m *ociDiskManager) ensure(ctx context.Context, image string) (artifacts.OCIDrive, string, error) {
 	if drive, path, ok := m.cached(image); ok {
 		return drive, path, nil
+	}
+	if m.preferOBD && m.obd != nil {
+		drive, err := m.obd.ensure(ctx, image)
+		if err == nil {
+			m.mu.Lock()
+			m.recent[image] = ociResolved{drive: drive, at: m.now()}
+			m.mu.Unlock()
+			return drive, "", nil
+		}
+		klog.InfoS("OverlayBD OCI drive unavailable; converting an ext4 disk on this node", "image", image, "err", err)
 	}
 	img, drive, err := m.resolve(ctx, image)
 	if err != nil {
@@ -286,6 +307,10 @@ func (d *Driver) DeliverSandbox(ctx context.Context, spec fastletapi.SandboxSpec
 func (m *ociDiskManager) attach(ctx context.Context, drive artifacts.OCIDrive) (string, error) {
 	if err := drive.Validate(); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	if drive.Format == artifacts.OCIDriveFormatOverlayBD {
+		// The device is attached per Sandbox when the drive is placed.
+		return "", nil
 	}
 	if path := m.diskPath(drive.DiskKey); fileExists(path) {
 		return path, nil

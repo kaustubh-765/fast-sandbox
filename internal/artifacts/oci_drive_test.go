@@ -51,3 +51,51 @@ func TestOCILaunchRoundTrip(t *testing.T) {
 		t.Fatal("an out-of-range length must be rejected")
 	}
 }
+
+func TestOCIDriveValidateOverlayBD(t *testing.T) {
+	key := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	layer := OCIDriveLayer{Digest: "sha256:" + key, Size: 4096}
+	valid := OCIDrive{Image: "python:3.12-slim", Digest: "sha256:" + key, DiskKey: key,
+		Format: OCIDriveFormatOverlayBD, Repository: "oci-zot.oci-poc.svc:5000/library/python", Lowers: []OCIDriveLayer{layer}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid OverlayBD drive rejected: %v", err)
+	}
+	mutate := func(change func(*OCIDrive)) OCIDrive {
+		drive := valid
+		drive.Lowers = append([]OCIDriveLayer(nil), valid.Lowers...)
+		change(&drive)
+		return drive
+	}
+	for name, drive := range map[string]OCIDrive{
+		"unknown format":  mutate(func(d *OCIDrive) { d.Format = "erofs" }),
+		"no repository":   mutate(func(d *OCIDrive) { d.Repository = "" }),
+		"url repository":  mutate(func(d *OCIDrive) { d.Repository = "http://zot/library/python" }),
+		"host only":       mutate(func(d *OCIDrive) { d.Repository = "oci-zot:5000" }),
+		"no layers":       mutate(func(d *OCIDrive) { d.Lowers = nil }),
+		"bad layer":       mutate(func(d *OCIDrive) { d.Lowers[0].Digest = "sha256:xyz" }),
+		"empty layer":     mutate(func(d *OCIDrive) { d.Lowers[0].Size = 0 }),
+		"query injection": mutate(func(d *OCIDrive) { d.Repository = "zot:5000/library/python?x=1" }),
+	} {
+		if err := drive.Validate(); err == nil {
+			t.Fatalf("%s: expected rejection", name)
+		}
+	}
+}
+
+func TestOCILaunchCarriesImageConfig(t *testing.T) {
+	config := &OCIImageConfig{Env: []string{"PATH=/usr/bin"}, Cmd: []string{"python3"}, WorkingDir: "/app", User: "app"}
+	if (OCILaunch{ImageConfig: config}).Empty() {
+		t.Fatal("a launch with only an image config is not empty")
+	}
+	drive, err := EncodeOCILaunch(OCILaunch{ImageConfig: config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(drive), `"imageConfig":{"Env":["PATH=/usr/bin"],"Cmd":["python3"],"WorkingDir":"/app","User":"app"}`) {
+		t.Fatalf("image config must keep image-config field names: %q", drive[:200])
+	}
+	decoded, err := DecodeOCILaunch(drive)
+	if err != nil || decoded.ImageConfig == nil || decoded.ImageConfig.WorkingDir != "/app" || decoded.ImageConfig.Cmd[0] != "python3" {
+		t.Fatalf("decode: %+v, %v", decoded, err)
+	}
+}
