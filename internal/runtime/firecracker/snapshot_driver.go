@@ -1407,6 +1407,15 @@ func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string
 	if err != nil {
 		return 0, err
 	}
+	// The OCI image drive is never part of the artifact set: record which
+	// disk the guest has mounted so the restore re-attaches it.
+	delete(document, "ociDrive")
+	if state.OCIDrive != nil {
+		document["ociDrive"], err = json.Marshal(state.OCIDrive)
+		if err != nil {
+			return 0, err
+		}
+	}
 	delete(document, "files")
 	if !isOCI {
 		document["files"], err = json.Marshal(files)

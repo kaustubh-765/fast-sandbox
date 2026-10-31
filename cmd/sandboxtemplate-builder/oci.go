@@ -22,6 +22,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 )
 
 // linuxAMD64 is the fixed target platform of the build (oci2rootfs converts
@@ -31,6 +32,10 @@ var linuxAMD64 = v1.Platform{OS: "linux", Architecture: "amd64"}
 // imageEnvFileName is the workdir file holding the source image's OCI
 // Config.Env, written by the pull stage and merged by the convert stage.
 const imageEnvFileName = "image-config.env"
+
+// ociDriveMarkerName in the workdir enables the OCI placeholder drive for the
+// snapshot stage (see artifacts.OCIDriveImageLabel).
+const ociDriveMarkerName = "oci-drive.enabled"
 
 // writeImageEnv persists the source image's OCI Config.Env for the convert
 // stage. An image without config envs produces an empty file.
@@ -42,6 +47,13 @@ func writeImageEnv(image v1.Image, workdir string) error {
 	if err := os.WriteFile(filepath.Join(workdir, imageEnvFileName),
 		[]byte(strings.Join(config.Config.Env, "\n")+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", imageEnvFileName, err)
+	}
+	// The snapshot stage runs as a separate process; it learns that the
+	// source image asked for the OCI placeholder drive from this marker.
+	if config.Config.Labels[artifacts.OCIDriveImageLabel] == artifacts.OCIDriveImageLabelValue {
+		if err := os.WriteFile(filepath.Join(workdir, ociDriveMarkerName), nil, 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", ociDriveMarkerName, err)
+		}
 	}
 	return nil
 }

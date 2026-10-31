@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	dataplane "fast-sandbox/internal/dataplane/contract"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
@@ -83,6 +84,9 @@ type Driver struct {
 	imageCacheLimitBytes int64
 	gcStop               chan struct{}
 	gcTrigger            chan struct{}
+	// ociDisks converts and caches OCI image drive disks (oci_drive.go); nil
+	// unless the Pool enables FAST_SANDBOX_OCI_DRIVE.
+	ociDisks *ociDiskManager
 	// imageUseCount records how often each cached image was pulled or booted,
 	// in memory: the GC evicts by this instead of filesystem timestamps.
 	// Guarded by mu.
@@ -185,6 +189,10 @@ func (d *Driver) Initialize(ctx context.Context, _ string) error {
 			d.mu.Unlock()
 			return fmt.Errorf("validate Firecracker StateRoot storage: %w", err)
 		}
+	}
+	if ociDriveEnabled() {
+		d.ociDisks = newOCIDiskManager(d.config.StateRoot)
+		klog.InfoS("OCI image drive enabled", "cache", filepath.Join(d.config.StateRoot, ociDiskCacheDir), "dockerHubMirror", d.ociDisks.mirror)
 	}
 	d.initialized = true
 	interval := d.imageGCInterval
@@ -510,6 +518,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 
+	// OCI image drive: resolve, and on first use convert, the image disk
+	// before a directory or network slot is allocated (conversion can take
+	// seconds). The placeholder is used when no image is requested.
+	ociDrive, ociDisk, ociFresh, err := d.resolveOCIDrive(ctx, stateRoot, restoreRef, spec)
+	if err != nil {
+		return nil, err
+	}
+
 	directory, err := ensureSandboxDir(stateRoot, identity.SandboxUID)
 	if err != nil {
 		return nil, err
@@ -657,6 +673,18 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		klog.InfoS("firecracker Create cleanup removed partial sandbox",
 			"sandboxID", identity.SandboxUID, "jailRoot", jailRoot)
 	}()
+	if d.ociDisks != nil && !isOCI {
+		// The drive path baked into the vmstate is relative to the VMM
+		// working directory: the jail root, or the state dir in direct mode.
+		vmDir := directory
+		if jailRoot != "" {
+			vmDir = jailRoot
+		}
+		if err := placeOCIDrive(vmDir, ociDisk); err != nil {
+			releaseSlot()
+			return nil, err
+		}
+	}
 	d.touchImage(restoreRef)
 	rootfsDur := time.Since(rootfsStarted) + ociPrepareDur
 	rootfsMiB := float64(0)
@@ -708,6 +736,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		Phase:      PhaseStarting,
 		APIAddress: apiAddress, CreatedAt: time.Now().Unix(),
 		InfraServices: infraServices, InfraDiagnostics: infraDiagnostics,
+		OCIDrive: ociDrive,
 	}
 	if err := saveState(directory, state); err != nil {
 		releaseSlot()
@@ -795,6 +824,21 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	bootDur := time.Since(bootStarted)
+
+	// A fresh OCI drive replaces the placeholder the golden snapshot was
+	// taken with: tell Firecracker so the guest sees the new disk size,
+	// which is the guest agent's signal to mount it and start the image.
+	// Resumes and snapshot restores already carry the disk size in vmstate.
+	if ociFresh {
+		_, patchSpan := observability.Start(ctx, "fastlet.firecracker.oci_drive")
+		err = client.PatchDrive(ctx, artifacts.OCIDriveID, artifacts.OCIDriveFileName)
+		observability.End(patchSpan, err)
+		if err != nil {
+			d.killAndForget(identity.SandboxUID, process.PID())
+			releaseSlot()
+			return nil, fmt.Errorf("%w: attach OCI image drive: %w", ErrRuntimeNotInitialized, err)
+		}
+	}
 
 	// A resumed checkpoint may carry the egress-owned vault and policy
 	// files: import them into egress here — before EnsureSandbox returns, so

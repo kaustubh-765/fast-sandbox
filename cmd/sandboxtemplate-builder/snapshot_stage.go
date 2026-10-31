@@ -109,6 +109,9 @@ func runSnapshotStage(args []string) error {
 	if err := os.Symlink(rootfs, driveLink); err != nil {
 		return fmt.Errorf("link snapshot drive %s: %w", driveLink, err)
 	}
+	if err := prepareOCIDrivePlaceholder(workdir); err != nil {
+		return err
+	}
 
 	// Stage A: cold boot and wait for guest readiness.
 	bootLog := filepath.Join(workdir, "boot.console.log")
@@ -229,6 +232,7 @@ func runSnapshotStage(args []string) error {
 type vmm struct {
 	socket  string
 	log     string
+	dir     string
 	process *exec.Cmd
 }
 
@@ -251,7 +255,7 @@ func startVMM(socketPath, logPath, workdir string) (*vmm, error) {
 		_ = logFile.Close()
 		return nil, err
 	}
-	vm := &vmm{socket: socketPath, log: logPath, process: command}
+	vm := &vmm{socket: socketPath, log: logPath, dir: workdir, process: command}
 	if err := waitForFile(socketPath, 15*time.Second); err != nil {
 		vm.stop()
 		return nil, err
@@ -383,6 +387,20 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 	}); err != nil {
 		return err
 	}
+	// The OCI placeholder drive is attached only when the snapshot stage
+	// created its backing file (source image label, see writeImageEnv). It
+	// is read-only and never mounted by the golden guest, so the Fastlet can
+	// repoint it at a converted image disk after restore.
+	if _, err := os.Stat(filepath.Join(vm.dir, artifacts.OCIDriveFileName)); err == nil {
+		if err := api(vm.socket, "PUT", "/drives/"+artifacts.OCIDriveID, map[string]any{
+			"drive_id":       artifacts.OCIDriveID,
+			"path_on_host":   artifacts.OCIDriveFileName,
+			"is_root_device": false,
+			"is_read_only":   true,
+		}); err != nil {
+			return fmt.Errorf("attach OCI placeholder drive: %w", err)
+		}
+	}
 	if err := api(vm.socket, "PUT", "/network-interfaces/eth0", map[string]any{
 		"iface_id":      "eth0",
 		"host_dev_name": buildTap,
@@ -397,6 +415,26 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 // refusals surface (the vCPUs are built here).
 func (vm *vmm) start() error {
 	return api(vm.socket, "PUT", "/actions", map[string]string{"action_type": "InstanceStart"})
+}
+
+// prepareOCIDrivePlaceholder creates the fixed-size placeholder backing file
+// of the OCI drive when the source image asked for it. The relative drive path
+// lands in the vmstate; consumers recreate the same file at restore.
+func prepareOCIDrivePlaceholder(workdir string) error {
+	if _, err := os.Stat(filepath.Join(workdir, ociDriveMarkerName)); err != nil {
+		return nil
+	}
+	path := filepath.Join(workdir, artifacts.OCIDriveFileName)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("create OCI placeholder drive: %w", err)
+	}
+	defer file.Close()
+	if err := file.Truncate(artifacts.OCIDrivePlaceholderBytes); err != nil {
+		return fmt.Errorf("size OCI placeholder drive: %w", err)
+	}
+	klog.InfoS("attaching OCI placeholder drive", "path", path, "bytes", artifacts.OCIDrivePlaceholderBytes)
+	return nil
 }
 
 // snapshotDriveName is the RELATIVE drive path baked into the vmstate. It
