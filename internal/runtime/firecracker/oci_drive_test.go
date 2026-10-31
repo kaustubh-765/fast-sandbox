@@ -8,8 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -19,6 +19,7 @@ import (
 
 	"fast-sandbox/internal/artifacts"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 const testOCIDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -39,6 +40,12 @@ func writeOCIManifest(t *testing.T, stateRoot, image string, drive *artifacts.OC
 	path := cachedManifestPath(stateRoot, image)
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
 	require.NoError(t, os.WriteFile(path, raw, 0o644))
+}
+
+func testOCIDiskManager(stateRoot string) *ociDiskManager {
+	manager := newOCIDiskManager(stateRoot)
+	manager.mirror = ""
+	return manager
 }
 
 func seedOCIDisk(t *testing.T, manager *ociDiskManager, key string) string {
@@ -106,7 +113,7 @@ func TestResolveOCIDriveDisabledIsNoop(t *testing.T) {
 // the drive: the recorded disk is re-attached and the spec env is ignored.
 func TestResolveOCIDriveManifestRecordWinsOverEnv(t *testing.T) {
 	stateRoot := t.TempDir()
-	manager := &ociDiskManager{stateRoot: stateRoot, inflight: map[string]*sync.Mutex{}}
+	manager := testOCIDiskManager(stateRoot)
 	recorded := testOCIDrive()
 	disk := seedOCIDisk(t, manager, recorded.DiskKey)
 	writeOCIManifest(t, stateRoot, "osb-snap-1", &recorded)
@@ -125,7 +132,7 @@ func TestResolveOCIDriveManifestRecordWinsOverEnv(t *testing.T) {
 func TestResolveOCIDriveGoldenWithoutImageUsesPlaceholder(t *testing.T) {
 	stateRoot := t.TempDir()
 	writeOCIManifest(t, stateRoot, "tpl-golden", nil)
-	driver := &Driver{ociDisks: &ociDiskManager{stateRoot: stateRoot, inflight: map[string]*sync.Mutex{}}}
+	driver := &Driver{ociDisks: testOCIDiskManager(stateRoot)}
 	drive, disk, fresh, err := driver.resolveOCIDrive(context.Background(), stateRoot, "tpl-golden", fastletapi.SandboxSpec{})
 	require.NoError(t, err)
 	require.Nil(t, drive)
@@ -135,7 +142,7 @@ func TestResolveOCIDriveGoldenWithoutImageUsesPlaceholder(t *testing.T) {
 
 func TestResolveOCIDriveRejectsCorruptRecord(t *testing.T) {
 	stateRoot := t.TempDir()
-	manager := &ociDiskManager{stateRoot: stateRoot, inflight: map[string]*sync.Mutex{}}
+	manager := testOCIDiskManager(stateRoot)
 	_, err := manager.attach(context.Background(), artifacts.OCIDrive{Image: "python", Digest: "sha256:nope", DiskKey: "../escape"})
 	require.ErrorIs(t, err, ErrInvalidConfig)
 }
@@ -201,4 +208,44 @@ func TestExtractImageStaysInsideRoot(t *testing.T) {
 	require.Empty(t, entries, "nothing was written through the symlink on the host")
 	_, err = os.Stat(filepath.Join(parent, "dotdot"))
 	require.True(t, os.IsNotExist(err), "dot-dot names never land above the root")
+}
+
+func TestOCIDeliverReportsCachedDiskWithoutRegistry(t *testing.T) {
+	manager := testOCIDiskManager(t.TempDir())
+	drive := testOCIDrive()
+	seedOCIDisk(t, manager, drive.DiskKey)
+	manager.recent[drive.Image] = ociResolved{drive: drive, at: time.Now()}
+
+	status, err := manager.deliver(drive.Image)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivered, status)
+	got, path, err := manager.ensure(context.Background(), drive.Image)
+	require.NoError(t, err)
+	require.Equal(t, drive, got)
+	require.Equal(t, manager.diskPath(drive.DiskKey), path)
+
+	manager.now = func() time.Time { return time.Now().Add(ociResolveTTL + time.Minute) }
+	_, _, ok := manager.cached(drive.Image)
+	require.False(t, ok, "a stale tag resolution is not reused")
+}
+
+// A conversion runs in the background while the create stays parked; its
+// failure is reported exactly once and the next poll starts a new attempt.
+func TestOCIDeliverParksThenReportsFailureOnce(t *testing.T) {
+	manager := testOCIDiskManager(t.TempDir())
+	const broken = "NOT//a valid reference"
+
+	status, err := manager.deliver(broken)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivering, status)
+	manager.mu.Lock()
+	delivery := manager.deliveries[broken]
+	manager.mu.Unlock()
+	<-delivery.done
+
+	_, err = manager.deliver(broken)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	status, err = manager.deliver(broken)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivering, status, "a new attempt starts after the failure was reported")
 }

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -26,6 +27,7 @@ import (
 
 	"fast-sandbox/internal/artifacts"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 // OCI image drive (artifacts.OCIDriveID). A Pool opts in with
@@ -53,6 +55,12 @@ const (
 	// ociGuestMetaDir holds the image config and drive record inside the
 	// converted disk, next to the image rootfs.
 	ociGuestMetaDir = ".fsb-oci"
+	// ociResolveTTL bounds how long a tag-to-digest resolution is reused, so
+	// warm creates skip the registry round trip without pinning a moving tag
+	// forever.
+	ociResolveTTL = 10 * time.Minute
+	// ociConvertTimeout bounds one background conversion.
+	ociConvertTimeout = 30 * time.Minute
 )
 
 var ociDrivePlatform = v1.Platform{OS: "linux", Architecture: "amd64"}
@@ -77,6 +85,23 @@ type ociDiskManager struct {
 
 	mu       sync.Mutex
 	inflight map[string]*sync.Mutex
+	// recent remembers the drive each image reference last resolved to.
+	recent map[string]ociResolved
+	// deliveries tracks background conversions of parked creates.
+	deliveries map[string]*ociDelivery
+	now        func() time.Time
+}
+
+type ociResolved struct {
+	drive artifacts.OCIDrive
+	at    time.Time
+}
+
+// ociDelivery is one background conversion; err is written before done is
+// closed.
+type ociDelivery struct {
+	done chan struct{}
+	err  error
 }
 
 func newOCIDiskManager(stateRoot string) *ociDiskManager {
@@ -86,7 +111,10 @@ func newOCIDiskManager(stateRoot string) *ociDiskManager {
 		runner: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
-		inflight: map[string]*sync.Mutex{},
+		inflight:   map[string]*sync.Mutex{},
+		recent:     map[string]ociResolved{},
+		deliveries: map[string]*ociDelivery{},
+		now:        time.Now,
 	}
 }
 
@@ -142,14 +170,90 @@ func (m *ociDiskManager) resolve(ctx context.Context, image string) (v1.Image, a
 	return img, drive, nil
 }
 
+// cached returns the disk of a recently resolved image that is present on
+// this node, without contacting the registry.
+func (m *ociDiskManager) cached(image string) (artifacts.OCIDrive, string, bool) {
+	m.mu.Lock()
+	resolved, ok := m.recent[image]
+	m.mu.Unlock()
+	if !ok || m.now().Sub(resolved.at) > ociResolveTTL {
+		return artifacts.OCIDrive{}, "", false
+	}
+	path := m.diskPath(resolved.drive.DiskKey)
+	if !fileExists(path) {
+		return artifacts.OCIDrive{}, "", false
+	}
+	return resolved.drive, path, true
+}
+
 // ensure returns the cached disk of image, converting it on first use.
 func (m *ociDiskManager) ensure(ctx context.Context, image string) (artifacts.OCIDrive, string, error) {
+	if drive, path, ok := m.cached(image); ok {
+		return drive, path, nil
+	}
 	img, drive, err := m.resolve(ctx, image)
 	if err != nil {
 		return artifacts.OCIDrive{}, "", err
 	}
 	path, err := m.convert(ctx, img, drive)
-	return drive, path, err
+	if err != nil {
+		return artifacts.OCIDrive{}, "", err
+	}
+	m.mu.Lock()
+	m.recent[image] = ociResolved{drive: drive, at: m.now()}
+	m.mu.Unlock()
+	return drive, path, nil
+}
+
+// deliver reports whether the disk of image is ready, starting one
+// background conversion per image otherwise. A finished attempt's error is
+// reported once; the next call starts a fresh attempt.
+func (m *ociDiskManager) deliver(image string) (runtimecontract.ImageDeliveryStatus, error) {
+	if _, _, ok := m.cached(image); ok {
+		return runtimecontract.ImageDelivered, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if delivery, ok := m.deliveries[image]; ok {
+		select {
+		case <-delivery.done:
+			delete(m.deliveries, image)
+			if delivery.err != nil {
+				return "", delivery.err
+			}
+			return runtimecontract.ImageDelivered, nil
+		default:
+			return runtimecontract.ImageDelivering, nil
+		}
+	}
+	delivery := &ociDelivery{done: make(chan struct{})}
+	m.deliveries[image] = delivery
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), ociConvertTimeout)
+		defer cancel()
+		_, _, delivery.err = m.ensure(ctx, image)
+		if delivery.err != nil {
+			klog.ErrorS(delivery.err, "OCI drive conversion failed", "image", image)
+		}
+		close(delivery.done)
+	}()
+	return runtimecontract.ImageDelivering, nil
+}
+
+// DeliverSandbox implements runtimecontract.SandboxDelivery: the golden image
+// is delivered like any template, then an OCI image drive requested in the
+// spec env converts in the background, so the create parks instead of
+// running past its deadline.
+func (d *Driver) DeliverSandbox(ctx context.Context, spec fastletapi.SandboxSpec) (runtimecontract.ImageDeliveryStatus, error) {
+	status, err := d.DeliverImage(ctx, spec.Image)
+	if err != nil || status != runtimecontract.ImageDelivered || d.ociDisks == nil {
+		return status, err
+	}
+	image := strings.TrimSpace(spec.Env[OCIDriveImageEnv])
+	if image == "" {
+		return status, nil
+	}
+	return d.ociDisks.deliver(image)
 }
 
 // attach returns the disk recorded by a snapshot. A disk missing from this
