@@ -42,6 +42,12 @@ const (
 	// directory survives before the sweep releases it; it covers the window
 	// between attach and the Sandbox's first state save.
 	ociOBDSweepAge = 10 * time.Minute
+	// ociOBDCloseWait bounds how long release waits for the VMM to close the
+	// device before asking ublkd to delete it anyway. Deleting an open device
+	// makes ublkd (kernels without UBLK_CMD_DEL_DEV_ASYNC) fall back to a
+	// bounded synchronous delete, which was seen to crash the daemon.
+	ociOBDCloseWait = 10 * time.Second
+	ociOBDClosePoll = 50 * time.Millisecond
 )
 
 // obdConfig is the overlaybd device config (config.v1.json): read-only, so
@@ -64,6 +70,8 @@ type obdManager struct {
 	convertdURL string
 	convertd    *http.Client
 	ublkd       *http.Client
+	// procRoot is scanned for processes still holding a device open.
+	procRoot string
 }
 
 func newOBDManager(stateRoot string) *obdManager {
@@ -75,6 +83,7 @@ func newOBDManagerAt(stateRoot, socket, convertdURL string) *obdManager {
 	return &obdManager{
 		stateRoot:   stateRoot,
 		convertdURL: convertdURL,
+		procRoot:    "/proc",
 		convertd:    &http.Client{Timeout: ociConvertTimeout},
 		ublkd: &http.Client{
 			Timeout: 2 * time.Minute,
@@ -226,10 +235,31 @@ func (m *obdManager) release(ctx context.Context, id string) error {
 		klog.InfoS("dropping unreadable OverlayBD device record", "sandboxID", id, "err", err)
 		return os.RemoveAll(dir)
 	}
+	m.waitClosed(ctx, id, device.Dev)
 	if err := m.del(ctx, device.DevID); err != nil {
 		return fmt.Errorf("release OverlayBD drive of sandbox %s: %w", id, err)
 	}
 	return os.RemoveAll(dir)
+}
+
+// waitClosed waits until no process holds dev open, up to ociOBDCloseWait.
+func (m *obdManager) waitClosed(ctx context.Context, id, dev string) {
+	started := time.Now()
+	deadline := started.Add(ociOBDCloseWait)
+	for {
+		holders := deviceOpenBy(m.procRoot, dev)
+		if len(holders) == 0 {
+			if waited := time.Since(started); waited > ociOBDClosePoll {
+				klog.InfoS("OverlayBD device closed before release", "sandboxID", id, "dev", dev, "waited", waited)
+			}
+			return
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			klog.InfoS("OverlayBD device still open at release; deleting anyway", "sandboxID", id, "dev", dev, "holders", holders)
+			return
+		}
+		time.Sleep(ociOBDClosePoll)
+	}
 }
 
 // del removes a ublkd device; one the daemon no longer knows is gone.
