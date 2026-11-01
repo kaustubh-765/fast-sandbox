@@ -13,8 +13,16 @@ chmod 0700 "$socket_dir"
 exec 9>"$socket_dir/daemon.lock"
 flock -n 9 || { echo 'another node ublkd owns the socket/cache' >&2; exit 1; }
 rm -f "$socket_dir/ublkd.sock"
-# Anonymous registry access (in-cluster Zot); keep an existing file.
-[ -s "$socket_dir/cred.json" ] || echo '{"auths":{}}' >"$socket_dir/cred.json"
+# Registry credentials: overlaybd's cred.json from the mounted Secret
+# (FAST_SANDBOX_REGISTRY_CRED, refreshed on every start); without one keep
+# an existing file, else anonymous access.
+registry_cred=${FAST_SANDBOX_REGISTRY_CRED:-/etc/fast-sandbox/registry/cred.json}
+if [ -s "$registry_cred" ]; then
+  install -m 0600 "$registry_cred" "$socket_dir/cred.json.tmp"
+  mv -f "$socket_dir/cred.json.tmp" "$socket_dir/cred.json"
+elif [ ! -s "$socket_dir/cred.json" ]; then
+  echo '{"auths":{}}' >"$socket_dir/cred.json"
+fi
 cat > "$socket_dir/service.json" <<EOF_JSON
 {
   "logConfig": {"logLevel": 1, "logPath": "/dev/stdout"},
