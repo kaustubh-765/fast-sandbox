@@ -23,9 +23,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -71,6 +74,11 @@ type server struct {
 	vsizeGiB  int
 	run       runner
 	slots     chan struct{}
+	// username/password authenticate to the registry (empty: anonymous).
+	username, password string
+	// lock is the cluster-wide conversion lock; nil when this is the only
+	// replica.
+	lock lockFunc
 
 	mu       sync.Mutex
 	inflight map[string]*conversion
@@ -110,6 +118,15 @@ func repository(image string) (name.Reference, string, error) {
 	return reference, reference.Context().RepositoryStr(), nil
 }
 
+// remoteOptions are the registry options of every read.
+func (s *server) remoteOptions(ctx context.Context, extra ...remote.Option) []remote.Option {
+	options := []remote.Option{remote.WithContext(ctx)}
+	if s.username != "" {
+		options = append(options, remote.WithAuth(&authn.Basic{Username: s.username, Password: s.password}))
+	}
+	return append(options, extra...)
+}
+
 func (s *server) local(repo, identifier string) (name.Reference, error) {
 	separator := ":"
 	if strings.HasPrefix(identifier, "sha256:") {
@@ -128,7 +145,7 @@ func (s *server) ensure(ctx context.Context, image string) (*ensureResponse, err
 	if err != nil {
 		return nil, &requestError{http.StatusBadRequest, err}
 	}
-	descriptor, err := remote.Get(source, remote.WithContext(ctx), remote.WithPlatform(amd64))
+	descriptor, err := remote.Get(source, s.remoteOptions(ctx, remote.WithPlatform(amd64))...)
 	if err != nil {
 		return nil, &requestError{http.StatusBadGateway, fmt.Errorf("resolve %s: %w", image, err)}
 	}
@@ -149,13 +166,13 @@ func (s *server) ensure(ctx context.Context, image string) (*ensureResponse, err
 		return nil, err
 	}
 	converted := false
-	obd, err := remote.Get(target, remote.WithContext(ctx))
+	obd, err := remote.Get(target, s.remoteOptions(ctx)...)
 	if err != nil {
-		if err := s.convert(ctx, repo, digest); err != nil {
+		if err := s.convert(ctx, repo, digest, target); err != nil {
 			return nil, &requestError{http.StatusBadGateway, err}
 		}
 		converted = true
-		if obd, err = remote.Get(target, remote.WithContext(ctx)); err != nil {
+		if obd, err = remote.Get(target, s.remoteOptions(ctx)...); err != nil {
 			return nil, &requestError{http.StatusBadGateway, fmt.Errorf("read converted %s: %w", target, err)}
 		}
 	}
@@ -181,9 +198,11 @@ func (s *server) ensure(ctx context.Context, image string) (*ensureResponse, err
 }
 
 // convert runs the convertor once per source manifest, however many
-// requests wait for it, with at most cap(slots) conversions at a time. A
+// requests wait for it, with at most cap(slots) conversions at a time. With a
+// cluster lock, replicas convert one source manifest one at a time and a
+// replica that finds target already pushed by another skips the run. A
 // failed attempt is not remembered: the next request retries.
-func (s *server) convert(ctx context.Context, repo string, digest v1.Hash) error {
+func (s *server) convert(ctx context.Context, repo string, digest v1.Hash, target name.Reference) error {
 	key := repo + "@" + digest.String()
 	s.mu.Lock()
 	if running, ok := s.inflight[key]; ok {
@@ -207,21 +226,38 @@ func (s *server) convert(ctx context.Context, repo string, digest v1.Hash) error
 			s.mu.Unlock()
 			close(running.done)
 		}()
-		s.slots <- struct{}{}
-		defer func() { <-s.slots }()
 		convertCtx, cancel := context.WithTimeout(context.Background(), maxConvert)
 		defer cancel()
+		if s.lock != nil {
+			unlock, err := s.lock(convertCtx, key)
+			if err != nil {
+				running.err = err
+				return
+			}
+			defer unlock()
+			if _, err := remote.Head(target, s.remoteOptions(convertCtx)...); err == nil {
+				log.Printf("%s was converted by another replica", key)
+				return
+			}
+		}
+		s.slots <- struct{}{}
+		defer func() { <-s.slots }()
 		dir := filepath.Join(s.workDir, digest.Hex)
 		_ = os.RemoveAll(dir)
 		defer os.RemoveAll(dir)
 		started := time.Now()
-		output, err := s.run(convertCtx, s.convertor,
-			"--repository", s.registry+"/"+repo,
+		args := []string{
+			"--repository", s.registry + "/" + repo,
 			"--input-digest", digest.String(),
-			"--overlaybd", obdTagPrefix+digest.Hex,
+			"--overlaybd", obdTagPrefix + digest.Hex,
 			"--plain", "--oci", "--mkfs",
 			"--vsize", strconv.Itoa(s.vsizeGiB),
-			"--dir", dir)
+			"--dir", dir,
+		}
+		if s.username != "" {
+			args = append(args, "--username", s.username+":"+s.password)
+		}
+		output, err := s.run(convertCtx, s.convertor, args...)
 		if err != nil {
 			running.err = fmt.Errorf("convert %s: %w: %s", key, err, lastLines(output, 5))
 			log.Printf("conversion failed: %v", running.err)
@@ -301,11 +337,26 @@ func main() {
 		vsize, concurrency, func(ctx context.Context, binary string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, binary, args...).CombinedOutput()
 		})
+	s.username, s.password = env("OCI_CONVERTD_USERNAME", ""), os.Getenv("OCI_CONVERTD_PASSWORD")
+	if namespace := env("OCI_CONVERTD_LOCK_NAMESPACE", ""); namespace != "" {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			log.Fatalf("OCI_CONVERTD_LOCK_NAMESPACE needs in-cluster credentials: %v", err)
+		}
+		client, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Fatalf("kubernetes client: %v", err)
+		}
+		hostname, _ := os.Hostname()
+		locker := &leaseLocker{client: client, namespace: namespace, identity: env("POD_NAME", hostname), now: time.Now, poll: leasePoll}
+		s.lock = locker.lock
+		log.Printf("cluster conversion lock: Leases in %s as %s", namespace, locker.identity)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/ensure", s.handleEnsure)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	address := env("OCI_CONVERTD_LISTEN", ":8080")
-	log.Printf("oci-convertd listening on %s, registry %s, %d concurrent conversions", address, registry, concurrency)
+	log.Printf("oci-convertd listening on %s, registry %s (authenticated=%t), %d concurrent conversions", address, registry, s.username != "", concurrency)
 	srv := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }

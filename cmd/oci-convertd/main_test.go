@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -49,7 +50,11 @@ func (f *fakeConvertor) run(ctx context.Context, _ string, args ...string) ([]by
 	if err != nil {
 		return nil, err
 	}
-	return nil, remote.Write(target, img, remote.WithContext(ctx))
+	options := []remote.Option{remote.WithContext(ctx)}
+	if user, password, ok := strings.Cut(flags["--username"], ":"); ok {
+		options = append(options, remote.WithAuth(&authn.Basic{Username: user, Password: password}))
+	}
+	return nil, remote.Write(target, img, options...)
 }
 
 func setup(t *testing.T) (*server, *fakeConvertor, string) {
