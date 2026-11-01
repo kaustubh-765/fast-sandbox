@@ -290,7 +290,7 @@ func (m *ociDiskManager) deliver(image string) (runtimecontract.ImageDeliverySta
 // is delivered like any template, then an OCI image drive requested in the
 // spec env converts in the background, so the create parks instead of
 // running past its deadline.
-func (d *Driver) DeliverSandbox(ctx context.Context, spec fastletapi.SandboxSpec) (runtimecontract.ImageDeliveryStatus, error) {
+func (d *Driver) DeliverSandbox(ctx context.Context, spec fastletapi.SandboxDesiredSpec) (runtimecontract.ImageDeliveryStatus, error) {
 	status, err := d.DeliverImage(ctx, spec.Image)
 	if err != nil || status != runtimecontract.ImageDelivered || d.ociDisks == nil {
 		return status, err
@@ -567,7 +567,7 @@ func placeOCIDrive(dir, disk string) error {
 // restore set's manifest (resume, create from snapshot) wins over the image
 // requested in the spec env (fresh create). fresh reports whether the drive
 // must be patched into the restored VM. A nil drive means the placeholder.
-func (d *Driver) resolveOCIDrive(ctx context.Context, stateRoot, restoreRef string, spec fastletapi.SandboxSpec) (drive *artifacts.OCIDrive, disk string, fresh bool, err error) {
+func (d *Driver) resolveOCIDrive(ctx context.Context, stateRoot, restoreRef string, spec fastletapi.SandboxDesiredSpec) (drive *artifacts.OCIDrive, disk string, fresh bool, err error) {
 	if d.ociDisks == nil {
 		return nil, "", false, nil
 	}
@@ -631,7 +631,7 @@ func waitForOCIContainer(ctx context.Context, address string, timeout time.Durat
 
 // ociLaunchFromSpec builds the launch overrides of a fresh create from the
 // Sandbox env, validating that they fit on the launch drive.
-func ociLaunchFromSpec(spec fastletapi.SandboxSpec) (artifacts.OCILaunch, error) {
+func ociLaunchFromSpec(spec fastletapi.SandboxDesiredSpec) (artifacts.OCILaunch, error) {
 	var launch artifacts.OCILaunch
 	if raw := strings.TrimSpace(spec.Env[OCILaunchEntrypointEnv]); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &launch.Entrypoint); err != nil {

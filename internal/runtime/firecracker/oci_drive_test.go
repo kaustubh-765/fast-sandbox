@@ -105,7 +105,7 @@ func TestPlaceOCIDrivePlaceholderAndDisk(t *testing.T) {
 func TestResolveOCIDriveDisabledIsNoop(t *testing.T) {
 	driver := &Driver{}
 	drive, disk, fresh, err := driver.resolveOCIDrive(context.Background(), t.TempDir(), "tpl-golden",
-		fastletapi.SandboxSpec{Env: map[string]string{OCIDriveImageEnv: "python:3.12-slim"}})
+		fastletapi.SandboxDesiredSpec{Env: map[string]string{OCIDriveImageEnv: "python:3.12-slim"}})
 	require.NoError(t, err)
 	require.Nil(t, drive)
 	require.Empty(t, disk)
@@ -123,7 +123,7 @@ func TestResolveOCIDriveManifestRecordWinsOverEnv(t *testing.T) {
 	driver := &Driver{ociDisks: manager}
 
 	drive, path, fresh, err := driver.resolveOCIDrive(context.Background(), stateRoot, "osb-snap-1",
-		fastletapi.SandboxSpec{Env: map[string]string{OCIDriveImageEnv: "node:24-slim"}})
+		fastletapi.SandboxDesiredSpec{Env: map[string]string{OCIDriveImageEnv: "node:24-slim"}})
 	require.NoError(t, err)
 	require.Equal(t, &recorded, drive)
 	require.Equal(t, disk, path)
@@ -136,7 +136,7 @@ func TestResolveOCIDriveGoldenWithoutImageUsesPlaceholder(t *testing.T) {
 	stateRoot := t.TempDir()
 	writeOCIManifest(t, stateRoot, "tpl-golden", nil)
 	driver := &Driver{ociDisks: testOCIDiskManager(stateRoot)}
-	drive, disk, fresh, err := driver.resolveOCIDrive(context.Background(), stateRoot, "tpl-golden", fastletapi.SandboxSpec{})
+	drive, disk, fresh, err := driver.resolveOCIDrive(context.Background(), stateRoot, "tpl-golden", fastletapi.SandboxDesiredSpec{})
 	require.NoError(t, err)
 	require.Nil(t, drive)
 	require.Empty(t, disk)
@@ -284,7 +284,7 @@ func TestWaitForOCIContainer(t *testing.T) {
 }
 
 func TestOCILaunchFromSpecAndPlacement(t *testing.T) {
-	spec := fastletapi.SandboxSpec{Env: map[string]string{
+	spec := fastletapi.SandboxDesiredSpec{Env: map[string]string{
 		OCILaunchEntrypointEnv: `["python3","-m","http.server","8080"]`,
 		OCILaunchEnvEnv:        `{"FOO":"bar"}`,
 		OCILaunchWorkdirEnv:    "/tmp",
@@ -313,7 +313,7 @@ func TestOCILaunchFromSpecAndPlacement(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, empty.Empty())
 
-	_, err = ociLaunchFromSpec(fastletapi.SandboxSpec{Env: map[string]string{OCILaunchEntrypointEnv: "python3 -m"}})
+	_, err = ociLaunchFromSpec(fastletapi.SandboxDesiredSpec{Env: map[string]string{OCILaunchEntrypointEnv: "python3 -m"}})
 	require.ErrorIs(t, err, ErrInvalidConfig)
 }
 
@@ -345,7 +345,7 @@ func TestGarbageCollectOCIDisks(t *testing.T) {
 	directory, err := ensureSandboxDir(root, "sbx-1")
 	require.NoError(t, err)
 	require.NoError(t, saveState(directory, &SandboxState{
-		Config:   fastletapi.RuntimeSandboxConfig{Spec: fastletapi.SandboxSpec{Image: "tpl-golden"}, Identity: fastletapi.SandboxIdentity{SandboxUID: "sbx-1"}},
+		Config:   fastletapi.RuntimeSandboxConfig{Desired: fastletapi.SandboxDesiredSpec{Image: "tpl-golden"}, Identity: fastletapi.SandboxIdentity{SandboxUID: "sbx-1"}},
 		Phase:    PhaseRunning,
 		OCIDrive: &artifacts.OCIDrive{Image: "x", Digest: digest(4), DiskKey: bySandbox},
 	}))

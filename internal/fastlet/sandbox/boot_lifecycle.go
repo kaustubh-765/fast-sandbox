@@ -62,7 +62,7 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 		}, true
 	}
 	if delivery, ok := m.runtime.(SandboxDelivery); ok {
-		spec := input.Sandbox.Spec
+		spec := input.Sandbox.Desired
 		return func(ctx context.Context) (ImageDeliveryStatus, error) {
 			return delivery.DeliverSandbox(ctx, spec)
 		}, true

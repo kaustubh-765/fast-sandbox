@@ -82,7 +82,7 @@ type ImageDelivery interface {
 // ImageDelivery for fresh creates; the create parks while it reports
 // ImageDelivering.
 type SandboxDelivery interface {
-	DeliverSandbox(ctx context.Context, spec fastletapi.SandboxSpec) (ImageDeliveryStatus, error)
+	DeliverSandbox(ctx context.Context, spec fastletapi.SandboxDesiredSpec) (ImageDeliveryStatus, error)
 }
 
 // CheckpointDelivery is the optional runtime extension for restoring a paused
