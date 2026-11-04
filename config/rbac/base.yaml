@@ -65,6 +65,10 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
+# Placement skips Fastlets on cordoned (spec.unschedulable) nodes.
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["sandbox.fast.io"]
   resources: ["sandboxpools"]
   verbs: ["get", "list", "watch"]

@@ -711,3 +711,57 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 	admission, _, _ := manager.State()
 	require.Equal(t, 5, admission.Used)
 }
+
+func TestTopKSkipsCordonedNodesInEveryResourceMode(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		fastlet func(id string) FastletInfo
+		request CandidateRequest
+	}{
+		{"legacy", func(id string) FastletInfo { return readyFastlet(id, 0, 10) }, candidate("alpine:latest", "cordon")},
+		{"resource-aware", func(id string) FastletInfo {
+			return resourceAwareFastlet(id, 0, fastletapi.AdmissionStateOpen, 2)
+		}, resourceAwareCandidate("alpine:latest")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewInMemoryRegistry()
+			cordoned := test.fastlet("on-cordoned")
+			open := test.fastlet("on-open")
+			open.NodeName = "node-b"
+			seedFastlet(t, registry, cordoned)
+			seedFastlet(t, registry, open)
+
+			registry.SetNodeUnschedulable("node-a", true)
+			selected := registry.TopK(test.request, 10)
+			require.Len(t, selected, 1)
+			require.Equal(t, FastletID("on-open"), selected[0].ID)
+			require.False(t, selected[0].NodeUnschedulable)
+
+			info, ok := registry.GetFastletByID("on-cordoned")
+			require.True(t, ok)
+			require.True(t, info.NodeUnschedulable, "reads expose the cordon to the Pool controller")
+			for _, info := range registry.GetAllFastlets() {
+				require.Equal(t, info.NodeName == "node-a", info.NodeUnschedulable)
+			}
+
+			// A Pod watch update does not clear the Node-fed cordon.
+			seedFastlet(t, registry, cordoned)
+			require.Len(t, registry.TopK(test.request, 10), 1)
+
+			registry.SetNodeUnschedulable("node-a", false)
+			selected = registry.TopK(test.request, 10)
+			require.Len(t, selected, 2, "uncordon restores the node")
+			info, _ = registry.GetFastletByID("on-cordoned")
+			require.False(t, info.NodeUnschedulable)
+		})
+	}
+}
+
+func TestSetNodeUnschedulableIgnoresEmptyNodeName(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	unbound := readyFastlet("unbound", 0, 10)
+	unbound.NodeName = ""
+	seedFastlet(t, registry, unbound)
+	registry.SetNodeUnschedulable("", true)
+	require.Len(t, registry.TopK(candidate("alpine:latest", "empty"), 10), 1)
+}

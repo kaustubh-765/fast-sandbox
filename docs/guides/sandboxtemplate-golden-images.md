@@ -252,6 +252,7 @@ what the node agents pull.
   through; they have a 2 h deadline and a 10 min Pending timeout (a missing
   KVM node fails the build instead of hanging forever). Finished Pods are
   kept 24 h for annotation inspection, then reaped by the controller.
+- **Build node selector**: the `sandbox.fast.io/build-node-selector` annotation on the SandboxTemplate narrows where the build Pod runs, for example onto the CPU family that the consuming SandboxPool serves. The value is a JSON object of label keys to label values, e.g. `sandbox.fast.io/build-node-selector: '{"sandbox.fast.io/cpu-family":"amd-milan"}'`, merged into the build Pod's `nodeSelector`. `sandbox.fast.io/kvm=true` is always kept; an annotation entry for that key is ignored. A value that is not a flat JSON string map, or that contains an invalid label key or value, creates no build Pod and fails the template with a `BuildSucceeded=False` condition of reason `InvalidBuildNodeSelector`; fixing the annotation retries the build without a spec change. The annotation is read when the build Pod is created, so changing a valid annotation does not rebuild an already built generation (edit the spec to rebuild). The builder Pod template ConfigMap overlay still cannot change `nodeSelector`.
 - **Diagnostics**: failed builds surface the container exit reason/message in
   the condition; the Pod logs (`kubectl -n <namespace> logs <build-pod>`)
   carry per-stage timings (`pullMs`, `bootToReadyMs`, `snapshotCreateMs`,

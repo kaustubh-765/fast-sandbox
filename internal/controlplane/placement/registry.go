@@ -94,6 +94,12 @@ type FastletInfo struct {
 	LastHeartbeat     time.Time
 	PodObservedAt     time.Time
 	RejectedUntil     time.Time
+
+	// NodeUnschedulable mirrors the hosting Node's spec.unschedulable
+	// (cordon). It is not part of the stored Pod/heartbeat view: the
+	// Registry stamps it on every read from its Node-fed cordon set, so new
+	// Sandboxes avoid the node and Pool scale-down drains it first.
+	NodeUnschedulable bool
 }
 
 func (i FastletInfo) Used() int {
@@ -106,6 +112,12 @@ func (i FastletInfo) Capacity() int {
 
 func (i FastletInfo) SchedulingUsed() int {
 	return i.Admission.Used + i.InFlightSlots
+}
+
+// NodeSchedulabilityRegistry receives Node cordon state from the Node
+// watch. Unschedulable nodes are skipped by placement in every resource mode.
+type NodeSchedulabilityRegistry interface {
+	SetNodeUnschedulable(node string, unschedulable bool)
 }
 
 // FastletRegistry is the scheduling view consumed by the Pool controller.
@@ -158,17 +170,48 @@ type rankedFastlet struct {
 }
 
 type InMemoryRegistry struct {
-	mu         sync.RWMutex
-	fastlets   map[FastletID]*fastletSlot
-	staleAfter atomic.Int64
-	clock      func() time.Time
-	serverSeed string
+	mu       sync.RWMutex
+	fastlets map[FastletID]*fastletSlot
+	// unschedulableNodes holds cordoned node names; guarded by mu.
+	unschedulableNodes map[string]struct{}
+	staleAfter         atomic.Int64
+	clock              func() time.Time
+	serverSeed         string
 }
 
 func NewInMemoryRegistry() *InMemoryRegistry {
-	registry := &InMemoryRegistry{fastlets: make(map[FastletID]*fastletSlot), clock: time.Now}
+	registry := &InMemoryRegistry{
+		fastlets:           make(map[FastletID]*fastletSlot),
+		unschedulableNodes: make(map[string]struct{}),
+		clock:              time.Now,
+	}
 	registry.staleAfter.Store(int64(DefaultObservationStaleAfter))
 	return registry
+}
+
+// SetNodeUnschedulable records whether a Node is cordoned. It is fed by the
+// Node watch and is independent of Fastlet Pod and heartbeat state, so a Pod
+// replacement never clears a cordon. Deleting a Node must call it with false.
+func (r *InMemoryRegistry) SetNodeUnschedulable(node string, unschedulable bool) {
+	if node == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if unschedulable {
+		r.unschedulableNodes[node] = struct{}{}
+		return
+	}
+	delete(r.unschedulableNodes, node)
+}
+
+// nodeUnschedulableLocked reports whether node is cordoned; r.mu must be held.
+func (r *InMemoryRegistry) nodeUnschedulableLocked(node string) bool {
+	if node == "" {
+		return false
+	}
+	_, cordoned := r.unschedulableNodes[node]
+	return cordoned
 }
 
 func (r *InMemoryRegistry) SetStaleAfter(duration time.Duration) { r.staleAfter.Store(int64(duration)) }
@@ -477,6 +520,10 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	for _, slot := range r.fastlets {
 		slots = append(slots, slot)
 	}
+	cordonedNodes := make(map[string]struct{}, len(r.unschedulableNodes))
+	for node := range r.unschedulableNodes {
+		cordonedNodes[node] = struct{}{}
+	}
 	r.mu.RUnlock()
 
 	heartbeats := heartbeatAgeSummary{}
@@ -486,6 +533,11 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 		slot.mu.RLock()
 		info := slot.info
 		heartbeats.observe(info.LastHeartbeat, request.Now, staleAfter)
+		if _, cordoned := cordonedNodes[info.NodeName]; info.NodeName != "" && cordoned {
+			// A cordoned node takes no new Sandboxes in any resource mode.
+			slot.mu.RUnlock()
+			continue
+		}
 		if !hardFilter(info, request, staleAfter, blockedNodes) {
 			slot.mu.RUnlock()
 			continue
@@ -535,6 +587,8 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 		ranked[index].slot.mu.RLock()
 		selected[index] = cloneInfo(ranked[index].slot.info)
 		ranked[index].slot.mu.RUnlock()
+		// Selected Fastlets passed the cordon filter above.
+		selected[index].NodeUnschedulable = false
 	}
 	recordTopK(len(slots), eligibleCount, request.Image, selectedImageHit)
 	return selected
@@ -716,6 +770,11 @@ func (r *InMemoryRegistry) GetAllFastlets() []FastletInfo {
 		result = append(result, cloneInfo(slot.info))
 		slot.mu.RUnlock()
 	}
+	r.mu.RLock()
+	for index := range result {
+		result[index].NodeUnschedulable = r.nodeUnschedulableLocked(result[index].NodeName)
+	}
+	r.mu.RUnlock()
 	return result
 }
 
@@ -729,6 +788,9 @@ func (r *InMemoryRegistry) GetFastletByID(id FastletID) (FastletInfo, bool) {
 	slot.mu.RLock()
 	result := cloneInfo(slot.info)
 	slot.mu.RUnlock()
+	r.mu.RLock()
+	result.NodeUnschedulable = r.nodeUnschedulableLocked(result.NodeName)
+	r.mu.RUnlock()
 	return result, true
 }
 

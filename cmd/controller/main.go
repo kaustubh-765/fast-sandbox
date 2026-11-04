@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -154,6 +156,11 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 		LeaderElection:                role.LeaderElection(),
 		LeaderElectionID:              "fast-sandbox-reconciler.sandbox.fast.io",
 		LeaderElectionReleaseOnCancel: true,
+		// Nodes are watched cluster-wide only for spec.unschedulable;
+		// trim everything else so the Node cache stays light.
+		Cache: ctrlcache.Options{ByObject: map[client.Object]ctrlcache.ByObject{
+			&corev1.Node{}: {Transform: reconciler.TrimNodeForCache},
+		}},
 	})
 	if err != nil {
 		klog.ErrorS(err, "Create controller-runtime manager")
@@ -172,6 +179,16 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	orchestrator := &orchestration.Orchestrator{
 		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog,
 		DisableResourceAwarePlacement: !resourceAwarePlacement,
+	}
+
+	// Every role feeds Node cordon state into the Registry: FastPath
+	// placement skips cordoned nodes and Pool scale-down drains them first.
+	// The controller does not need leader election (process-local state).
+	if err := (&reconciler.NodeSchedulabilityReconciler{
+		Client: manager.GetClient(), Registry: registry,
+	}).SetupWithManager(manager); err != nil {
+		klog.ErrorS(err, "Register Node schedulability controller")
+		os.Exit(1)
 	}
 
 	if role.RunsControllers() {

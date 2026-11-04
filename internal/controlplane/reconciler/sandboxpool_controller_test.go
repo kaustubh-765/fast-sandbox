@@ -1052,7 +1052,7 @@ func TestResourceAwareDrainDoesNotFallbackPastExactCandidates(t *testing.T) {
 		fastletPod("fastlet-c", "uid-c", "10.0.0.3"),
 	}
 	selections := selectDrainTargets(
-		pods, 2, []string{"fastlet-b/uid-b"}, "desired-template", false, true, nil,
+		pods, 2, []string{"fastlet-b/uid-b"}, "desired-template", false, true, nil, nil,
 	)
 	require.Len(t, selections, 1)
 	require.Equal(t, "fastlet-b", selections[0].pod.Name)
@@ -2338,4 +2338,71 @@ func TestUpdatePoolObservationRetriesConflictByRefetchingLatest(t *testing.T) {
 	require.Equal(t, "runtime-1", persisted.Status.RuntimeRevision)
 	require.NotNil(t, apiMeta.FindStatusCondition(persisted.Status.Conditions, apiv1alpha2.PoolConditionRuntimeReady), "conditions written by another writer must be preserved")
 	require.Equal(t, observation.warmImages, stale.Status.WarmImages, "the caller must adopt the persisted status")
+}
+
+func TestResourceAwareScaleDownDrainsIdleFastletOnCordonedNodeFirst(t *testing.T) {
+	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	pool := resourceAwareScalingPool()
+	pool.Spec.Capacity.PoolMin = 2
+	planned := resourceAwareCommitmentCapacity(pool)
+	names := []string{"fastlet-a", "fastlet-b", "fastlet-c", "fastlet-d"}
+	pods := make([]corev1.Pod, 0, len(names))
+	registry := placement.NewInMemoryRegistry()
+	for index, name := range names {
+		uid := "uid-" + name
+		pod := fastletPod(name, uid, fmt.Sprintf("10.0.0.%d", index+1))
+		pod.Spec.NodeName = "node-" + name
+		pods = append(pods, *pod)
+		used := 0
+		if name == "fastlet-c" {
+			used = 1 // busy: never a scale-down candidate, cordoned or not
+		}
+		info := resourceAwareControllerFastlet(name, uid, used, fastletapi.AdmissionStateOpen, now)
+		info.NodeName = pod.Spec.NodeName
+		seedControllerRegistry(t, registry, info)
+	}
+	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
+
+	// Baseline: three idle Fastlets and poolMin=2, so two drain in
+	// free-then-identity order.
+	baseline := reconciler.planResourceAwareScale(pool, pods, 0, planned, resourceFastletsForPoolChildren(registry, pool, pods), now)
+	require.Equal(t, []string{"fastlet-a/uid-fastlet-a", "fastlet-b/uid-fastlet-b"}, baseline.drainCandidates)
+
+	registry.SetNodeUnschedulable("node-fastlet-d", true)
+	registry.SetNodeUnschedulable("node-fastlet-c", true)
+	plan := reconciler.planResourceAwareScale(pool, pods, 0, planned, resourceFastletsForPoolChildren(registry, pool, pods), now)
+	require.Equal(t, baseline.desiredPods, plan.desiredPods, "cordoning changes the order, not the desired count")
+	require.Equal(t, []string{"fastlet-d/uid-fastlet-d", "fastlet-a/uid-fastlet-a"}, plan.drainCandidates,
+		"the idle Fastlet on the cordoned node drains first; the busy cordoned one stays ineligible")
+}
+
+func TestLegacyScaleDownDrainsIdleFastletOnCordonedNodeFirst(t *testing.T) {
+	pods := []*corev1.Pod{
+		fastletPod("fastlet-a", "uid-a", "10.0.0.1"),
+		fastletPod("fastlet-b", "uid-b", "10.0.0.2"),
+		fastletPod("fastlet-c", "uid-c", "10.0.0.3"),
+	}
+	for _, pod := range pods {
+		pod.Spec.NodeName = "node-" + pod.Name
+		pod.Annotations = map[string]string{placement.AnnotationPodTemplateHash: "desired-template"}
+	}
+	active := map[string]int{"fastlet-b/uid-b": 1}
+
+	selections := selectDrainTargets(pods, 1, nil, "desired-template", true, false, active, nil)
+	require.Len(t, selections, 1)
+	require.Equal(t, "fastlet-a", selections[0].pod.Name)
+
+	cordoned := map[string]struct{}{"node-fastlet-c": {}, "node-fastlet-b": {}}
+	selections = selectDrainTargets(pods, 2, nil, "desired-template", true, false, active, cordoned)
+	require.Len(t, selections, 2)
+	require.Equal(t, "fastlet-c", selections[0].pod.Name, "the idle Fastlet on a cordoned node drains first")
+	require.Equal(t, "fastlet-a", selections[1].pod.Name,
+		"a busy Fastlet on a cordoned node keeps the fewest-assignments order")
+	require.Equal(t, placement.DrainReasonScaleDown, selections[0].reason)
+
+	observed := map[string]placement.FastletInfo{
+		"fastlet-c/uid-c": {NodeName: "node-fastlet-c", NodeUnschedulable: true},
+		"fastlet-a/uid-a": {NodeName: "node-fastlet-a"},
+	}
+	require.Equal(t, map[string]struct{}{"node-fastlet-c": {}}, cordonedFastletNodes(observed))
 }

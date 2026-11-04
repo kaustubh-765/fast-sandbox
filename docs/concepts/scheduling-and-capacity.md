@@ -83,7 +83,8 @@ Every Fast-Path and Controller replica maintains its own Registry from:
    revision;
 3. full aggregate admission snapshots piggybacked on Create success,
    definitive rejection, and Delete responses;
-4. short-lived process-local reservations while Create RPCs are in flight.
+4. short-lived process-local reservations while Create RPCs are in flight;
+5. a Kubernetes Node watch for `spec.unschedulable` (cordon). The Node cache is trimmed to that field, and the FastPath and Controller ServiceAccounts need `get`/`list`/`watch` on `nodes`.
 
 Watches provide topology changes without full polling. Heartbeats refresh runtime-local facts and repair missed or stale observations.
 
@@ -94,7 +95,7 @@ a global lock; Fastlet atomic admission resolves cross-replica races.
 
 The Orchestrator:
 
-1. filters by namespace, Pool, readiness, runtime profile, Infra revision, Registry revision, and stale heartbeat;
+1. filters by namespace, Pool, readiness, runtime profile, Infra revision, Registry revision, and stale heartbeat, and skips Fastlets on cordoned (unschedulable) Nodes in every resource mode;
 2. requires fresh eligible slot and resource ledgers in ResourceAware mode;
 3. prioritizes image-cache affinity;
 4. ranks by a coarse dominant-load bucket, FastPath Pod UID seed, and a stable
@@ -187,6 +188,8 @@ drain rather than deleting an arbitrary Pod. If a scale-down candidate becomes
 loaded, its drain is canceled after timeout instead of forcing deletion.
 
 The scheduling Registry excludes draining Fastlets from new placement.
+
+Operators retire a worker node by cordoning it. New Sandboxes then avoid that node's Fastlets, and scale-down drains idle Fastlets on cordoned nodes before any other candidate (ResourceAware: before the free-capacity order; LegacySlot: before the fewest-assignments order). Cordoning does not make a Fastlet eligible for scale-down by itself, does not change the desired Pod count, and does not evict running Sandboxes; idle Fastlets on a cordoned node still count toward buffer capacity until they are drained.
 
 ## Node-scoped cleanup
 

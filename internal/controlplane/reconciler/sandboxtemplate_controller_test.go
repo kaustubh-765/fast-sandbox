@@ -1242,3 +1242,85 @@ func TestOCIInvalidPublishFailsBeforeCreatingPod(t *testing.T) {
 		})
 	}
 }
+
+// TestSandboxTemplateBuildNodeSelectorAnnotation: the build node selector
+// annotation is merged into the build Pod's nodeSelector, the platform KVM
+// selector always wins, and no annotation keeps the platform-only selector.
+func TestSandboxTemplateBuildNodeSelectorAnnotation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		annotation *string
+		want       map[string]string
+	}{
+		{"no-annotation", nil, map[string]string{sandboxTemplateKVMNodeLabel: "true"}},
+		{"merged", ptr(`{"sandbox.fast.io/cpu-family":"amd-milan","zone":"a"}`), map[string]string{
+			sandboxTemplateKVMNodeLabel: "true", "sandbox.fast.io/cpu-family": "amd-milan", "zone": "a",
+		}},
+		{"kvm-preserved", ptr(`{"sandbox.fast.io/kvm":"false","cpu":"intel"}`), map[string]string{
+			sandboxTemplateKVMNodeLabel: "true", "cpu": "intel",
+		}},
+		{"empty-object", ptr(`{}`), map[string]string{sandboxTemplateKVMNodeLabel: "true"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			template := newSandboxTemplate("tenant-a", "selector")
+			if test.annotation != nil {
+				template.Annotations = map[string]string{BuildNodeSelectorAnnotation: *test.annotation}
+			}
+			r := newSandboxTemplateReconciler(t, template)
+			key := client.ObjectKeyFromObject(template)
+			reconcileOnce(t, r, key)
+			updated := getSandboxTemplate(t, r, key)
+			require.Equal(t, apiv1alpha2.SandboxTemplatePhaseBuilding, updated.Status.Phase)
+			pods := listBuilderPods(t, r, "tenant-a")
+			require.Len(t, pods, 1)
+			require.Equal(t, test.want, pods[0].Spec.NodeSelector)
+		})
+	}
+}
+
+// TestSandboxTemplateInvalidBuildNodeSelectorFailsBeforeCreatingPod: an
+// invalid annotation fails the build terminally with no Pod; fixing the
+// annotation (no generation bump) retries the build.
+func TestSandboxTemplateInvalidBuildNodeSelectorFailsBeforeCreatingPod(t *testing.T) {
+	for _, test := range []struct {
+		name, value, message string
+	}{
+		{"not-json", `cpu=amd`, "must be a JSON object"},
+		{"nested", `{"cpu":{"family":"amd"}}`, "must be a JSON object"},
+		{"non-string", `{"cpu":1}`, "must be a JSON object"},
+		{"array", `["cpu"]`, "must be a JSON object"},
+		{"bad-key", `{"bad key!":"amd"}`, "not a valid node selector"},
+		{"bad-value", `{"cpu":"amd milan"}`, "not a valid node selector"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			template := newSandboxTemplate("tenant-a", "bad-selector")
+			template.Annotations = map[string]string{BuildNodeSelectorAnnotation: test.value}
+			r := newSandboxTemplateReconciler(t, template)
+			key := client.ObjectKeyFromObject(template)
+			reconcileOnce(t, r, key)
+			updated := getSandboxTemplate(t, r, key)
+			require.Equal(t, apiv1alpha2.SandboxTemplatePhaseFailed, updated.Status.Phase)
+			condition := findBuildCondition(t, &updated)
+			require.Equal(t, reasonInvalidBuildNodeSelector, condition.Reason)
+			require.Equal(t, corev1.ConditionFalse, condition.Status)
+			require.Contains(t, condition.Message, test.message)
+			require.Empty(t, listBuilderPods(t, r, "tenant-a"))
+
+			// Still invalid: stays Failed without a Pod.
+			reconcileOnce(t, r, key)
+			require.Empty(t, listBuilderPods(t, r, "tenant-a"))
+
+			// Fixing the annotation retries the same generation.
+			updated = getSandboxTemplate(t, r, key)
+			updated.Annotations[BuildNodeSelectorAnnotation] = `{"cpu":"amd"}`
+			require.NoError(t, r.Update(context.Background(), &updated))
+			reconcileOnce(t, r, key)
+			healed := getSandboxTemplate(t, r, key)
+			require.Equal(t, apiv1alpha2.SandboxTemplatePhaseBuilding, healed.Status.Phase)
+			pods := listBuilderPods(t, r, "tenant-a")
+			require.Len(t, pods, 1)
+			require.Equal(t, "amd", pods[0].Spec.NodeSelector["cpu"])
+			require.Equal(t, "true", pods[0].Spec.NodeSelector[sandboxTemplateKVMNodeLabel])
+		})
+	}
+}

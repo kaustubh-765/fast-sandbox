@@ -482,6 +482,9 @@ func (r *SandboxPoolReconciler) fastletUtilizationCounts(
 type resourceAwareDrainCandidate struct {
 	identity string
 	free     int32
+	// cordoned marks a Fastlet whose Node is unschedulable; operators
+	// retire nodes by cordoning them, so those Fastlets drain first.
+	cordoned bool
 }
 
 type resourceAwareScalePlan struct {
@@ -573,6 +576,9 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 
 	retainedFree := max(pool.Spec.Capacity.BufferMax, pool.Spec.Capacity.BufferMin)
 	sort.Slice(view.removable, func(i, j int) bool {
+		if view.removable[i].cordoned != view.removable[j].cordoned {
+			return view.removable[i].cordoned
+		}
 		if view.removable[i].free != view.removable[j].free {
 			return view.removable[i].free < view.removable[j].free
 		}
@@ -658,7 +664,9 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 		}
 		if fastletResourceObservationFresh(info, now) && info.SchedulingUsed() == 0 && awaitingAdmission[identity] == 0 &&
 			!info.Draining && !info.DrainRequested {
-			view.removable = append(view.removable, resourceAwareDrainCandidate{identity: identity, free: free})
+			view.removable = append(view.removable, resourceAwareDrainCandidate{
+				identity: identity, free: free, cordoned: info.NodeUnschedulable,
+			})
 		}
 	}
 	return view
@@ -949,7 +957,10 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 				}
 			}
 		}
-		selections := selectDrainTargets(available, count, preferredScaleDown, desiredPodHash, currentTemplateReady, resourceAware, active)
+		selections := selectDrainTargets(
+			available, count, preferredScaleDown, desiredPodHash, currentTemplateReady, resourceAware, active,
+			cordonedFastletNodes(observedFastlets),
+		)
 		for _, selection := range selections {
 			if err := r.startDrain(ctx, selection.pod, selection.reason); err != nil {
 				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
@@ -1012,6 +1023,18 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 	return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
 }
 
+// cordonedFastletNodes returns the unschedulable (cordoned) nodes hosting
+// the observed Pool Fastlets, as stamped by the Registry's Node watch.
+func cordonedFastletNodes(observedFastlets map[string]placement.FastletInfo) map[string]struct{} {
+	cordoned := make(map[string]struct{})
+	for _, info := range observedFastlets {
+		if info.NodeUnschedulable && info.NodeName != "" {
+			cordoned[info.NodeName] = struct{}{}
+		}
+	}
+	return cordoned
+}
+
 type drainTarget struct {
 	pod    *corev1.Pod
 	reason string
@@ -1025,6 +1048,7 @@ func selectDrainTargets(
 	currentTemplateReady bool,
 	resourceAware bool,
 	active map[string]int,
+	cordonedNodes map[string]struct{},
 ) []drainTarget {
 	if count <= 0 {
 		return nil
@@ -1076,7 +1100,16 @@ func selectDrainTargets(
 	}
 
 	remaining := append([]*corev1.Pod(nil), available...)
+	// Idle Fastlets on cordoned nodes drain first; the rest keep the
+	// fewest-active-assignments order.
+	idleCordoned := func(pod *corev1.Pod) bool {
+		_, cordoned := cordonedNodes[pod.Spec.NodeName]
+		return pod.Spec.NodeName != "" && cordoned && active[podIdentity(pod)] == 0
+	}
 	sort.Slice(remaining, func(i, j int) bool {
+		if leftCordoned, rightCordoned := idleCordoned(remaining[i]), idleCordoned(remaining[j]); leftCordoned != rightCordoned {
+			return leftCordoned
+		}
 		left, right := active[podIdentity(remaining[i])], active[podIdentity(remaining[j])]
 		if left != right {
 			return left < right
