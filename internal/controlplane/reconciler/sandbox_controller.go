@@ -32,8 +32,8 @@ const (
 	FinalizerName           = assignment.CleanupFinalizer
 	DefaultRequeueInterval  = 5 * time.Second
 	ReadyRequeueInterval    = 30 * time.Second
-	DeletionPollInterval    = time.Second
-	ObservationPollInterval = time.Second
+	DeletionPollInterval    = 200 * time.Millisecond
+	ObservationPollInterval = 200 * time.Millisecond
 )
 
 type SandboxReconciler struct {

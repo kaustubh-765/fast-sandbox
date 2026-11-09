@@ -37,7 +37,7 @@ const (
 	SandboxSnapshotFinalizerName = assignment.SnapshotCleanupFinalizer
 	// SnapshotObservationPollInterval drives the observe loop of a running
 	// snapshot task.
-	SnapshotObservationPollInterval = time.Second
+	SnapshotObservationPollInterval = 200 * time.Millisecond
 	// SnapshotRetryInterval backs off placement problems (unavailable
 	// Fastlet, not-Ready target Sandbox).
 	SnapshotRetryInterval = 5 * time.Second
