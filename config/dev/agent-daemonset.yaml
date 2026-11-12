@@ -194,6 +194,8 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 3
         volumeMounts:
+        - {name: component-log-config, mountPath: /etc/fast-sandbox/logging, readOnly: true}
+        - {name: component-logs, mountPath: /var/log/fast-sandbox}
         - name: agent-socket
           mountPath: /run/fast-sandbox/firecracker
         - name: agent-state
@@ -235,6 +237,16 @@ spec:
           value: /var/lib/fast-sandbox/firecracker
         - name: OVERLAYBD_CACHE_SIZE_GB
           value: "16"
+        # Warm pool: LOW=0 disables it. SIZE_GB must equal the template
+        # rootfsSize in whole GiB (2Gi -> 2; default 30Gi -> 30): larger or
+        # smaller values miss on every acquire. Keep LOW+HIGH within ublks_max
+        # (64) alongside Sandbox rootfs devices.
+        - name: OVERLAYBD_POOL_LOW
+          value: "4"
+        - name: OVERLAYBD_POOL_HIGH
+          value: "8"
+        - name: OVERLAYBD_POOL_SIZE_GB
+          value: "30"
         securityContext:
           privileged: true
         readinessProbe:
@@ -277,6 +289,8 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         volumeMounts:
+        - {name: component-log-config, mountPath: /etc/fast-sandbox/logging, readOnly: true}
+        - {name: component-logs, mountPath: /var/log/fast-sandbox}
         - name: network-state
           mountPath: /run/fast-sandbox/network
         - name: network-namespaces
@@ -297,6 +311,14 @@ spec:
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
       volumes:
+      - name: component-log-config
+        configMap:
+          name: fast-sandbox-logging
+          optional: true
+          items:
+          - {key: logging.yaml, path: logging.yaml}
+      - name: component-logs
+        emptyDir: {}
       - name: oci-tools
         hostPath:
           path: /opt/fast-sandbox/oci

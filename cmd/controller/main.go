@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -17,7 +20,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
-	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -28,6 +31,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	"fast-sandbox/internal/controlplane"
 	"fast-sandbox/internal/controlplane/fastletcontrol"
 	"fast-sandbox/internal/controlplane/fastpath"
@@ -72,6 +76,9 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	var resourceAwarePoolScaling bool
 	var resourceAwareStartupGrace time.Duration
 	var resourceAwareScaleDownStabilization time.Duration
+	var cacheNamespaces string
+	var kubeClientQPS float64
+	var kubeClientBurst int
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -97,15 +104,24 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.BoolVar(&resourceAwarePoolScaling, "resource-aware-pool-scaling", true, "Enable ResourceAware effective-capacity Pool scaling.")
 	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
 	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
-	klog.InitFlags(nil)
+	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
+	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
+	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
 
 	role, err := controlplane.ParseRole(roleValue)
 	if err != nil {
 		klog.ErrorS(err, "Invalid control-plane role")
 		os.Exit(1)
 	}
+	closeLogs, err := componentlog.Configure(string(role))
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-"+string(role))
 	if err != nil {
 		klog.ErrorS(err, "Configure OpenTelemetry")
@@ -122,6 +138,15 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	}
 	if resourceAwarePoolScaling && !resourceAwarePlacement {
 		klog.ErrorS(nil, "resource-aware-pool-scaling requires resource-aware-placement")
+		os.Exit(1)
+	}
+	if err := validateKubeClientTuning(kubeClientQPS, kubeClientBurst); err != nil {
+		klog.ErrorS(err, "Invalid kube client tuning")
+		os.Exit(1)
+	}
+	cacheNamespaceSet := parseCacheNamespaces(cacheNamespaces)
+	if err := validateControllerCacheScoping(cacheNamespaceSet, runtimeEnvironmentNamespace, role.RunsControllers()); err != nil {
+		klog.ErrorS(err, "Invalid cache scoping")
 		os.Exit(1)
 	}
 	if role.RunsControllers() && routeVerifyPublicKey == "" {
@@ -149,7 +174,12 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	}
 	ctrl.SetLogger(klog.NewKlogr())
 
-	manager, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig := ctrl.GetConfigOrDie()
+	if kubeClientQPS > 0 {
+		restConfig.QPS = float32(kubeClientQPS)
+		restConfig.Burst = kubeClientBurst
+	}
+	managerOptions := ctrl.Options{
 		Scheme:                        scheme,
 		Metrics:                       metricsserver.Options{BindAddress: metricsAddress},
 		HealthProbeBindAddress:        probeAddress,
@@ -158,10 +188,17 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 		LeaderElectionReleaseOnCancel: true,
 		// Nodes are watched cluster-wide only for spec.unschedulable;
 		// trim everything else so the Node cache stays light.
-		Cache: ctrlcache.Options{ByObject: map[client.Object]ctrlcache.ByObject{
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.Node{}: {Transform: reconciler.TrimNodeForCache},
 		}},
-	})
+	}
+	if namespaces, scoped := cacheNamespaceConfigs(cacheNamespaceSet); scoped {
+		// Namespace scoping applies to namespaced objects only; Nodes stay
+		// cluster-wide with the transform above.
+		managerOptions.Cache.DefaultNamespaces = namespaces
+		klog.InfoS("scoping informer cache to namespaces", "namespaces", strings.Join(sortedCacheNamespaceNames(namespaces), ","))
+	}
+	manager, err := ctrl.NewManager(restConfig, managerOptions)
 	if err != nil {
 		klog.ErrorS(err, "Create controller-runtime manager")
 		os.Exit(1)
@@ -295,6 +332,70 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// parseCacheNamespaces splits the comma-separated --namespaces value
+// into a set. Empty or whitespace-only entries are dropped; an empty result
+// means cluster-wide watching.
+func parseCacheNamespaces(value string) map[string]struct{} {
+	namespaces := map[string]struct{}{}
+	for _, name := range strings.Split(value, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			namespaces[name] = struct{}{}
+		}
+	}
+	return namespaces
+}
+
+// validateKubeClientTuning requires qps and burst to be set as a pair and to
+// stay non-negative; zero keeps the client-go defaults.
+func validateKubeClientTuning(qps float64, burst int) error {
+	if (qps == 0) != (burst == 0) {
+		return errors.New("kube-client-qps and kube-client-burst must be set together")
+	}
+	if qps < 0 || burst < 0 {
+		return errors.New("kube-client-qps and kube-client-burst must not be negative")
+	}
+	return nil
+}
+
+// validateControllerCacheScoping rejects a scoped controller-role cache that
+// cannot observe the platform runtime environment ConfigMap; an empty set
+// keeps cluster-wide semantics and needs no check.
+func validateControllerCacheScoping(namespaces map[string]struct{}, runtimeEnvironmentNamespace string, runsControllers bool) error {
+	if !runsControllers || len(namespaces) == 0 {
+		return nil
+	}
+	runtimeNamespace := runtimeEnvironmentNamespace
+	if runtimeNamespace == "" {
+		runtimeNamespace = runtimeenv.SystemNamespace
+	}
+	if _, ok := namespaces[runtimeNamespace]; !ok {
+		return fmt.Errorf("--namespaces must include the runtime environment namespace %q", runtimeNamespace)
+	}
+	return nil
+}
+
+// cacheNamespaceConfigs converts a namespace set into cache-scoping configs;
+// the second return value reports whether the cache should be scoped at all.
+func cacheNamespaceConfigs(namespaces map[string]struct{}) (map[string]cache.Config, bool) {
+	if len(namespaces) == 0 {
+		return nil, false
+	}
+	configs := make(map[string]cache.Config, len(namespaces))
+	for name := range namespaces {
+		configs[name] = cache.Config{}
+	}
+	return configs, true
+}
+
+func sortedCacheNamespaceNames(configs map[string]cache.Config) []string {
+	names := make([]string, 0, len(configs))
+	for name := range configs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func shutdownTracing(shutdown observability.Shutdown) {

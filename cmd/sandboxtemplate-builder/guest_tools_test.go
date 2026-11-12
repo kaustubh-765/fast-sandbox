@@ -24,8 +24,8 @@ func TestRenderGuestInitRoutesToolsThroughBusyboxFallback(t *testing.T) {
 		"tool mkdir -p /dev/pts",
 		"tool hostname sandbox",
 		"tool setsid $SH /opt/opensandbox/bootstrap.sh",
-		"tool nc -w 1 127.0.0.1 44772",
-		"if ! have_tool nc; then",
+		"guest_nc -w 1 127.0.0.1 44772",
+		"select_nc() {",
 		"tool sleep 5",
 	} {
 		if !strings.Contains(script, want) {
@@ -40,7 +40,7 @@ func TestRenderGuestInitRoutesToolsThroughBusyboxFallback(t *testing.T) {
 			}
 		}
 	}
-	if got := renderGuestInitWith(apiv1alpha2.SandboxTemplateSpec{}, guestBusyboxPath+" sh"); !strings.HasPrefix(got, "#!"+guestBusyboxPath+" sh\n") {
+	if got := renderGuestInitWith(apiv1alpha2.SandboxTemplateSpec{}, guestBusyboxPath+" sh", false); !strings.HasPrefix(got, "#!"+guestBusyboxPath+" sh\n") {
 		t.Fatalf("busybox interpreter not used: %q", strings.SplitN(got, "\n", 2)[0])
 	}
 }

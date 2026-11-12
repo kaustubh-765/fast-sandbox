@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // This file encapsulates the build-flow Firecracker phase: inject an init
@@ -132,7 +134,8 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 // before returning; it also joins the rollback, so a VMM that could not be
 // stopped keeps the rootfs device it holds attached. The produced file
 // paths are returned.
-func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback) (vmstatePath, memfilePath string, err error) {
+func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback, progress *buildProgress) (vmstatePath, memfilePath string, err error) {
+	progress.start("starting guest VM")
 	runtimeDir := filepath.Join(workDir, "fc")
 	if err := os.MkdirAll(runtimeDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create firecracker runtime dir: %w", err)
@@ -148,6 +151,11 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		bootArgs = defaultBootArgs + " init=" + options.initPath
 	}
 
+	pinnedKernel := filepath.Join(runtimeDir, "boot-kernel")
+	options.kernelSHA256, err = firecrackerconfig.PinKernel(options.kernel, pinnedKernel)
+	if err != nil {
+		return "", "", err
+	}
 	process, err := launchFirecracker(global.firecrackerBin, runtimeDir, apiSocket, buildVMID, serialLog)
 	if err != nil {
 		return "", "", err
@@ -169,7 +177,7 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	if err := client.waitReady(readyCtx); err != nil {
 		return "", "", err
 	}
-	if err := client.setBootSource(ctx, bootSource{KernelImagePath: options.kernel, BootArgs: bootArgs}); err != nil {
+	if err := client.setBootSource(ctx, bootSource{KernelImagePath: pinnedKernel, BootArgs: bootArgs}); err != nil {
 		return "", "", fmt.Errorf("configure boot source: %w", err)
 	}
 	if err := client.addDrive(ctx, drive{
@@ -188,14 +196,28 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 			return "", "", err
 		}
 	}
+	if options.guestControlPort != 0 {
+		if err := client.do(ctx, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}, nil); err != nil {
+			return "", "", err
+		}
+	}
 	if err := client.startInstance(ctx); err != nil {
 		return "", "", fmt.Errorf("start instance: %w", err)
 	}
 
+	progress.start("waiting for guest readiness")
 	if err := waitSerialFor(serialLog, options.readyPattern, options.readyTimeout); err != nil {
 		return "", "", err
 	}
 
+	if options.guestControlPort != 0 {
+		progress.start("probing guest-control helper")
+		options.guestControlVersion, err = probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	progress.start("capturing VM snapshot")
 	snapDir := filepath.Join(workDir, "snapshot")
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)

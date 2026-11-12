@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackervmm"
 	infracontract "fast-sandbox/internal/infra/contract"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -33,22 +34,29 @@ type VMPhase string
 
 const (
 	PhaseStarting VMPhase = "Starting"
-	PhaseRunning  VMPhase = "Running"
+	PhaseRunning  VMPhase = vmRunning
 	PhaseStopped  VMPhase = "Stopped"
+	// PhaseFailed is a durable terminal observation. Physical resources may
+	// already be reclaimed, but the identity remains until Controller ACK.
+	PhaseFailed VMPhase = "runtime-failed"
 )
 
 // SandboxState is the durable per-Sandbox driver record. It keeps stable
 // runtime configuration separate from Driver-produced allocation state so
 // restart recovery preserves both authority boundaries.
 type SandboxState struct {
-	Config           fastletapi.RuntimeSandboxConfig     `json:"config"`
-	Allocation       fastletapi.RuntimeAllocation        `json:"allocation"`
-	Phase            VMPhase                             `json:"phase"`
-	PID              int                                 `json:"pid,omitempty"`
-	APIAddress       string                              `json:"apiAddress,omitempty"`
-	CreatedAt        int64                               `json:"createdAt"`
-	InfraServices    []infracontract.ServiceEndpoint     `json:"infraServices,omitempty"`
-	InfraDiagnostics []infracontract.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
+	VMM               *firecrackervmm.Selection           `json:"vmm,omitempty"`
+	BootKernelSHA256  string                              `json:"bootKernelSHA256,omitempty"`
+	BootCompatibility *artifacts.SnapshotCompatibility    `json:"bootCompatibility,omitempty"`
+	Config            fastletapi.RuntimeSandboxConfig     `json:"config"`
+	Allocation        fastletapi.RuntimeAllocation        `json:"allocation"`
+	Phase             VMPhase                             `json:"phase"`
+	PID               int                                 `json:"pid,omitempty"`
+	APIAddress        string                              `json:"apiAddress,omitempty"`
+	CreatedAt         int64                               `json:"createdAt"`
+	FailureMessage    string                              `json:"failureMessage,omitempty"`
+	InfraServices     []infracontract.ServiceEndpoint     `json:"infraServices,omitempty"`
+	InfraDiagnostics  []infracontract.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
 	// StageDurations records the per-stage create timing of the Sandbox
 	// (acquire/rootfs/infra/launch/configure/boot) for load bottleneck
 	// analysis (serial vs parallel clone batches).
@@ -125,10 +133,17 @@ func saveState(directory string, state *SandboxState) error {
 		file.Close()
 		return err
 	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), metaPath(directory))
+	if err := os.Rename(file.Name(), metaPath(directory)); err != nil {
+		return err
+	}
+	return syncCaptureDirectory(directory)
 }
 
 // loadState reads the Sandbox state; os.ErrNotExist means the Sandbox is not

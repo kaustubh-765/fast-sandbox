@@ -16,11 +16,15 @@ import (
 )
 
 type Metadata struct {
+	// RecoveryRequired keeps a live runtime unavailable without declaring it
+	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
+	RecoveryRequired       bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string
 	PID                    int
 	Phase                  string
+	RuntimeMessage         string
 	CreatedAt              int64
 	UserProcessStartedAt   time.Time
 	UserProcessStartSource fastletapi.UserProcessStartSource
@@ -106,10 +110,18 @@ type SnapshotResult struct {
 	ArtifactDigest string
 	// SizeBytes is the total logical size of the artifact set.
 	SizeBytes int64
+	// Mode is the artifact class actually produced (the mode the driver
+	// executed and recorded in the published manifest, not the raw
+	// request). Empty means Full. The Fastlet verifies it against the
+	// admitted mode before reporting success.
+	Mode fastletapi.SnapshotMode
 }
 
 // SnapshotInput carries one snapshot request to the runtime driver.
 type SnapshotInput struct {
+	Mode fastletapi.SnapshotMode
+	// Identity binds the asynchronous task to the runtime incarnation verified at admission.
+	Identity *fastletapi.SandboxIdentity
 	// SandboxID identifies the running Sandbox to snapshot.
 	SandboxID string
 	// SnapshotID is the node-local identity of the snapshot; it scopes the
@@ -153,14 +165,41 @@ type Snapshotter interface {
 	DeleteSnapshot(ctx context.Context, snapshotID string) error
 }
 
+// RootfsOnlySnapshotCapability is the optional Snapshotter extension through
+// which a driver advertises that it implements rootfs-only capture
+// (SnapshotInput.Mode == RootfsOnly). A Fastlet whose runtime does not
+// implement it (or answers false) never reports the rootfs-only heartbeat
+// capability, and the control plane refuses to dispatch a RootfsOnly
+// snapshot to it: an older runtime ignores the mode and would silently
+// produce a Full artifact.
+type RootfsOnlySnapshotCapability interface {
+	SupportsRootfsOnlySnapshots() bool
+}
+
 // ResourceRecoveryOwnerRetirer gates destructive recovery of one dead runtime.
 // Implementations call it after confirming the runtime is dead and before
 // releasing any sandbox-owned resources. A failure must leave those resources
 // intact so recovery can be retried.
 type ResourceRecoveryOwnerRetirer func(ctx context.Context, metadata *Metadata) error
 
+// RecoveryReconciler retries a fenced live runtime using its complete identity.
+// It must serialize with capture/replacement and never publish interrupted cuts.
+type RecoveryReconciler interface {
+	ReconcileSandbox(ctx context.Context, identity fastletapi.SandboxIdentity) error
+}
+
 type ResourceRecoverer interface {
 	RecoverRuntimeResources(ctx context.Context, managed []*Metadata, retireOwner ResourceRecoveryOwnerRetirer) error
+}
+
+// TerminalFailureHandler durably fences an unexpectedly exited runtime before
+// reclaiming its physical resources. RecordTerminalFailure must commit the
+// complete runtime identity before returning success. CleanupTerminalFailure
+// is idempotent and must retain that record until the ordinary DeleteSandbox
+// path acknowledges the Controller's durable terminal decision.
+type TerminalFailureHandler interface {
+	RecordTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity, message string) error
+	CleanupTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity) error
 }
 
 type ResourceAdmission interface {

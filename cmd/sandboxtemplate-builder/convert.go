@@ -132,6 +132,10 @@ func guestInitPath(spec apiv1alpha2.SandboxTemplateSpec) string {
 // env, and /etc/hosts into the mounted rootfs, returning the baked MITM CA
 // lineage (nil when none).
 func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint string) ([]mitmCALineage, error) {
+	control, err := injectGuestControl(spec, mountPoint)
+	if err != nil {
+		return nil, err
+	}
 	opt := filepath.Join(mountPoint, "opt", "opensandbox")
 	if err := os.MkdirAll(opt, 0o755); err != nil {
 		return nil, err
@@ -169,7 +173,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	if err := os.MkdirAll(filepath.Dir(guestInit), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(guestInit, []byte(renderGuestInitWith(spec, guestInitShell(mountPoint, busybox))), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
+	if err := os.WriteFile(guestInit, []byte(renderGuestInitWith(spec, guestInitShell(mountPoint, busybox), control)), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
 		return nil, err
 	}
 
@@ -334,7 +338,7 @@ func mergeGuestEnvs(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (map[s
 const startupFailedMarker = "SANDBOX_STARTUP_FAILED"
 
 // guestBusyboxPath is where the builder's static busybox lands in the guest
-// rootfs, backing the init's loopback setup on images without ip/ifconfig.
+// rootfs, backing loopback setup and TCP readiness checks.
 // The filename must stay "busybox": applets dispatch on argv[0].
 const guestBusyboxPath = "/usr/local/lib/sandbox-busybox/busybox"
 
@@ -349,15 +353,27 @@ var hostBusyboxCandidates = []string{"/bin/busybox", "/usr/bin/busybox"}
 // the host can verify the guest is alive after a snapshot restore (the init
 // does not re-run after resume).
 func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
-	return renderGuestInitWith(spec, "/bin/sh")
+	return renderGuestInitWith(spec, "/bin/sh", false)
+}
+
+// renderGuestInitWithControl renders the default-shell init, optionally
+// starting the guest-control helper (OverlayBD builds).
+func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bool) string {
+	return renderGuestInitWith(spec, "/bin/sh", control)
 }
 
 // renderGuestInitWith renders the init with the given interpreter line. Every
 // external tool the script needs (mountpoint, mount, mkdir, hostname, setsid,
-// nc, sleep) runs through tool(): the image's own command when it has one, the
+// sleep) runs through tool(): the image's own command when it has one, the
 // injected static busybox applet otherwise. Images without nc, mountpoint or
-// a shell therefore build like Alpine does.
-func renderGuestInitWith(spec apiv1alpha2.SandboxTemplateSpec, shell string) string {
+// a shell therefore build like Alpine does. TCP readiness prefers the
+// injected busybox nc (known -w semantics) and falls back to the image's nc.
+// control starts the guest-control helper used by OverlayBD rootfs captures.
+func renderGuestInitWith(spec apiv1alpha2.SandboxTemplateSpec, shell string, control bool) string {
+	controlStart := ""
+	if control {
+		controlStart = "tool setsid /usr/local/sbin/fsb-guest-control --mount / --port 1234 </dev/null >/dev/console 2>&1 &\n"
+	}
 	var readiness []string
 	if spec.Readiness.Probe != "" {
 		readiness = append(readiness, "READINESS_PROBE="+shellQuote(spec.Readiness.Probe))
@@ -404,7 +420,7 @@ tool mountpoint -q /tmp || tool mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
 tool hostname sandbox
-` + renderFreePageReporting() + `
+` + renderFreePageReporting() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs
@@ -415,20 +431,27 @@ elif [ -n "${ENTRYPOINT:-}" ]; then
   tool setsid $SH -c "$ENTRYPOINT" &
 fi
 ` + readinessBlock + `
-if ! have_tool nc; then
-  echo "SANDBOX_STARTUP_FAILED nc_missing"
-  exit 1
-fi
-ready_tcp() { host=${1#tcp://}; host=${host%%:*}; port=${1##*:}; tool nc -w 1 "$host" "$port" </dev/null >/dev/null 2>&1; }
+select_nc() {
+  if [ -x "$BB" ] && "$BB" nc --help >/dev/null 2>&1; then
+    guest_nc() { "$BB" nc "$@"; }
+  elif command -v nc >/dev/null 2>&1; then
+    guest_nc() { nc "$@"; }
+  else
+    echo "SANDBOX_STARTUP_FAILED nc_missing"
+    exit 1
+  fi
+}
+ready_tcp() { host=${1#tcp://}; host=${host%%:*}; port=${1##*:}; guest_nc -w 1 "$host" "$port" </dev/null >/dev/null 2>&1; }
 ready_cmd() { $SH -c "${1#cmd://}" >/dev/null 2>&1; }
-ready_execd_ping() { tool nc -w 1 127.0.0.1 44772 </dev/null >/dev/null 2>&1; }
+ready_execd_ping() { guest_nc -w 1 127.0.0.1 44772 </dev/null >/dev/null 2>&1; }
 if [ -n "${READINESS_PROBE:-}" ]; then
   case "$READINESS_PROBE" in
-    tcp://*) until ready_tcp "$READINESS_PROBE"; do tool sleep 1; done ;;
+    tcp://*) select_nc; until ready_tcp "$READINESS_PROBE"; do tool sleep 1; done ;;
     cmd://*) until ready_cmd "$READINESS_PROBE"; do tool sleep 1; done ;;
     *) echo "SANDBOX_STARTUP_FAILED invalid_probe"; exit 1 ;;
   esac
 elif [ -x /opt/opensandbox/execd ]; then
+  select_nc
   until ready_execd_ping; do tool sleep 1; done
 else
   tool sleep "${WARMUP_SECONDS:-60}"

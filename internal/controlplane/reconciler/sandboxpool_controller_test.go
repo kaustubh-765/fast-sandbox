@@ -2,27 +2,35 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
@@ -299,13 +307,21 @@ func TestRegistryWriteSecretRefRequiresName(t *testing.T) {
 type recordingDrainer struct {
 	mu       sync.Mutex
 	requests []fastletapi.SetDrainingRequest
+	respond  func(*fastletapi.SetDrainingRequest) *fastletapi.SetDrainingResponse
 }
 
 func (d *recordingDrainer) SetDraining(_ context.Context, _ string, request *fastletapi.SetDrainingRequest) (*fastletapi.SetDrainingResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.requests = append(d.requests, *request)
-	return &fastletapi.SetDrainingResponse{Draining: request.Draining}, nil
+	if d.respond != nil {
+		return d.respond(request), nil
+	}
+	admission := fastletapi.AdmissionStatus{}
+	return &fastletapi.SetDrainingResponse{
+		Draining: request.Draining, DrainID: request.DrainID, FastletPodUID: request.FastletPodUID,
+		Admission: &admission, RuntimeReady: true,
+	}, nil
 }
 
 func TestResolveRuntimeProfileUsesCanonicalRuntime(t *testing.T) {
@@ -1219,6 +1235,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	profile := runtimePlan.Profile
 	pod, err := reconciler.constructPodWithRuntimePlan(pool, runtimePlan)
 	require.NoError(t, err)
+	requireComponentLogging(t, &pod.Spec, "fastlet", fastletProxyContainerName)
 	require.Nil(t, pod.Spec.RuntimeClassName)
 	require.NotNil(t, pod.Spec.AutomountServiceAccountToken)
 	require.False(t, *pod.Spec.AutomountServiceAccountToken)
@@ -1446,6 +1463,8 @@ func TestConstructResourceAwarePodProjectsOneResolvedCapacity(t *testing.T) {
 	require.Equal(t, "41088Mi", pod.Spec.Containers[0].Resources.Requests.Memory().String())
 	require.Equal(t, pod.Spec.Containers[0].Resources.Requests, pod.Spec.Containers[0].Resources.Limits)
 	require.Equal(t, "20m", pod.Spec.Containers[1].Resources.Limits.Cpu().String(), "sidecar resources remain independent")
+	requireComponentLogging(t, &pod.Spec, "fastlet", fastletProxyContainerName)
+	require.Equal(t, pool.Spec.FastletTemplate.Spec.Containers[1], pod.Spec.Containers[1], "tenant sidecar must remain unchanged")
 }
 
 func TestEnsureBoundedPodContainersRejectsUnboundedUserSidecar(t *testing.T) {
@@ -1527,6 +1546,76 @@ func TestLoadedScaleDownFastletCancelsAtDrainTimeout(t *testing.T) {
 	require.NoError(t, err)
 	remaining := getFastletPod(t, k8sClient, "fastlet-a")
 	require.False(t, placement.PodDrainRequested(remaining), "ordinary scale-down must not force-delete a loaded Fastlet")
+}
+
+func TestBoundedFirecrackerUpgradeNeverForcesLoadedFastlet(t *testing.T) {
+	now := time.Now()
+	r, k8s, drainer, pool := newDrainHarness(t, nil)
+	r.Now = func() time.Time { return now }
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+	pod := getFastletPod(t, k8s, "fastlet-a")
+	pod.Annotations = map[string]string{
+		placement.AnnotationDraining: "true", placement.AnnotationDrainReason: placement.DrainReasonPlannedUpgrade,
+		placement.AnnotationDrainStartedAt: now.Add(-24 * time.Hour).Format(time.RFC3339Nano),
+	}
+	ctx := context.Background()
+	require.NoError(t, k8s.Update(ctx, pod))
+	for _, used := range []int{1, 0} {
+		used := used
+		drainer.respond = func(request *fastletapi.SetDrainingRequest) *fastletapi.SetDrainingResponse {
+			admission := fastletapi.AdmissionStatus{Used: used, Running: used, Resources: &fastletapi.ResourceAdmissionStatus{
+				Version: "v2", Epoch: "epoch-a", Revision: uint64(used + 1),
+				Committed: fastletapi.SandboxResourceVector{CPU: fmt.Sprintf("%d", used), Memory: fmt.Sprintf("%dGi", used)},
+			}}
+			return &fastletapi.SetDrainingResponse{
+				Draining: request.Draining, DrainID: request.DrainID, FastletPodUID: request.FastletPodUID,
+				Admission: &admission, RuntimeReady: true,
+			}
+		}
+		pod = getFastletPod(t, k8s, pod.Name)
+		// Keep the Registry snapshot empty in both iterations. Only the atomic
+		// drain response changes, reproducing the pre-ACK TOCTOU window.
+		info := resourceAwareControllerFastlet(pod.Name, string(pod.UID), 0, fastletapi.AdmissionStateOpen, now)
+		info.ResourceReceivedAt = now
+		_, _, err := r.reconcileDraining(ctx, pool, []corev1.Pod{*pod}, nil, 0, "", false, nil, map[string]placement.FastletInfo{podIdentity(pod): info})
+		require.NoError(t, err)
+	}
+	var gone corev1.Pod
+	err := k8s.Get(ctx, client.ObjectKeyFromObject(pod), &gone)
+	require.Error(t, err)
+	require.NoError(t, client.IgnoreNotFound(err))
+}
+
+func TestDrainSnapshotValidationFailsClosed(t *testing.T) {
+	emptyResources := &fastletapi.ResourceAdmissionStatus{
+		Version: "v2", Epoch: "epoch-a", Revision: 1,
+		Committed: fastletapi.SandboxResourceVector{CPU: "0", Memory: "0"},
+	}
+	emptyAdmission := &fastletapi.AdmissionStatus{Resources: emptyResources}
+	valid := &fastletapi.SetDrainingResponse{
+		Draining: true, DrainID: "drain-a", FastletPodUID: "pod-a", Admission: emptyAdmission, RuntimeReady: true,
+	}
+	require.True(t, drainResponseEmpty(valid, true))
+
+	missing := *valid
+	missing.Admission = nil
+	require.False(t, drainResponseEmpty(&missing, true))
+	recovering := *valid
+	recovering.Recovering = true
+	require.False(t, drainResponseEmpty(&recovering, true))
+	loaded := *valid
+	loadedAdmission := *emptyAdmission
+	loadedAdmission.Used, loadedAdmission.Creating = 1, 1
+	loaded.Admission = &loadedAdmission
+	require.False(t, drainResponseEmpty(&loaded, true))
+	invalidLedger := *valid
+	invalidAdmission := *emptyAdmission
+	invalidResources := *emptyResources
+	invalidResources.Reason = fastletapi.AdmissionReasonUnsupportedProtocol
+	invalidAdmission.Resources = &invalidResources
+	invalidLedger.Admission = &invalidAdmission
+	require.False(t, drainResponseEmpty(&invalidLedger, true))
 }
 
 func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {
@@ -1663,6 +1752,287 @@ func TestSandboxNeedsPlacementExcludesTerminalAndAssignedStates(t *testing.T) {
 	require.False(t, sandboxNeedsPlacement(&apiv1alpha2.Sandbox{Status: apiv1alpha2.SandboxStatus{Placement: placementStatus}}))
 }
 
+func TestPoolReplacesTerminalFastletAtCapacityLimit(t *testing.T) {
+	for _, test := range []struct {
+		resourceAware bool
+		finalizer     bool
+	}{
+		{},
+		{finalizer: true},
+		{resourceAware: true},
+		{resourceAware: true, finalizer: true},
+	} {
+		resourceAware := test.resourceAware
+		for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodSucceeded} {
+			t.Run(fmt.Sprintf("resourceAware=%t/finalizer=%t/%s", resourceAware, test.finalizer, phase), func(t *testing.T) {
+				ctx := context.Background()
+				now := time.Date(2026, 11, 7, 0, 0, 0, 0, time.UTC)
+				sandbox := assignedSandbox("sandbox-a", "terminal-fastlet", "terminal-uid")
+				reconciler, k8sClient, drainer, pool := newDrainHarness(t, []apiv1alpha2.Sandbox{sandbox})
+				reconciler.Now = func() time.Time { return now }
+				for _, name := range []string{"fastlet-a", "fastlet-b"} {
+					require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+				}
+				pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+				if resourceAware {
+					pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+				}
+				require.NoError(t, k8sClient.Update(ctx, pool))
+				plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+				require.NoError(t, err)
+				pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+				require.NoError(t, err)
+				pod.Name, pod.GenerateName, pod.UID = "terminal-fastlet", "", "terminal-uid"
+				pod.Status.Phase = phase
+				pod.Status.Reason = "UnexpectedAdmissionError"
+				// A finalizer keeps the retired Pod visible after deletion so
+				// repeated reconciles also cover asynchronous cleanup.
+				if test.finalizer {
+					pod.Finalizers = []string{"test.fast-sandbox.io/cleanup"}
+				}
+				require.NoError(t, k8sClient.Create(ctx, pod))
+				deleteCalls := 0
+				reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if obj.GetName() == pod.Name {
+							deleteCalls++
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				expectedObjects := 1
+				if test.finalizer {
+					expectedObjects++
+				}
+
+				for range 3 {
+					_, err = reconciler.Reconcile(ctx, poolRequest(pool))
+					require.NoError(t, err)
+					var pods corev1.PodList
+					require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels(poolLabels(pool.Name))))
+					require.Len(t, pods.Items, expectedObjects, "a finalizer may retain the retired Pod alongside its replacement")
+					live := 0
+					for _, child := range pods.Items {
+						if child.Name == pod.Name {
+							require.Equal(t, pod.UID, child.UID)
+							require.NotNil(t, child.DeletionTimestamp)
+							continue
+						}
+						live++
+						require.True(t, metav1.IsControlledBy(&child, pool))
+					}
+					require.Equal(t, 1, live, "replace the terminal Pod without exceeding PoolMax")
+					now = now.Add(10 * time.Minute)
+				}
+				require.Equal(t, 1, deleteCalls, "do not repeat deletion while the terminal Pod awaits finalizer cleanup")
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+				require.Equal(t, int32(1), pool.Status.CurrentPods, "the retiring terminal Pod must not count toward effective capacity")
+				var persisted apiv1alpha2.Sandbox
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(&sandbox), &persisted))
+				require.Equal(t, sandbox.Status, persisted.Status, "replacing capacity must not transfer the old Sandbox instance")
+				require.Empty(t, drainer.requests, "a terminal Fastlet cannot acknowledge a drain")
+			})
+		}
+	}
+}
+
+func TestPoolReplacesDeletingFastletBeforeTerminationCompletes(t *testing.T) {
+	for _, resourceAware := range []bool{false, true} {
+		for _, phase := range []corev1.PodPhase{corev1.PodRunning, corev1.PodPending, corev1.PodUnknown} {
+			t.Run(fmt.Sprintf("resourceAware=%t/%s", resourceAware, phase), func(t *testing.T) {
+				ctx := context.Background()
+				now := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+				reconciler, k8sClient, drainer, pool := newDrainHarness(t, nil)
+				reconciler.Now = func() time.Time { return now }
+				for _, name := range []string{"fastlet-a", "fastlet-b"} {
+					require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+				}
+				pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+				if resourceAware {
+					pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+				}
+				require.NoError(t, k8sClient.Update(ctx, pool))
+				plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+				require.NoError(t, err)
+				pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+				require.NoError(t, err)
+				pod.Name, pod.GenerateName, pod.UID = "deleting-fastlet", "", "deleting-uid"
+				pod.Status.Phase = phase
+				pod.Finalizers = []string{"test.fast-sandbox.io/cleanup"}
+				require.NoError(t, k8sClient.Create(ctx, pod))
+				// Model an operator deleting the only Fastlet. Its finalizer
+				// keeps the nonterminal Pod visible throughout reconciliation.
+				require.NoError(t, k8sClient.Delete(ctx, pod))
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod))
+				require.NotNil(t, pod.DeletionTimestamp)
+				now = pod.DeletionTimestamp.Time
+				creates, deletes := 0, 0
+				reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if _, ok := obj.(*corev1.Pod); ok {
+							creates++
+						}
+						return c.Create(ctx, obj, opts...)
+					},
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if _, ok := obj.(*corev1.Pod); ok {
+							deletes++
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				var replacementName string
+				for range 3 {
+					_, err = reconciler.Reconcile(ctx, poolRequest(pool))
+					require.NoError(t, err)
+					var pods corev1.PodList
+					require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels(poolLabels(pool.Name))))
+					require.Len(t, pods.Items, 2, "the terminating Pod and exactly one replacement must coexist")
+					for _, child := range pods.Items {
+						if child.Name == pod.Name {
+							require.Equal(t, pod.UID, child.UID)
+							require.Equal(t, phase, child.Status.Phase)
+							require.NotNil(t, child.DeletionTimestamp)
+							continue
+						}
+						if replacementName == "" {
+							replacementName = child.Name
+						}
+						require.Equal(t, replacementName, child.Name)
+						require.Nil(t, child.DeletionTimestamp)
+						require.True(t, metav1.IsControlledBy(&child, pool))
+					}
+					now = now.Add(10 * time.Minute)
+				}
+				require.Equal(t, 1, creates, "repeated reconciles must create only one replacement")
+				require.Zero(t, deletes, "do not repeat an operator's deletion or drain the replacement")
+				require.Empty(t, drainer.requests)
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+				require.Equal(t, int32(1), pool.Status.CurrentPods)
+			})
+		}
+	}
+}
+
+func TestDeletingPoolDoesNotProvisionFastlets(t *testing.T) {
+	for _, resourceAware := range []bool{false, true} {
+		for _, deletingChild := range []bool{false, true} {
+			t.Run(fmt.Sprintf("resourceAware=%t/deletingChild=%t", resourceAware, deletingChild), func(t *testing.T) {
+				ctx := context.Background()
+				reconciler, k8sClient, drainer, pool := newDrainHarness(t, nil)
+				for _, name := range []string{"fastlet-a", "fastlet-b"} {
+					require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+				}
+				pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+				if resourceAware {
+					pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+				}
+				pool.Finalizers = []string{"test.fast-sandbox.io/pool-cleanup"}
+				require.NoError(t, k8sClient.Update(ctx, pool))
+				if deletingChild {
+					plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+					require.NoError(t, err)
+					pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+					require.NoError(t, err)
+					pod.Name, pod.GenerateName, pod.UID = "deleting-fastlet", "", "deleting-uid"
+					pod.Status.Phase = corev1.PodRunning
+					pod.Finalizers = []string{"test.fast-sandbox.io/pod-cleanup"}
+					require.NoError(t, k8sClient.Create(ctx, pod))
+					require.NoError(t, k8sClient.Delete(ctx, pod))
+				}
+				require.NoError(t, k8sClient.Delete(ctx, pool))
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+				require.NotNil(t, pool.DeletionTimestamp)
+				creates, deletes := 0, 0
+				reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						creates++
+						return c.Create(ctx, obj, opts...)
+					},
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						deletes++
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				for range 3 {
+					_, err := reconciler.Reconcile(ctx, poolRequest(pool))
+					require.NoError(t, err)
+				}
+				require.Zero(t, creates, "a deleting Pool must not create any child resources")
+				require.Zero(t, deletes, "leave child deletion to the existing deletion flow")
+				require.Empty(t, drainer.requests)
+				var pods corev1.PodList
+				require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace)))
+				expected := 0
+				if deletingChild {
+					expected = 1
+				}
+				require.Equal(t, expected, len(pods.Items))
+			})
+		}
+	}
+}
+
+func TestRemoveRetiredFastletsPreservesActiveAndForeignPods(t *testing.T) {
+	ctx := context.Background()
+	reconciler, k8sClient, _, pool := newDrainHarness(t, nil)
+	var pods []corev1.Pod
+	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodRunning, corev1.PodSucceeded, corev1.PodPending, corev1.PodUnknown} {
+		pod := fastletPod(string(phase), string(phase)+"-uid", "")
+		pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(pool, apiv1alpha2.GroupVersion.WithKind("SandboxPool"))}
+		pod.Status.Phase = phase
+		require.NoError(t, k8sClient.Create(ctx, pod))
+		pods = append(pods, *pod)
+	}
+	foreign := fastletPod("foreign", "foreign-uid", "")
+	foreign.Status.Phase = corev1.PodFailed
+	foreign.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(pool, apiv1alpha2.GroupVersion.WithKind("SandboxPool"))}
+	foreign.OwnerReferences[0].UID = "previous-pool-uid"
+	require.NoError(t, k8sClient.Create(ctx, foreign))
+	pods = append(pods, *foreign)
+	foreignDeleting := foreign.DeepCopy()
+	foreignDeleting.Name, foreignDeleting.UID, foreignDeleting.ResourceVersion = "foreign-deleting", "foreign-deleting-uid", ""
+	foreignDeleting.Status.Phase = corev1.PodRunning
+	foreignDeleting.Finalizers = []string{"test.fast-sandbox.io/cleanup"}
+	require.NoError(t, k8sClient.Create(ctx, foreignDeleting))
+	require.NoError(t, k8sClient.Delete(ctx, foreignDeleting))
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignDeleting), foreignDeleting))
+	pods = append(pods, *foreignDeleting)
+	remaining, err := reconciler.removeRetiredFastlets(ctx, pool, pods)
+	require.NoError(t, err)
+	var names []string
+	for _, pod := range remaining {
+		names = append(names, pod.Name)
+		require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(&pod), &corev1.Pod{}))
+	}
+	require.ElementsMatch(t, []string{"Running", "Pending", "Unknown", "foreign", "foreign-deleting"}, names)
+}
+
+func TestPoolDoesNotReplaceFastletWhenTerminalDeletionFails(t *testing.T) {
+	ctx := context.Background()
+	reconciler, k8sClient, _, pool := newDrainHarness(t, nil)
+	pod := getFastletPod(t, k8sClient, "fastlet-a")
+	pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(pool, apiv1alpha2.GroupVersion.WithKind("SandboxPool"))}
+	require.NoError(t, k8sClient.Update(ctx, pod))
+	pod.Status.Phase = corev1.PodFailed
+	require.NoError(t, k8sClient.Status().Update(ctx, pod))
+	deleteErr := apierrors.NewForbidden(corev1.Resource("pods"), pod.Name, nil)
+	reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			require.Equal(t, pod.Name, obj.GetName())
+			options := (&client.DeleteOptions{}).ApplyOptions(opts)
+			require.NotNil(t, options.Preconditions)
+			require.Equal(t, &pod.UID, options.Preconditions.UID)
+			return deleteErr
+		},
+	})
+	_, err := reconciler.Reconcile(ctx, poolRequest(pool))
+	require.ErrorIs(t, err, deleteErr)
+	var pods corev1.PodList
+	require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace)))
+	require.Len(t, pods.Items, 2, "failed deletion must not provision replacement capacity")
+}
+
 func newDrainHarness(t *testing.T, sandboxes []apiv1alpha2.Sandbox) (*SandboxPoolReconciler, client.Client, *recordingDrainer, *apiv1alpha2.SandboxPool) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -1763,6 +2133,43 @@ func TestConstructPodSharesNodeOCIToolsAndSocket(t *testing.T) {
 	}
 }
 
+func TestConstructResourceAwareFirecrackerPodMountsWritableHostCgroup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "firecracker-pool", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime: apiv1alpha2.RuntimeFirecracker, MaxSandboxesPerPod: 2,
+			SandboxResources: apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+				resource.MustParse("512m"), resource.MustParse("512Mi"),
+				resource.MustParse("2"), resource.MustParse("2"), 128,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+	require.NoError(t, err)
+	require.True(t, hasHostPath(pod, podcgroup.HostPath))
+	mount := volumeMountForNamedContainer(t, pod, "fastlet", podcgroup.VolumeName)
+	require.NotNil(t, mount)
+	require.Equal(t, podcgroup.HostRoot, mount.MountPath)
+	require.False(t, mount.ReadOnly)
+
+	legacy := pool.DeepCopy()
+	legacy.Spec.SandboxResources = apiv1alpha2.NewLegacySandboxResourceProfile(
+		resource.MustParse("512m"), resource.MustParse("512Mi"), 128,
+	)
+	legacyPod, err := reconciler.constructPodWithRuntimePlan(legacy, plan)
+	require.NoError(t, err)
+	require.False(t, hasHostPath(legacyPod, podcgroup.HostPath),
+		"LegacySlot Firecracker must preserve its existing process placement")
+}
+
 func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
@@ -1835,6 +2242,62 @@ func TestConstructPodRejectsReservedControlMountFromUserSidecarOrInitContainer(t
 	}}
 	_, err = reconciler.constructPod(base, profile)
 	require.ErrorContains(t, err, "reserved by the platform")
+}
+
+func TestConstructPodRejectsReservedComponentLoggingStorage(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	base := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime: apiv1alpha2.RuntimeContainer, MaxSandboxesPerPod: 1, SandboxResources: testSandboxResources(),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(base)
+	require.NoError(t, err)
+	for _, reserved := range []struct{ name, path string }{
+		{componentlog.ConfigVolumeName, componentlog.ConfigMountPath},
+		{componentlog.LogVolumeName, componentlog.LogDirectory},
+	} {
+		t.Run(reserved.name, func(t *testing.T) {
+			pool := base.DeepCopy()
+			pool.Spec.FastletTemplate.Spec.Volumes = []corev1.Volume{{
+				Name: reserved.name, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}}
+			_, err := reconciler.constructPod(pool, profile)
+			require.ErrorContains(t, err, "platform-owned volume name")
+
+			for _, location := range []string{"fastlet", "sidecar", "init"} {
+				for _, collision := range []string{"name", "path"} {
+					t.Run(location+"/"+collision, func(t *testing.T) {
+						pool := base.DeepCopy()
+						mount := corev1.VolumeMount{Name: "user-data", MountPath: "/user"}
+						if collision == "name" {
+							mount.Name = reserved.name
+						} else {
+							mount.MountPath = reserved.path
+						}
+						container := corev1.Container{Name: "user", Image: "user:test", VolumeMounts: []corev1.VolumeMount{mount}}
+						spec := &pool.Spec.FastletTemplate.Spec
+						switch location {
+						case "fastlet":
+							spec.Containers[0].VolumeMounts = container.VolumeMounts
+						case "sidecar":
+							spec.Containers = append(spec.Containers, container)
+						case "init":
+							spec.InitContainers = []corev1.Container{container}
+						}
+						_, err := reconciler.constructPod(pool, profile)
+						require.ErrorContains(t, err, "reserved by the platform")
+					})
+				}
+			}
+		})
+	}
 }
 
 func TestConstructPodRejectsInfraArtifactStorageOverride(t *testing.T) {
@@ -2155,6 +2618,153 @@ func TestBuildFastletSettingsIncludesSidecarsInPodMemoryBudget(t *testing.T) {
 		"the aggregate Pod observer includes the runtime owner, long-running sidecars, and platform proxy but not one-shot init containers")
 	require.Equal(t, "256Mi", settings.ResourceAdmission.RuntimeEnvelope.Memory.String(),
 		"sidecars never increase Sandbox commitment or the runtime-owner envelope")
+}
+
+func TestComponentLoggingManifests(t *testing.T) {
+	for _, test := range []struct {
+		path       string
+		containers map[string][]string
+	}{
+		{"manager/controller.yaml", map[string][]string{
+			"fast-sandbox-controller": {"manager"},
+			"fast-sandbox-fastpath":   {"manager"},
+			"fast-sandbox-proxy":      {"proxy"},
+		}},
+		{"janitor/janitor.yaml", map[string][]string{"fast-sandbox-janitor": {"janitor"}}},
+		{"dev/agent-daemonset.yaml", map[string][]string{"firecracker-runtime": {"firecracker-agent", "janitor"}}},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			found := map[string][]string{}
+			for _, document := range strings.Split(string(readLoggingManifest(t, test.path)), "\n---\n") {
+				var workload struct {
+					Kind     string            `json:"kind"`
+					Metadata metav1.ObjectMeta `json:"metadata"`
+					Spec     struct {
+						Template corev1.PodTemplateSpec `json:"template"`
+					} `json:"spec"`
+				}
+				require.NoError(t, yaml.Unmarshal([]byte(document), &workload))
+				if workload.Kind != "Deployment" && workload.Kind != "DaemonSet" {
+					continue
+				}
+				containers, ok := test.containers[workload.Metadata.Name]
+				require.True(t, ok, "unexpected workload %s", workload.Metadata.Name)
+				require.Equal(t, "fast-sandbox-system", workload.Metadata.Namespace)
+				requireComponentLogging(t, &workload.Spec.Template.Spec, containers...)
+				found[workload.Metadata.Name] = containers
+			}
+			require.Equal(t, test.containers, found)
+		})
+	}
+}
+
+func TestComponentLoggingConfigMapAndKustomizations(t *testing.T) {
+	var config corev1.ConfigMap
+	require.NoError(t, yaml.Unmarshal(readLoggingManifest(t, "logging/configmap.yaml"), &config))
+	require.Equal(t, componentlog.ConfigMapName, config.Name)
+	require.Equal(t, "fast-sandbox-system", config.Namespace)
+	require.Len(t, config.Data, 1)
+	var settings map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(config.Data[componentlog.ConfigFileName]), &settings))
+	require.Equal(t, map[string]any{
+		"directory": componentlog.LogDirectory,
+		"maxSizeMB": float64(100), "maxBackups": float64(10), "maxAgeDays": float64(7),
+		"compress": true, "alsoStderr": false,
+	}, settings)
+
+	for _, test := range []struct{ path, resource string }{
+		{"logging/kustomization.yaml", "configmap.yaml"},
+		{"default/kustomization.yaml", "../logging"},
+		{"default/kustomization.yaml", "../manager"},
+		{"default/kustomization.yaml", "../janitor"},
+		{"dev/kustomization.yaml", "../default"},
+		{"all-in-one/kustomization.yaml", "../dev"},
+	} {
+		var kustomization struct {
+			Resources []string `json:"resources"`
+		}
+		require.NoError(t, yaml.Unmarshal(readLoggingManifest(t, test.path), &kustomization))
+		require.Contains(t, kustomization.Resources, test.resource, test.path)
+	}
+}
+
+func TestAllInOnePatchPreservesComponentLogging(t *testing.T) {
+	for _, document := range strings.Split(string(readLoggingManifest(t, "manager/controller.yaml")), "\n---\n") {
+		var deployment appsv1.Deployment
+		require.NoError(t, yaml.Unmarshal([]byte(document), &deployment))
+		if deployment.Kind != "Deployment" || deployment.Name != "fast-sandbox-controller" {
+			continue
+		}
+		// Kustomize applies this named-container strategic merge over the base.
+		base, err := yaml.YAMLToJSON([]byte(document))
+		require.NoError(t, err)
+		patch, err := yaml.YAMLToJSON(readLoggingManifest(t, "all-in-one/controller-all-in-one.yaml"))
+		require.NoError(t, err)
+		merged, err := strategicpatch.StrategicMergePatch(base, patch, appsv1.Deployment{})
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(merged, &deployment))
+		require.Contains(t, deployment.Spec.Template.Spec.Containers[0].Args, "--role=all")
+		requireComponentLogging(t, &deployment.Spec.Template.Spec, "manager")
+		return
+	}
+	t.Fatal("base controller Deployment not found")
+}
+
+func readLoggingManifest(t *testing.T, path string) []byte {
+	t.Helper()
+	absolute, err := filepath.Abs(filepath.Join("..", "..", "..", "config", path))
+	require.NoError(t, err)
+	data, err := os.ReadFile(absolute)
+	require.NoError(t, err)
+	return data
+}
+
+func requireComponentLogging(t *testing.T, spec *corev1.PodSpec, containerNames ...string) {
+	t.Helper()
+	var volumes []corev1.Volume
+	for _, volume := range spec.Volumes {
+		if volume.Name == componentlog.ConfigVolumeName || volume.Name == componentlog.LogVolumeName {
+			volumes = append(volumes, volume)
+		}
+	}
+	require.ElementsMatch(t, []corev1.Volume{
+		{
+			Name: componentlog.ConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: componentlog.ConfigMapName},
+				Optional:             ptr(true),
+				Items:                []corev1.KeyToPath{{Key: componentlog.ConfigFileName, Path: componentlog.ConfigFileName}},
+			}},
+		},
+		{
+			Name:         componentlog.LogVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	}, volumes, "exactly one optional config volume and one disk-backed log emptyDir per Pod")
+
+	var found []string
+	for _, container := range append(append([]corev1.Container(nil), spec.Containers...), spec.InitContainers...) {
+		var mounts []corev1.VolumeMount
+		for _, mount := range container.VolumeMounts {
+			if mount.Name == componentlog.ConfigVolumeName || mount.Name == componentlog.LogVolumeName ||
+				mount.MountPath == componentlog.ConfigMountPath || mount.MountPath == componentlog.LogDirectory {
+				mounts = append(mounts, mount)
+			}
+		}
+		if !slices.Contains(containerNames, container.Name) {
+			require.Empty(t, mounts, "non-target container %s must not receive logging mounts", container.Name)
+			continue
+		}
+		found = append(found, container.Name)
+		require.ElementsMatch(t, []corev1.VolumeMount{
+			{Name: componentlog.ConfigVolumeName, MountPath: componentlog.ConfigMountPath, ReadOnly: true},
+			{Name: componentlog.LogVolumeName, MountPath: componentlog.LogDirectory},
+		}, mounts, container.Name)
+		for _, env := range container.Env {
+			require.NotEqual(t, componentlog.ConfigEnv, env.Name, "use the optional default config path, not an explicit override")
+		}
+	}
+	require.ElementsMatch(t, containerNames, found)
 }
 
 func testSandboxResources() apiv1alpha2.SandboxResourceProfile {

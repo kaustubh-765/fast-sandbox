@@ -68,10 +68,15 @@ type FastletInfo struct {
 	PreparedArtifacts   []string
 	RegistryRevision    string
 	WarmImages          []fastletapi.WarmImageState
-	PodReady            bool
-	RuntimeReady        bool
-	DrainRequested      bool
-	Draining            bool
+	// Capabilities are the heartbeat-advertised feature capabilities
+	// (fastletapi.CapabilityXxx). Dispatch sites gate on them so a request
+	// whose semantics an old Fastlet would silently ignore never reaches
+	// that Fastlet; an absent list means baseline-only behavior.
+	Capabilities   []string
+	PodReady       bool
+	RuntimeReady   bool
+	DrainRequested bool
+	Draining       bool
 
 	Admission fastletapi.AdmissionStatus
 	// ResourceCapacity is the Controller-resolved Sandbox commitment capacity
@@ -112,6 +117,19 @@ func (i FastletInfo) Capacity() int {
 
 func (i FastletInfo) SchedulingUsed() int {
 	return i.Admission.Used + i.InFlightSlots
+}
+
+// SupportsCapability reports whether the Fastlet explicitly advertised the
+// capability in a heartbeat. Absence is authoritative baseline behavior:
+// the caller must fail closed, never assume an old Fastlet understands the
+// feature.
+func (i FastletInfo) SupportsCapability(capability string) bool {
+	for _, item := range i.Capabilities {
+		if item == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // NodeSchedulabilityRegistry receives Node cordon state from the Node
@@ -306,6 +324,7 @@ func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.PreparedArtifacts = append([]string(nil), previous.PreparedArtifacts...)
 	target.RegistryRevision = previous.RegistryRevision
 	target.WarmImages = cloneWarmImageStates(previous.WarmImages)
+	target.Capabilities = append([]string(nil), previous.Capabilities...)
 	target.CacheEpoch = previous.CacheEpoch
 	target.CacheRevision = previous.CacheRevision
 	target.CacheComplete = previous.CacheComplete
@@ -347,6 +366,7 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 	slot.info.PreparedArtifacts = append([]string(nil), heartbeat.PreparedArtifacts...)
 	slot.info.RegistryRevision = heartbeat.RegistryRevision
 	slot.info.WarmImages = cloneWarmImageStates(heartbeat.WarmImages)
+	slot.info.Capabilities = append([]string(nil), heartbeat.Capabilities...)
 	applyHeartbeatAdmission(&slot.info, heartbeat.Admission, observedAt)
 	applyAdmissionResources(&slot.info)
 	if slot.info.RuntimeProfileHash == "" {
@@ -506,14 +526,6 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	if request.Now.IsZero() {
 		request.Now = r.clock()
 	}
-	// Runtimes that cache under a content-addressed key (firecracker: the
-	// directory name is sha256 of the raw reference) report that key in their
-	// inventory, so the hit check accepts it next to the plain reference.
-	imageCacheKey := ""
-	if request.Image != "" {
-		imageCacheKey = artifacts.ImageIndexKey(request.Image)
-	}
-	request.Image = fastletcache.NormalizeReference(request.Image)
 	staleAfter := time.Duration(r.staleAfter.Load())
 	r.mu.RLock()
 	slots := make([]*fastletSlot, 0, len(r.fastlets))
@@ -550,7 +562,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 		ranked = append(ranked, rankedFastlet{
 			slot:        slot,
 			id:          info.ID,
-			imageHit:    imageHit(info, request.Image, imageCacheKey),
+			imageHit:    imageHit(info, request.Image),
 			loadBucket:  int(load * 10),
 			serverOrder: serverOrder,
 			stableOrder: stableOrder(request.StableKey, info.ID),
@@ -736,17 +748,18 @@ func dominantResourceLoad(info FastletInfo, request CandidateRequest) float64 {
 	return max(slotLoad, cpuLoad, memoryLoad)
 }
 
-func imageHit(info FastletInfo, image, cacheKey string) bool {
+func imageHit(info FastletInfo, image string) bool {
 	if image == "" || !info.CacheComplete {
 		return false
 	}
-	return hasImage(info.Images, image) || (cacheKey != "" && hasImage(info.Images, cacheKey))
-}
-
-// hasImage reports whether the sorted inventory holds image.
-func hasImage(images []string, image string) bool {
-	index := sort.SearchStrings(images, image)
-	return index < len(images) && images[index] == image
+	if info.RuntimeName == apiv1alpha2.RuntimeFirecracker {
+		// Firecracker reports cache directory keys derived from the exact reference.
+		image = artifacts.ImageIndexKey(image)
+	} else {
+		image = fastletcache.NormalizeReference(image)
+	}
+	index := sort.SearchStrings(info.Images, image)
+	return index < len(info.Images) && info.Images[index] == image
 }
 
 func stableOrder(key string, id FastletID) uint64 {
@@ -817,6 +830,7 @@ func cloneInfo(info FastletInfo) FastletInfo {
 	info.Images = append([]string(nil), info.Images...)
 	info.PreparedArtifacts = append([]string(nil), info.PreparedArtifacts...)
 	info.WarmImages = cloneWarmImageStates(info.WarmImages)
+	info.Capabilities = append([]string(nil), info.Capabilities...)
 	info.SandboxStatuses = cloneStatuses(info.SandboxStatuses)
 	return info
 }

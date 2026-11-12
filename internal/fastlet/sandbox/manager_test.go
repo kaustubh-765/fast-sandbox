@@ -31,6 +31,43 @@ type MockRuntime struct {
 	getStatusCalls map[string]int
 }
 
+type terminalFailureMockRuntime struct {
+	*MockRuntime
+	recordCalls  int
+	cleanupCalls int
+}
+
+func (m *terminalFailureMockRuntime) SandboxRuntimeExited(string) bool { return true }
+
+func (m *terminalFailureMockRuntime) RecordTerminalFailure(_ context.Context, identity fastletapi.SandboxIdentity, message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordCalls++
+	sandboxID := identity.SandboxUID
+	metadata := m.sandboxes[sandboxID]
+	if metadata == nil {
+		return ErrSandboxNotFound
+	}
+	if metadata.Config.Identity != identity {
+		return errors.New("terminal identity mismatch")
+	}
+	metadata.Phase = sandboxStateRuntimeFailed
+	metadata.RuntimeMessage = message
+	return nil
+}
+
+func (m *terminalFailureMockRuntime) CleanupTerminalFailure(_ context.Context, identity fastletapi.SandboxIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sandboxID := identity.SandboxUID
+	metadata := m.sandboxes[sandboxID]
+	if metadata == nil || metadata.Config.Identity != identity || metadata.Phase != sandboxStateRuntimeFailed {
+		return errors.New("terminal identity was not recorded before cleanup")
+	}
+	m.cleanupCalls++
+	return nil
+}
+
 // NewMockRuntime creates a new mock runtime for testing.
 func NewMockRuntime() *MockRuntime {
 	return &MockRuntime{
@@ -525,7 +562,11 @@ func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
-	mockRuntime := NewMockRuntime()
+	mockRuntime := newAdmissionRuntime()
+	mockRuntime.deleteEntered = make(chan struct{}, 1)
+	mockRuntime.deleteBlock = make(chan struct{})
+	releaseDelete := sync.OnceFunc(func() { close(mockRuntime.deleteBlock) })
+	t.Cleanup(releaseDelete)
 	manager := NewSandboxManager(mockRuntime)
 
 	ctx := context.Background()
@@ -539,17 +580,22 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	require.NoError(t, err, "DeleteSandbox should succeed")
 	assert.NotNil(t, resp)
 
+	// Keep deletion in flight while verifying the intermediate observations.
+	select {
+	case <-mockRuntime.deleteEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runtime deletion did not start")
+	}
 	statuses := manager.GetSandboxStatuses(ctx)
 	require.Len(t, statuses, 1, "Should have one status")
 	assert.Equal(t, spec.SandboxID, statuses[0].SandboxID)
 	assert.Equal(t, fastletapi.RuntimeStateStopping, statuses[0].Runtime.State)
 	assert.Equal(t, fastletapi.DataPlaneStateDraining, statuses[0].DataPlane.State)
 
-	// Wait for async deletion to complete
-	time.Sleep(100 * time.Millisecond)
-
-	statuses = manager.GetSandboxStatuses(ctx)
-	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
+	releaseDelete()
+	require.Eventually(t, func() bool {
+		return len(manager.GetSandboxStatuses(ctx)) == 0
+	}, 3*time.Second, time.Millisecond, "Sandbox should be completely removed after async delete")
 }
 
 func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
@@ -700,6 +746,60 @@ func TestSandboxManager_GetSandboxStatuses_StoppedRuntimeFailsWithoutReleasingAd
 
 	admission, _, _ := manager.State()
 	require.Equal(t, 1, admission.Used, "a failed observation must not release the commitment before cleanup")
+}
+
+func TestSandboxManager_ExitedRuntimeRemainsFailedAcrossRestartUntilDelete(t *testing.T) {
+	runtime := &terminalFailureMockRuntime{MockRuntime: NewMockRuntime()}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-a"})
+	require.NoError(t, err)
+	spec := runtimeSpecForTest("test-sb-terminal", "test-claim", "alpine:latest")
+	request := &fastletapi.CreateSandboxRequest{
+		RequestID: "create-terminal", SpecGeneration: 1,
+		Identity: fastletapi.SandboxIdentity{
+			SandboxUID: spec.SandboxID, Namespace: "default", Name: spec.ClaimName, FastletPodUID: "pod-a",
+			InstanceGeneration: 7, RuntimeInstanceID: "runtime-g7", AssignmentAttempt: 3, RouteGeneration: 1,
+		},
+		Sandbox: spec.SandboxDesiredSpec,
+	}
+	_, err = manager.CreateSandbox(t.Context(), request)
+	require.NoError(t, err)
+	runtime.mu.Lock()
+	exited := *runtime.sandboxes[spec.SandboxID]
+	exited.Phase = "Stopped"
+	runtime.sandboxes[spec.SandboxID] = &exited
+	runtime.mu.Unlock()
+
+	statuses := manager.GetSandboxStatuses(t.Context())
+	require.Len(t, statuses, 1)
+	require.Equal(t, fastletapi.RuntimeStateFailed, statuses[0].Runtime.State)
+	require.Eventually(t, func() bool {
+		admission, _, _ := manager.State()
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return runtime.recordCalls > 0 && runtime.cleanupCalls > 0 && admission.Used == 0
+	}, time.Second, 10*time.Millisecond)
+
+	restarted, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-a", RecoverOnStart: true})
+	require.NoError(t, err)
+	require.NoError(t, restarted.Recover(t.Context()))
+	inspected, err := restarted.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.RuntimeStateFailed, inspected.Sandbox.Runtime.State)
+	require.Equal(t, request.Identity.RuntimeInstanceID, inspected.Sandbox.RuntimeInstanceID)
+	require.Equal(t, "runtime reported stopped and its dedicated cgroup is empty", inspected.Sandbox.Runtime.Message)
+	for range 3 {
+		heartbeat := restarted.GetSandboxStatuses(t.Context())
+		require.Len(t, heartbeat, 1)
+		require.Equal(t, inspected.Sandbox.Runtime.Message, heartbeat[0].Runtime.Message)
+	}
+
+	replayed, err := restarted.CreateSandbox(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.CreateDispositionExisting, replayed.Disposition)
+	require.Equal(t, fastletapi.RuntimeStateFailed, replayed.Sandbox.Runtime.State)
+	_, err = restarted.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !runtime.HasSandbox(spec.SandboxID) }, time.Second, 10*time.Millisecond)
 }
 
 func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {

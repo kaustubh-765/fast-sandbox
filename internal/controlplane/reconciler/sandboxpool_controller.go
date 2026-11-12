@@ -34,6 +34,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
@@ -42,6 +43,7 @@ import (
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	"fast-sandbox/internal/runtimeenv"
+	"fast-sandbox/pkg/util/idgen"
 )
 
 // SandboxPoolReconciler reconciles SandboxPool resources.
@@ -67,6 +69,10 @@ type SandboxPoolReconciler struct {
 
 type FastletDrainer interface {
 	SetDraining(context.Context, string, *fastletapi.SetDrainingRequest) (*fastletapi.SetDrainingResponse, error)
+}
+
+type fastletDrainHeartbeater interface {
+	Heartbeat(context.Context, string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
 }
 
 const (
@@ -123,6 +129,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var pool apiv1alpha2.SandboxPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// A deleting Pool must not replenish the children being removed.
+	if pool.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
 	}
 	// The Identity struct has no pool field, so attach the pool key directly:
 	// every log in this reconcile (drain retries, scale-up, condition writes)
@@ -225,6 +235,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// provision Fastlets until both configurations are valid.
 	var childPods corev1.PodList
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
+		return ctrl.Result{}, err
+	}
+	childPods.Items, err = r.removeRetiredFastlets(ctx, &pool, childPods.Items)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	appliedRegistry, totalRegistry := r.registryRolloutCounts(&pool, compiledRegistry, childPods.Items)
@@ -401,6 +415,28 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *SandboxPoolReconciler) removeRetiredFastlets(ctx context.Context, pool *apiv1alpha2.SandboxPool, pods []corev1.Pod) ([]corev1.Pod, error) {
+	active := pods[:0]
+	for index := range pods {
+		pod := &pods[index]
+		terminal := pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+		if !metav1.IsControlledBy(pod, pool) || (!terminal && pod.DeletionTimestamp == nil) {
+			active = append(active, *pod)
+			continue
+		}
+		// Deleting Pods no longer admit work, even while Running. Terminal
+		// Pods cannot recover or acknowledge a drain, so retire their exact UID.
+		// Preserve deletion in progress and leave cleanup fences intact.
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+				return nil, err
+			}
+			klog.FromContext(ctx).Info("retired terminal Fastlet Pod", "pod", pod.Name, "podUID", pod.UID, "phase", pod.Status.Phase)
+		}
+	}
+	return active, nil
 }
 
 func (r *SandboxPoolReconciler) aggregateWarmImageStatus(
@@ -908,7 +944,7 @@ func (r *SandboxPoolReconciler) runtimeCapabilityCondition(pool *apiv1alpha2.San
 	return condition, ready
 }
 
-func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-existing drain state machine; refactor tracked separately
+func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit,gocyclo // persisted drain state machine; refactor tracked separately
 	ctx context.Context,
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
@@ -983,7 +1019,10 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 		timeout = defaultDrainTimeout
 	}
 	for _, pod := range draining {
-		acked, err := r.requestDrain(ctx, pod, true, pod.Annotations[placement.AnnotationDrainReason])
+		protectedUpgrade := pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker &&
+			pool.Spec.SandboxResources.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware &&
+			pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonPlannedUpgrade
+		response, err := r.requestDrain(ctx, pod, true, pod.Annotations[placement.AnnotationDrainReason])
 		if err != nil {
 			// Re-fires every drain requeue until acked; the attempt counter
 			// keeps the repeats attributable without suppressing them.
@@ -997,15 +1036,29 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 				klog.FromContext(ctx).V(1).Error(err, "Retry Fastlet drain request still failing", "pod", pod.Name, "attempt", attempt)
 			}
 		}
-		empty := active[podIdentity(pod)] == 0
-		if resourceAware {
-			identity := podIdentity(pod)
-			info, exists := observedFastlets[identity]
-			empty = exists && fastletResourceObservationFresh(info, now) && info.SchedulingUsed() == 0 &&
-				awaitingAdmission[identity] == 0
+		identity := podIdentity(pod)
+		info, observed := observedFastlets[identity]
+		empty := false
+		legacy := legacyDrainResponse(response)
+		if err == nil {
+			requireResources := resourceAware || protectedUpgrade
+			if legacy {
+				empty, err = r.legacyDrainObservationEmpty(ctx, pod, requireResources)
+				if err != nil {
+					klog.FromContext(ctx).V(1).Error(err, "Fresh heartbeat after legacy drain ACK failed", "pod", pod.Name)
+				}
+			} else {
+				empty = drainResponseEmpty(response, requireResources)
+			}
+			if observed && info.InFlightSlots != 0 {
+				empty = false
+			}
+			empty = empty && awaitingAdmission[identity] == 0
+		}
+		if active[identity] != 0 {
+			empty = false
 		}
 		timedOut := !drainStartedAt(pod).IsZero() && now.Sub(drainStartedAt(pod)) >= timeout
-		previouslyAcked := pod.Annotations[placement.AnnotationDrainAckedAt] != ""
 		if timedOut && !empty && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
 			if err := r.cancelDrain(ctx, pod); err != nil {
 				return ctrl.Result{}, true, err
@@ -1013,7 +1066,15 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 			klog.FromContext(ctx).Info("cancelled loaded scale-down drain after timeout", "pod", pod.Name)
 			continue
 		}
-		if (empty && (acked || previouslyAcked)) || timedOut {
+		if protectedUpgrade && !empty {
+			if timedOut {
+				klog.FromContext(ctx).Info("planned Fastlet replacement blocked until drain is acknowledged and empty", "pod", pod.Name)
+			}
+			continue
+		}
+		// Legacy ACKs carry no attempt-bound inventory. Even after timeout,
+		// deletion requires a fresh empty snapshot fetched after this ACK.
+		if err == nil && (empty || timedOut && !legacy) {
 			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, true, err
 			}
@@ -1123,18 +1184,24 @@ func selectDrainTargets(
 }
 
 func (r *SandboxPoolReconciler) startDrain(ctx context.Context, pod *corev1.Pod, reason string) error {
+	drainID, err := idgen.GenerateRequestID()
+	if err != nil {
+		return fmt.Errorf("generate drain ID for Fastlet Pod %s: %w", pod.Name, err)
+	}
 	before := pod.DeepCopy()
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[placement.AnnotationDraining] = "true"
 	pod.Annotations[placement.AnnotationDrainStartedAt] = r.now().UTC().Format(time.RFC3339Nano)
+	pod.Annotations[placement.AnnotationDrainID] = drainID
 	pod.Annotations[placement.AnnotationDrainReason] = reason
 	delete(pod.Annotations, placement.AnnotationDrainAckedAt)
+	delete(pod.Annotations, placement.AnnotationDrainAckedID)
 	if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
 		return fmt.Errorf("persist drain intent for Fastlet Pod %s: %w", pod.Name, err)
 	}
-	_, err := r.requestDrain(ctx, pod, true, reason)
+	_, err = r.requestDrain(ctx, pod, true, reason)
 	return err
 }
 
@@ -1145,43 +1212,117 @@ func (r *SandboxPoolReconciler) cancelDrain(ctx context.Context, pod *corev1.Pod
 	before := pod.DeepCopy()
 	delete(pod.Annotations, placement.AnnotationDraining)
 	delete(pod.Annotations, placement.AnnotationDrainStartedAt)
+	delete(pod.Annotations, placement.AnnotationDrainID)
 	delete(pod.Annotations, placement.AnnotationDrainReason)
 	delete(pod.Annotations, placement.AnnotationDrainAckedAt)
+	delete(pod.Annotations, placement.AnnotationDrainAckedID)
 	return r.Patch(ctx, pod, client.MergeFrom(before))
 }
 
-func (r *SandboxPoolReconciler) requestDrain(ctx context.Context, pod *corev1.Pod, draining bool, reason string) (bool, error) {
+func (r *SandboxPoolReconciler) requestDrain(ctx context.Context, pod *corev1.Pod, draining bool, reason string) (*fastletapi.SetDrainingResponse, error) {
 	if r.FastletDrainer == nil {
-		return false, errors.New("Fastlet drain client is not configured")
+		return nil, errors.New("Fastlet drain client is not configured")
 	}
 	if pod.Status.PodIP == "" {
-		return false, fmt.Errorf("fastlet Pod %s has no Pod IP", pod.Name)
+		return nil, fmt.Errorf("fastlet Pod %s has no Pod IP", pod.Name)
 	}
-	response, err := r.FastletDrainer.SetDraining(ctx, pod.Status.PodIP, &fastletapi.SetDrainingRequest{Draining: draining, Reason: reason})
+	if draining && pod.Annotations[placement.AnnotationDrainID] == "" {
+		drainID, err := idgen.GenerateRequestID()
+		if err != nil {
+			return nil, fmt.Errorf("generate drain ID for Fastlet Pod %s: %w", pod.Name, err)
+		}
+		before := pod.DeepCopy()
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations[placement.AnnotationDrainID] = drainID
+		delete(pod.Annotations, placement.AnnotationDrainAckedAt)
+		delete(pod.Annotations, placement.AnnotationDrainAckedID)
+		if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			return nil, fmt.Errorf("persist drain ID for Fastlet Pod %s: %w", pod.Name, err)
+		}
+	}
+	drainID := pod.Annotations[placement.AnnotationDrainID]
+	response, err := r.FastletDrainer.SetDraining(ctx, pod.Status.PodIP, &fastletapi.SetDrainingRequest{
+		Draining: draining, Reason: reason, DrainID: drainID, FastletPodUID: string(pod.UID),
+	})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if response == nil || response.Draining != draining {
-		return false, fmt.Errorf("fastlet Pod %s returned an inconsistent drain state", pod.Name)
+		return nil, fmt.Errorf("fastlet Pod %s returned an inconsistent drain state", pod.Name)
 	}
-	if draining && pod.Annotations[placement.AnnotationDrainAckedAt] == "" {
+	if !legacyDrainResponse(response) && (response.FastletPodUID != string(pod.UID) || response.DrainID != drainID) {
+		return nil, fmt.Errorf("fastlet Pod %s returned a drain snapshot for another Pod or attempt", pod.Name)
+	}
+	if draining && (pod.Annotations[placement.AnnotationDrainAckedAt] == "" || pod.Annotations[placement.AnnotationDrainAckedID] != drainID) {
 		before := pod.DeepCopy()
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)
 		}
 		pod.Annotations[placement.AnnotationDrainAckedAt] = r.now().UTC().Format(time.RFC3339Nano)
+		pod.Annotations[placement.AnnotationDrainAckedID] = drainID
 		if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
-			return false, err
+			return nil, err
 		}
 	}
-	return true, nil
+	return response, nil
+}
+
+func legacyDrainResponse(response *fastletapi.SetDrainingResponse) bool {
+	return response != nil && response.FastletPodUID == "" && response.DrainID == "" && response.Admission == nil
+}
+
+func drainResponseEmpty(response *fastletapi.SetDrainingResponse, requireResources bool) bool {
+	return response != nil && response.Draining && response.RuntimeReady && !response.Recovering &&
+		admissionSnapshotEmpty(response.Admission, requireResources)
+}
+
+func (r *SandboxPoolReconciler) legacyDrainObservationEmpty(ctx context.Context, pod *corev1.Pod, requireResources bool) (bool, error) {
+	heartbeater, ok := r.FastletDrainer.(fastletDrainHeartbeater)
+	if !ok {
+		return false, errors.New("legacy drain requires a fresh heartbeat after acknowledgement")
+	}
+	// The request must start after SetDraining returns. A cached heartbeat's
+	// receive time cannot fence a delayed response from an earlier attempt.
+	heartbeat, err := heartbeater.Heartbeat(ctx, pod.Status.PodIP, &fastletapi.HeartbeatRequest{})
+	if err != nil {
+		return false, err
+	}
+	if heartbeat == nil || heartbeat.FastletPodUID == "" || heartbeat.FastletPodUID != string(pod.UID) {
+		return false, fmt.Errorf("legacy drain heartbeat does not identify Fastlet Pod %s", pod.Name)
+	}
+	return heartbeat.Draining && heartbeat.RuntimeReady && !heartbeat.Recovering &&
+		admissionSnapshotEmpty(&heartbeat.Admission, requireResources), nil
+}
+
+func admissionSnapshotEmpty(admission *fastletapi.AdmissionStatus, requireResources bool) bool {
+	if admission == nil || admission.Used != 0 || admission.Creating != 0 || admission.Running != 0 || admission.Deleting != 0 {
+		return false
+	}
+	if !requireResources {
+		return true
+	}
+	resources := admission.Resources
+	if resources == nil || resources.Version != "v2" || resources.Epoch == "" || resources.Reason == fastletapi.AdmissionReasonUnsupportedProtocol {
+		return false
+	}
+	cpu, cpuErr := resource.ParseQuantity(resources.Committed.CPU)
+	memory, memoryErr := resource.ParseQuantity(resources.Committed.Memory)
+	return cpuErr == nil && memoryErr == nil && cpu.Sign() == 0 && memory.Sign() == 0
+}
+
+func fastletResourceObservationFresh(info placement.FastletInfo, now time.Time) bool {
+	return !info.LastHeartbeat.IsZero() && !info.ResourceReceivedAt.IsZero() &&
+		now.Sub(info.LastHeartbeat) <= placement.DefaultObservationStaleAfter &&
+		now.Sub(info.ResourceReceivedAt) <= placement.DefaultObservationStaleAfter
 }
 
 func activeAssignmentsByPod(sandboxes []apiv1alpha2.Sandbox, poolName string) map[string]int {
 	result := make(map[string]int)
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.Spec.PoolRef != poolName || sandbox.Status.Placement.FastletName == "" {
+		if sandbox.Spec.PoolRef != poolName || sandbox.Status.Placement.FastletName == "" || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		placement := sandbox.Status.Placement
@@ -1198,7 +1339,7 @@ func awaitingAdmissionByFastlet(
 	result := make(map[string]int)
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.DeletionTimestamp != nil || sandbox.Status.Placement.FastletName == "" || sandbox.Status.Placement.FastletPodUID == "" {
+		if sandbox.DeletionTimestamp != nil || sandbox.Status.Placement.FastletName == "" || sandbox.Status.Placement.FastletPodUID == "" || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		identity := sandbox.Status.Placement.FastletName + "/" + string(sandbox.Status.Placement.FastletPodUID)
@@ -1207,12 +1348,6 @@ func awaitingAdmissionByFastlet(
 		}
 	}
 	return result
-}
-
-func fastletResourceObservationFresh(info placement.FastletInfo, now time.Time) bool {
-	return !info.LastHeartbeat.IsZero() && !info.ResourceReceivedAt.IsZero() &&
-		now.Sub(info.LastHeartbeat) <= placement.DefaultObservationStaleAfter &&
-		now.Sub(info.ResourceReceivedAt) <= placement.DefaultObservationStaleAfter
 }
 
 func sandboxNeedsPlacement(sandbox *apiv1alpha2.Sandbox) bool {
@@ -1290,7 +1425,7 @@ func poolSlotDemandCounts(
 ) (active int32, pending int32) {
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.Spec.PoolRef != poolName || sandbox.DeletionTimestamp != nil {
+		if sandbox.Spec.PoolRef != poolName || sandbox.DeletionTimestamp != nil || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		if sandbox.Status.Placement.FastletName != "" {
@@ -1455,6 +1590,9 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	}
 
 	runtimeResourceOwner := podSpec.Containers[0].Name
+	needsHostCgroup := profile.Driver == runtimecatalog.DriverKindContainerd ||
+		(profile.Driver == runtimecatalog.DriverKindFirecracker &&
+			resolvedResources.Mode == apiv1alpha2.SandboxResourceModeResourceAware)
 	if len(podSpec.Containers) > 0 {
 		c := &podSpec.Containers[0]
 		if c.SecurityContext == nil {
@@ -1525,7 +1663,8 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir},
 		)
-		if profile.Driver == runtimecatalog.DriverKindContainerd {
+		c.VolumeMounts = append(c.VolumeMounts, componentLogVolumeMounts()...)
+		if needsHostCgroup {
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
 				Name: podcgroup.VolumeName, MountPath: podcgroup.HostRoot,
 			})
@@ -1564,7 +1703,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP},
 			{Name: "proxy-metrics", ContainerPort: 9093, Protocol: corev1.ProtocolTCP},
 		},
-		VolumeMounts: []corev1.VolumeMount{{Name: proxyControlVolumeName, MountPath: proxyRunDir}},
+		VolumeMounts: append(componentLogVolumeMounts(), corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir}),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/readyz", Port: intstr.FromInt32(5780), Scheme: corev1.URISchemeHTTP,
@@ -1615,7 +1754,8 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		},
 		corev1.Volume{Name: proxyControlVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
-	if profile.Driver == runtimecatalog.DriverKindContainerd {
+	podSpec.Volumes = append(podSpec.Volumes, componentLogVolumes()...)
+	if needsHostCgroup {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: podcgroup.VolumeName,
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
@@ -1756,17 +1896,43 @@ func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.Pod
 	return false
 }
 
+func componentLogVolumeMounts() []corev1.VolumeMount {
+	return []corev1.VolumeMount{
+		{Name: componentlog.ConfigVolumeName, MountPath: componentlog.ConfigMountPath, ReadOnly: true},
+		{Name: componentlog.LogVolumeName, MountPath: componentlog.LogDirectory},
+	}
+}
+
+func componentLogVolumes() []corev1.Volume {
+	return []corev1.Volume{
+		{
+			Name: componentlog.ConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: componentlog.ConfigMapName},
+				Optional:             boolPtr(true),
+				Items:                []corev1.KeyToPath{{Key: componentlog.ConfigFileName, Path: componentlog.ConfigFileName}},
+			}},
+		},
+		{
+			Name:         componentlog.LogVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	}
+}
+
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
-		tmpVolumeName:              tmpDir,
-		infraToolsVolumeName:       infraHostPath,
-		infraPlanVolumeName:        "/etc/fast-sandbox/infra",
-		runtimePlanVolumeName:      runtimeenv.PlanMountPath,
-		registryConfigVolumeName:   registryConfigDir,
-		fastletsettings.VolumeName: fastletsettings.MountPath,
-		proxyControlVolumeName:     proxyRunDir,
-		nodeCleanupVolumeName:      filepath.Dir(nodecleanup.DefaultSocketPath),
-		podcgroup.VolumeName:       podcgroup.HostRoot,
+		tmpVolumeName:                 tmpDir,
+		infraToolsVolumeName:          infraHostPath,
+		infraPlanVolumeName:           "/etc/fast-sandbox/infra",
+		runtimePlanVolumeName:         runtimeenv.PlanMountPath,
+		registryConfigVolumeName:      registryConfigDir,
+		fastletsettings.VolumeName:    fastletsettings.MountPath,
+		proxyControlVolumeName:        proxyRunDir,
+		nodeCleanupVolumeName:         filepath.Dir(nodecleanup.DefaultSocketPath),
+		podcgroup.VolumeName:          podcgroup.HostRoot,
+		componentlog.ConfigVolumeName: componentlog.ConfigMountPath,
+		componentlog.LogVolumeName:    componentlog.LogDirectory,
 	}
 	for _, volume := range podSpec.Volumes {
 		if _, reserved := reservedVolumes[volume.Name]; reserved {
@@ -1961,6 +2127,9 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		},
 		PodMemoryBudget:     podMemoryBudget,
 		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
+	}
+	if pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker {
+		bundle.ResourceAdmission.Version = fastletsettings.BoundedFirecrackerVersion
 	}
 	return bundle, nil
 }

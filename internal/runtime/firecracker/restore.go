@@ -216,7 +216,14 @@ func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
+	if document.IsRootfsOnly() {
+		return fmt.Errorf("%w: RootfsOnly cold boot is not yet enabled in Fastlet", ErrIncompatibleArtifact)
+	}
+	selected, err := d.selectVMM(context.Background(), document.Compatibility.FirecrackerVersion)
+	if err != nil {
+		return err
+	}
+	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.selectionVersion(selected), image)
 }
 
 // parseMemMiB parses a resource quantity into whole MiB.

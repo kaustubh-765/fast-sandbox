@@ -4,6 +4,8 @@ Fast Sandbox uses Prometheus metrics for bounded SLO signals, OpenTelemetry trac
 
 ## Logging conventions
 
+First-party Kubernetes services use shared file logging and rotation, with optional stderr mirroring. See [Component file logging and rotation](component-logging.md) for configuration, covered processes, retention, and inspection commands; `kubectl logs` does not read component log files.
+
 All services log through `k8s.io/klog/v2`. One style applies everywhere:
 
 - Messages are constant strings starting lowercase — except when the first
@@ -125,6 +127,8 @@ identities remain trace/log fields only.
 See [Performance](performance.md) for the complete latency boundary and benchmark contract.
 
 ## Diagnostics
+
+ResourceAware direct Firecracker exports `fast_sandbox_runtime_cgroup_memory_limit_bytes` for the shared pool and each live Sandbox leaf. An empty `sandbox_uid` selects the bounded pool; a leaf with `memory.max=max` reports `+Inf`, rather than omitting the series. A missing series therefore does not represent an unlimited memory ceiling.
 
 ```bash
 bin/fastctl --endpoint localhost:9090 \

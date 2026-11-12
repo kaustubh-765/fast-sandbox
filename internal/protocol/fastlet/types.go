@@ -94,6 +94,7 @@ type RuntimeSandboxConfig struct {
 	ActionsAPIVersion string               `json:"actionsApiVersion,omitempty"`
 	Desired           SandboxDesiredSpec   `json:"desired"`
 	Limits            SandboxRuntimeLimits `json:"limits"`
+	CPURequest        string               `json:"cpuRequest,omitempty"` // Validated commitment used for host CPU weight.
 }
 
 // UnmarshalJSON keeps durable runtime state written before desired state and
@@ -112,6 +113,7 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 		ActionsAPIVersion string                    `json:"actionsApiVersion,omitempty"`
 		Desired           *SandboxDesiredSpec       `json:"desired"`
 		Limits            *SandboxRuntimeLimits     `json:"limits"`
+		CPURequest        string                    `json:"cpuRequest,omitempty"`
 		Spec              *legacyRuntimeSandboxSpec `json:"spec"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -120,7 +122,7 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 	if wire.Desired != nil && wire.Spec != nil {
 		return errors.New("runtime Sandbox config cannot contain both desired and legacy spec")
 	}
-	*c = RuntimeSandboxConfig{Identity: wire.Identity, ActionsAPIVersion: wire.ActionsAPIVersion}
+	*c = RuntimeSandboxConfig{Identity: wire.Identity, ActionsAPIVersion: wire.ActionsAPIVersion, CPURequest: wire.CPURequest}
 	if wire.Spec != nil {
 		c.Desired = wire.Spec.SandboxDesiredSpec
 		c.Limits = SandboxRuntimeLimits{CPU: wire.Spec.CPU, Memory: wire.Spec.Memory, PIDs: wire.Spec.PIDs}
@@ -254,7 +256,19 @@ type FastletStatus struct {
 	PreparedArtifacts   []string         `json:"preparedArtifacts,omitempty"`
 	RegistryRevision    string           `json:"registryRevision,omitempty"`
 	WarmImages          []WarmImageState `json:"warmImages,omitempty"`
+	// Capabilities are the explicitly advertised feature capabilities of
+	// this Fastlet build (CapabilityXxx constants). The control plane gates
+	// dispatch on them: an old Fastlet reports none and must never receive
+	// a request whose semantics depend on a capability it silently ignores.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// CapabilityRootfsOnlySnapshots marks a Fastlet whose runtime driver
+// implements rootfs-only snapshot capture (SnapshotSpec.Mode == RootfsOnly).
+// The control plane requires this capability before dispatching a
+// RootfsOnly snapshot; a Fastlet that does not advertise it would silently
+// execute Full (unknown JSON fields are ignored).
+const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
 
 type WarmImageState struct {
 	Image   string `json:"image"`
@@ -506,12 +520,20 @@ type InvokeHandlerResponse struct {
 }
 
 type SetDrainingRequest struct {
-	Draining bool   `json:"draining"`
-	Reason   string `json:"reason,omitempty"`
+	Draining      bool   `json:"draining"`
+	Reason        string `json:"reason,omitempty"`
+	DrainID       string `json:"drainId,omitempty"`
+	FastletPodUID string `json:"fastletPodUid,omitempty"`
 }
 
 type SetDrainingResponse struct {
-	Draining bool `json:"draining"`
+	Draining      bool             `json:"draining"`
+	DrainID       string           `json:"drainId,omitempty"`
+	FastletPodUID string           `json:"fastletPodUid,omitempty"`
+	Admission     *AdmissionStatus `json:"admission,omitempty"`
+	Recovering    bool             `json:"recovering"`
+	RuntimeReady  bool             `json:"runtimeReady"`
+	Error         *FastletError    `json:"error,omitempty"`
 }
 
 type RuntimeDiagnostics struct {
@@ -616,7 +638,23 @@ type SnapshotIdentity struct {
 }
 
 // SnapshotSpec is the desired snapshot configuration.
+// SnapshotMode explicitly distinguishes Full from disk-only capture; an empty value preserves legacy Full semantics.
+type SnapshotMode string
+
+const (
+	SnapshotModeFull       SnapshotMode = "Full"
+	SnapshotModeRootfsOnly SnapshotMode = "RootfsOnly"
+)
+
+func NormalizeSnapshotMode(mode SnapshotMode) SnapshotMode {
+	if mode == "" {
+		return SnapshotModeFull
+	}
+	return mode
+}
+
 type SnapshotSpec struct {
+	Mode SnapshotMode `json:"mode,omitempty"`
 	// Kind selects the publish mode. Empty is treated as SnapshotKindTemplate
 	// so callers that predate checkpoints keep working.
 	Kind SnapshotKind `json:"kind,omitempty"`
@@ -637,8 +675,12 @@ type SnapshotStatus struct {
 	ManifestRef    string        `json:"manifestRef,omitempty"`
 	ArtifactDigest string        `json:"artifactDigest,omitempty"`
 	SizeBytes      int64         `json:"sizeBytes,omitempty"`
-	StartedAt      time.Time     `json:"startedAt,omitempty"`
-	CompletedAt    time.Time     `json:"completedAt,omitempty"`
+	// Mode is the artifact class of the task: the admitted mode while
+	// in flight, the produced artifact's mode once terminal. Empty means
+	// Full (a pre-mode Fastlet never sets it).
+	Mode        SnapshotMode `json:"mode,omitempty"`
+	StartedAt   time.Time    `json:"startedAt,omitempty"`
+	CompletedAt time.Time    `json:"completedAt,omitempty"`
 }
 
 // CreateSnapshotRequest registers one snapshot task. The response returns

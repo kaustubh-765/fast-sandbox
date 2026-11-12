@@ -185,6 +185,10 @@ sudo "$FSB_VM" build \
 - `<registry-repository>:v1.0.0_rootfs`;
 - `<registry-repository>:v1.0.0_snapfiles`.
 
+`build` streams phase logs to stdout before the final artifact summary. Each entry includes a UTC timestamp, cumulative build time (`[build ...]`), phase name, status (`started`, `completed`, or `failed`), and phase duration. Stages cover source resolution and layer preparation, rootfs preparation, runtime injection, guest startup and readiness, the optional guest-control probe, snapshot capture and packaging, layer sealing, and local artifact finalization. A phase starts before its blocking work, so a stalled build leaves the active phase visible. Guest serial output remains in the build work directory; it is not streamed.
+
+For OCI template builds, `sandboxtemplate-builder` also records its own preparation, `fsb-vm build`, publication, and result-reporting phases through the [component logger](component-logging.md), with `elapsedMs` and `durationMs` fields. These logs follow the configured file rotation and optional stderr mirroring. Registry publication is a separate `fsb-vm push` command; its stdout remains a single JSON result, without progress text.
+
 Common build options:
 
 | Option | Default | Description |
@@ -202,6 +206,7 @@ Common build options:
 | `--username` | empty | Registry credentials as `username:password` |
 | `--keep-work-dir` | `false` | Keep build scratch after success |
 | `--no-compress` | `false` | Disable zfile compression when committing layers |
+| `--guest-control-port` | `0` (disabled) | Cold-boot probe that validates the guest-control helper injected via `--inject-dir` over vsock; only the reserved port `1234` is accepted. On success the template manifest records the `guestControl` capability; a failed probe fails the build |
 
 `build` does not execute the source image's OCI Entrypoint, Cmd, or Env automatically. For non-Redis workloads, provide `--init-script-file` and make the script print a stable string matching `--ready-pattern` only after the service is ready. `--init-path` must be a clean absolute guest path without whitespace; `os.Root`-confined writes prevent image symlinks from escaping onto the host. Every build uses an independent temporary scratch directory, and a non-blocking per-output lock rejects a second concurrent build of the same `--output`.
 
@@ -455,6 +460,8 @@ sudo "$FSB_VM" \
 Do not reuse a `sandbox_id` that still exists locally.
 
 Snapfiles devices and mounts are shared by default for identical resolved layers and credential scope within the same `--state-dir` and mount namespace. Writable rootfs devices and uppers remain private. Each Sandbox keeps a durable snapfiles lease until deletion.
+
+If a cached snapfiles device disappears, for example after an `overlaybd-ublkd` restart, the next create rebuilds it from the template after safely unmounting and cleaning up the stale attachment. Recovery is allowed only when no other Sandbox holds a lease; otherwise creation fails without replacing the shared device. Delete the affected Sandboxes before retrying rather than manually removing the shared cache.
 
 ## 8. Inspect VMs
 

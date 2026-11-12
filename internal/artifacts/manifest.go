@@ -27,6 +27,7 @@ const (
 // Platform is optional for standalone fsb-vm use. Files lists native VM
 // artifacts only; platform state is described once in Platform.StateFiles.
 type VMManifest struct {
+	GuestControl  *VMGuestControl       `json:"guestControl,omitempty"`
 	SchemaVersion int                   `json:"schemaVersion"`
 	Runtime       string                `json:"runtime"`
 	Machine       VMMachine             `json:"machine"`
@@ -55,6 +56,9 @@ type VMMachine struct {
 }
 
 type VMKernel struct {
+	// SHA256 identifies the kernel used at cold boot, including the kernel in Full RAM state.
+	SHA256  string `json:"sha256,omitempty"`
+	Cmdline string `json:"cmdline,omitempty"`
 	Version string `json:"version"`
 }
 
@@ -89,7 +93,15 @@ type ManifestFile struct {
 	ChunkList *ChunkListDigest `json:"chunkList,omitempty"`
 }
 
+type VMGuestControl struct {
+	Protocol      string `json:"protocol"`
+	Transport     string `json:"transport"`
+	Port          uint32 `json:"port"`
+	HelperVersion string `json:"helperVersion"`
+}
+
 type VMPlatform struct {
+	SnapshotMode string                  `json:"snapshotMode,omitempty"`
 	Execd        string                  `json:"execd,omitempty"`
 	Entrypoint   []string                `json:"entrypoint,omitempty"`
 	Init         string                  `json:"init,omitempty"`
@@ -130,6 +142,17 @@ func DecodeVMManifest(raw []byte) (VMManifest, error) {
 }
 
 func (m VMManifest) Validate() error {
+	if m.Kernel.SHA256 != "" {
+		decoded, err := hex.DecodeString(m.Kernel.SHA256)
+		if err != nil || len(decoded) != sha256.Size {
+			return errors.New("invalid kernel.sha256")
+		}
+	}
+	if c := m.GuestControl; c != nil {
+		if c.Protocol != "fsb-freeze-v1" || c.Transport != "vsock" || c.Port == 0 || c.Port == 4294967295 || strings.TrimSpace(c.HelperVersion) == "" || len(c.HelperVersion) > 128 {
+			return errors.New("unsupported guestControl capability")
+		}
+	}
 	if m.SchemaVersion != VMManifestVersion || m.Runtime != "firecracker" {
 		return fmt.Errorf("unsupported VM manifest version/runtime: %d/%q", m.SchemaVersion, m.Runtime)
 	}
@@ -142,17 +165,8 @@ func (m VMManifest) Validate() error {
 	if m.Kernel.Version == "" || m.Compatibility.CPUArch == "" || !KnownFirecrackerVersion(m.Compatibility.FirecrackerVersion) {
 		return fmt.Errorf("VM manifest requires kernel.version, compatibility.cpuArch and a known firecrackerVersion")
 	}
-	switch m.Compatibility.CPUTemplate {
-	case CPUTemplateNone:
-		if m.Compatibility.Vendor == "" || m.Compatibility.Vendor == unknownProvenanceValue || m.Compatibility.CPUFamily < 1 || m.Compatibility.CPUModel < 1 || m.Compatibility.CPUStepping < 0 {
-			return fmt.Errorf("unmasked VM manifest requires a resolved CPU identity")
-		}
-	case CPUTemplateT2, CPUTemplateT2A:
-		if len(cpuTemplateAllowlists[m.Compatibility.FirecrackerVersion][m.Compatibility.CPUTemplate]) == 0 {
-			return fmt.Errorf("unsupported CPU template/version %s/%s", m.Compatibility.CPUTemplate, m.Compatibility.FirecrackerVersion)
-		}
-	default:
-		return fmt.Errorf("unsupported cpuTemplate %q", m.Compatibility.CPUTemplate)
+	if err := m.validateSnapshotMode(); err != nil {
+		return err
 	}
 	if network := m.GuestNetwork; network != nil {
 		if _, err := net.ParseMAC(network.MAC); err != nil || network.Iface == "" {
@@ -167,8 +181,16 @@ func (m VMManifest) Validate() error {
 	return validateVMPlatform(m.Platform)
 }
 
+// IsRootfsOnly recognizes only the explicit mode; legacy manifests retain Full semantics.
+func (m VMManifest) IsRootfsOnly() bool {
+	return m.Platform != nil && m.Platform.SnapshotMode == "rootfsOnly"
+}
+
 func validateVMPlatform(platform *VMPlatform) error {
 	if platform != nil {
+		if platform.SnapshotMode != "" && platform.SnapshotMode != "rootfsOnly" {
+			return errors.New("unsupported snapshotMode")
+		}
 		if owner := platform.Checkpoint; owner != nil && (strings.TrimSpace(owner.SandboxUID) == "" || strings.TrimSpace(owner.Namespace) == "") {
 			return fmt.Errorf("checkpoint requires sandboxUID and namespace")
 		}
@@ -483,6 +505,17 @@ var cpuTemplateAllowlists = map[string]map[string][]fms{
 			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
 		},
 	},
+	// T2 and T2A are unchanged between upstream v1.16.1 and v1.17.0.
+	"1.17.0": {
+		CPUTemplateT2: {
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 4},  // Skylake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 7},  // Cascade Lake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 106, stepping: 6}, // Ice Lake-SP
+		},
+		CPUTemplateT2A: {
+			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
+		},
+	},
 }
 
 // CompatibilityCPUTemplate reports which template tier the identity
@@ -584,4 +617,37 @@ func SizeGiB(sizeBytes int64) int {
 func sha256Sum(payload []byte) string {
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:])
+}
+
+func (m VMManifest) validateSnapshotMode() error {
+	if m.IsRootfsOnly() {
+		if strings.TrimSpace(m.Kernel.Cmdline) == "" || strings.ContainsAny(m.Kernel.Cmdline, "\x00\n\r") {
+			return errors.New("rootfsOnly requires a valid kernel.cmdline")
+		}
+		if m.Platform.Checkpoint != nil {
+			return errors.New("rootfsOnly is a template, not a checkpoint")
+		}
+		if m.Compatibility.CPUArch != "x86_64" && m.Compatibility.CPUArch != "aarch64" {
+			return errors.New("unsupported rootfsOnly CPU architecture")
+		}
+		for _, name := range []string{"vmstate.snap", "memory.snap"} {
+			if _, ok := m.Files[name]; ok {
+				return errors.New("rootfsOnly must not contain VM state or RAM")
+			}
+		}
+	} else {
+		switch m.Compatibility.CPUTemplate {
+		case CPUTemplateNone:
+			if m.Compatibility.Vendor == "" || m.Compatibility.Vendor == unknownProvenanceValue || m.Compatibility.CPUFamily < 1 || m.Compatibility.CPUModel < 1 || m.Compatibility.CPUStepping < 0 {
+				return fmt.Errorf("unmasked VM manifest requires a resolved CPU identity")
+			}
+		case CPUTemplateT2, CPUTemplateT2A:
+			if len(cpuTemplateAllowlists[m.Compatibility.FirecrackerVersion][m.Compatibility.CPUTemplate]) == 0 {
+				return fmt.Errorf("unsupported CPU template/version %s/%s", m.Compatibility.CPUTemplate, m.Compatibility.FirecrackerVersion)
+			}
+		default:
+			return fmt.Errorf("unsupported cpuTemplate %q", m.Compatibility.CPUTemplate)
+		}
+	}
+	return nil
 }

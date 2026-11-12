@@ -24,10 +24,16 @@ func (f *fakeProcess) Wait() error { return nil }
 
 type fakeProcessRunner struct {
 	started [][]string
+	cgroups []string
 	err     error
 	// processes records every process handed out so tests can assert the
 	// killAndForget path (tracked processes die via Kill, not killProcess).
 	processes []*fakeProcess
+}
+
+func (f *fakeProcessRunner) StartInCgroup(_ context.Context, cgroupPath, _ string, name string, args []string, _ string) (Process, error) {
+	f.cgroups = append(f.cgroups, cgroupPath)
+	return f.Start(context.Background(), name, args, "")
 }
 
 func (f *fakeProcessRunner) Start(_ context.Context, name string, args []string, _ string) (Process, error) {
@@ -81,6 +87,18 @@ func TestLaunchInvokesRunner(t *testing.T) {
 	require.Len(t, runner.started, 1)
 	require.Equal(t, "/usr/local/bin/firecracker", runner.started[0][0])
 	require.Contains(t, runner.started[0], "--api-sock")
+}
+
+func TestLaunchInvokesRunnerAtomicallyInSandboxCgroup(t *testing.T) {
+	runner := &fakeProcessRunner{}
+	process, err := launch(context.Background(), runner, launchConfig{
+		BinaryPath: "/usr/local/bin/firecracker", SandboxID: "sandbox-1", APIAddress: "/run/api.sock",
+		WorkingDir: "/var/lib/fast-sandbox/sandbox-1", CgroupPath: "/sys/fs/cgroup/pod/fast-sandbox/fsb-1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4242, process.PID())
+	require.Equal(t, []string{"/sys/fs/cgroup/pod/fast-sandbox/fsb-1"}, runner.cgroups)
+	require.Equal(t, "/usr/local/bin/firecracker", runner.started[0][0])
 }
 
 func TestBuildArgvJailer(t *testing.T) {
@@ -188,4 +206,17 @@ func argvIndex(argv []string, flag string) int {
 		}
 	}
 	return -1
+}
+
+// Identically named TAP devices are independent in each netns; neither direct nor cgroup launches may bypass that boundary.
+func TestLaunchDirectEntersAssignedNetworkNamespace(t *testing.T) {
+	for _, group := range []string{"", "/sys/fs/cgroup/test"} {
+		runner := &fakeProcessRunner{}
+		_, err := launch(t.Context(), runner, launchConfig{SandboxID: "sandbox", BinaryPath: "/usr/bin/firecracker", APIAddress: "/run/api.sock", NetNSPath: "/run/netns/slot", CgroupPath: group})
+		require.NoError(t, err)
+		require.Equal(t, []string{"nsenter", "--net=/run/netns/slot", "--", "/usr/bin/firecracker", "--id", "sandbox", "--api-sock", "/run/api.sock"}, runner.started[0])
+		if group != "" {
+			require.Equal(t, []string{group}, runner.cgroups)
+		}
+	}
 }

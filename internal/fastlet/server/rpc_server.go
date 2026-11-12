@@ -197,8 +197,8 @@ func (s *FastletServer) handleSetDraining(w http.ResponseWriter, r *http.Request
 	if !decodePost(w, r, &req) {
 		return
 	}
-	s.sandboxManager.SetDraining(req.Draining, req.Reason)
-	writeResponse(w, &fastletapi.SetDrainingResponse{Draining: req.Draining}, nil)
+	response, err := s.sandboxManager.SetDraining(&req)
+	writeResponse(w, response, err)
 }
 
 func (s *FastletServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +314,7 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor fastletapi.CacheCursor
 		InfraReady:          infraReady, PreparedArtifacts: preparedArtifacts,
 		RegistryRevision: s.sandboxManager.RegistryRevision(),
 		WarmImages:       s.sandboxManager.WarmImageStates(),
+		Capabilities:     s.sandboxManager.SnapshotCapabilities(),
 	}
 	return fastletapi.HeartbeatResponse{
 		FastletStatus: status,
