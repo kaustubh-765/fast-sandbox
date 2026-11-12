@@ -426,7 +426,13 @@ if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs
   # execd once its command exits, and its no-command fallback (an
   # interactive shell) exits instantly on the EOF serial console stdin.
-  BOOTSTRAP_CMD="${ENTRYPOINT:-tail -f /dev/null}" tool setsid $SH /opt/opensandbox/bootstrap.sh &
+  # Export it: tool() is a shell function, and some shells (the injected
+  # busybox 1.30 that runs this init when the image's /bin/sh is not visible
+  # at render time, e.g. OverlayBD builds) do not export prefix assignments of
+  # a function call to the commands it runs. bootstrap.sh would then see no
+  # command, run the fallback shell, which exits at once, and stop execd.
+  export BOOTSTRAP_CMD="${ENTRYPOINT:-tail -f /dev/null}"
+  tool setsid $SH /opt/opensandbox/bootstrap.sh &
 elif [ -n "${ENTRYPOINT:-}" ]; then
   tool setsid $SH -c "$ENTRYPOINT" &
 fi

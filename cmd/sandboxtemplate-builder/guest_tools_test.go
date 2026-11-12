@@ -104,3 +104,57 @@ func TestGuestInitToolHelpersInShell(t *testing.T) {
 		t.Fatalf("busybox provides missing tools, got %q", got)
 	}
 }
+
+// bootstrap.sh must receive the entrypoint as BOOTSTRAP_CMD. tool() is a
+// shell function, and shells such as busybox 1.30 (the injected busybox that
+// runs the init on OverlayBD builds) and dash do not export prefix
+// assignments of a function call. Without the export, bootstrap.sh falls
+// back to a shell that exits at once and stops execd: the build never
+// reports SANDBOX_READY.
+func TestGuestInitExportsBootstrapCommandThroughTool(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid not available")
+	}
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "bootstrap.sh")
+	got := filepath.Join(dir, "got")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s' \"${BOOTSTRAP_CMD:-<unset>}\" > \"$GOT\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{Execd: "opensandbox/execd:1.1.0"})
+	preStart := strings.Index(script, "BB=")
+	preEnd := strings.Index(script, "SH=/bin/sh;")
+	start := strings.Index(script, "if [ -x /opt/opensandbox/bootstrap.sh ]; then")
+	end := strings.Index(script[start:], "\nfi\n")
+	if preStart < 0 || preEnd < preStart || start < 0 || end < 0 {
+		t.Fatal("rendered init lacks the preamble or the bootstrap launch")
+	}
+	preEnd += strings.Index(script[preEnd:], "\n") + 1
+	snippet := script[preStart:preEnd] + "ENTRYPOINT='sleep 1'\n" + script[start:start+end+4] + "wait\n"
+	snippet = strings.ReplaceAll(snippet, "/opt/opensandbox/bootstrap.sh", stub)
+	// The default shell plus every busybox the builder would inject as the
+	// init interpreter (Ubuntu 22.04's busybox-static 1.30 shows the bug).
+	shells := [][]string{{"/bin/sh"}}
+	for _, candidate := range hostBusyboxCandidates {
+		if _, err := os.Stat(candidate); err == nil {
+			shells = append(shells, []string{candidate, "sh"})
+		}
+	}
+	for _, shell := range shells {
+		t.Run(strings.Join(shell, " "), func(t *testing.T) {
+			_ = os.Remove(got)
+			cmd := exec.Command(shell[0], append(shell[1:], "-c", snippet)...)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GOT=" + got}
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("bootstrap launch failed: %v: %s", err, output)
+			}
+			payload, err := os.ReadFile(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(payload) != "sleep 1" {
+				t.Fatalf("bootstrap.sh got BOOTSTRAP_CMD=%q, want the entrypoint", payload)
+			}
+		})
+	}
+}
