@@ -128,6 +128,11 @@ func (c *firecrackerClient) setMachineConfig(ctx context.Context, config machine
 	return c.do(ctx, http.MethodPut, "/machine-config", config, nil)
 }
 
+// setEntropy attaches the virtio-rng entropy device (default host source).
+func (c *firecrackerClient) setEntropy(ctx context.Context) error {
+	return c.do(ctx, http.MethodPut, "/entropy", map[string]any{}, nil)
+}
+
 // startInstance boots the configured microVM (PUT /actions InstanceStart).
 func (c *firecrackerClient) startInstance(ctx context.Context) error {
 	return c.do(ctx, http.MethodPut, "/actions", map[string]string{"action_type": "InstanceStart"}, nil)

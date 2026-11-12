@@ -126,6 +126,48 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 	return nil
 }
 
+// configureBuildVM configures the started, unconfigured build VMM and boots it.
+// The entropy device (virtio-rng) is required: the guest has no other entropy
+// source, so without it the guest CRNG may never initialize and getrandom()
+// callers block. execd then never serves its port, the build times out waiting
+// for SANDBOX_READY, and a snapshot taken anyway carries a guest that never
+// becomes usable (OpenSandbox #1695). The native builder and the rootfs-only
+// boot path (firecrackerconfig.RootfsBoot) attach it for the same reason; the
+// Full snapshot keeps the device, so every restored instance has it too.
+func configureBuildVM(ctx context.Context, client *firecrackerClient, options *buildOptions, kernel, bootArgs string) error {
+	if err := client.setBootSource(ctx, bootSource{KernelImagePath: kernel, BootArgs: bootArgs}); err != nil {
+		return fmt.Errorf("configure boot source: %w", err)
+	}
+	if err := client.addDrive(ctx, drive{
+		DriveID:      options.rootfsDriveID,
+		PathOnHost:   rootfsDriveLink,
+		IsRootDevice: true,
+		IsReadOnly:   false,
+	}); err != nil {
+		return fmt.Errorf("attach rootfs drive: %w", err)
+	}
+	if err := client.setMachineConfig(ctx, machineConfig{VCPUCount: options.vcpu, MemSizeMiB: options.memoryMB}); err != nil {
+		return fmt.Errorf("configure machine: %w", err)
+	}
+	if err := client.setEntropy(ctx); err != nil {
+		return fmt.Errorf("attach entropy device: %w", err)
+	}
+	if options.tapName != "" {
+		if err := client.do(ctx, "PUT", "/network-interfaces/eth0", map[string]string{"iface_id": "eth0", "host_dev_name": options.tapName, "guest_mac": options.guestMAC}, nil); err != nil {
+			return err
+		}
+	}
+	if options.guestControlPort != 0 {
+		if err := client.do(ctx, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}, nil); err != nil {
+			return err
+		}
+	}
+	if err := client.startInstance(ctx); err != nil {
+		return fmt.Errorf("start instance: %w", err)
+	}
+	return nil
+}
+
 // coldBootAndSnapshot launches a 1-shot Firecracker on rootfsDevPath, waits
 // for the ready pattern in the serial log, pauses the VM and captures a Full
 // snapshot into snapDir. The drive is attached through the relative
@@ -177,32 +219,8 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	if err := client.waitReady(readyCtx); err != nil {
 		return "", "", err
 	}
-	if err := client.setBootSource(ctx, bootSource{KernelImagePath: pinnedKernel, BootArgs: bootArgs}); err != nil {
-		return "", "", fmt.Errorf("configure boot source: %w", err)
-	}
-	if err := client.addDrive(ctx, drive{
-		DriveID:      options.rootfsDriveID,
-		PathOnHost:   rootfsDriveLink,
-		IsRootDevice: true,
-		IsReadOnly:   false,
-	}); err != nil {
-		return "", "", fmt.Errorf("attach rootfs drive: %w", err)
-	}
-	if err := client.setMachineConfig(ctx, machineConfig{VCPUCount: options.vcpu, MemSizeMiB: options.memoryMB}); err != nil {
-		return "", "", fmt.Errorf("configure machine: %w", err)
-	}
-	if options.tapName != "" {
-		if err := client.do(ctx, "PUT", "/network-interfaces/eth0", map[string]string{"iface_id": "eth0", "host_dev_name": options.tapName, "guest_mac": options.guestMAC}, nil); err != nil {
-			return "", "", err
-		}
-	}
-	if options.guestControlPort != 0 {
-		if err := client.do(ctx, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}, nil); err != nil {
-			return "", "", err
-		}
-	}
-	if err := client.startInstance(ctx); err != nil {
-		return "", "", fmt.Errorf("start instance: %w", err)
+	if err := configureBuildVM(ctx, client, options, pinnedKernel, bootArgs); err != nil {
+		return "", "", err
 	}
 
 	progress.start("waiting for guest readiness")
