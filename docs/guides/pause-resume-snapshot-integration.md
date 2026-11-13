@@ -149,7 +149,8 @@ Rejection codes:
 | --- | --- |
 | `FailedPrecondition` | The Sandbox is durably `Paused` with **no** recorded checkpoint (resume is impossible; a fresh instance requires `resetRevision`), or the Sandbox is being deleted |
 | `Aborted` | Fence mismatches, including `expected_checkpoint_id` |
-| — | Resuming a Sandbox that is already `Running` (or one whose pause is still converging) is an idempotent success; before the runtime is released it simply cancels the pause |
+| `ResourceExhausted` | The pause was released and no Fastlet in the Sandbox's Pool has room for it now: the same candidate check as a create. The Sandbox stays `Paused`, with its checkpoint, and can be resumed later. Without this check the resume would be accepted and wait in `RESUMING` (`NoCandidate`) with no time limit, and a Sandbox whose lifetime ran out meanwhile would lose its checkpoint. A resume that passes the check but loses the room before it is placed still waits. |
+| — | Resuming a Sandbox that is already `Running` (or one whose pause is still converging) is an idempotent success; before the runtime is released it simply cancels the pause, with no room check |
 
 Observe completion the same way:
 

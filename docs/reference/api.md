@@ -370,7 +370,7 @@ The protobuf contract is
 | `GetSandboxSnapshot` | CR-backed phase/artifact/placement observation |
 | `DeleteSandboxSnapshot` | Accepts deletion (`expected_uid` fenced); for OCI, deletes both published manifests before the object disappears. Native store lifecycle is managed separately |
 | `PauseSandbox` | Persist `spec.state=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
-| `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
+| `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; a released pause with no Fastlet room in its Pool is refused with `RESOURCE_EXHAUSTED` and stays paused; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
 
 ### Atomic Create

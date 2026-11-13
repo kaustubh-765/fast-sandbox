@@ -29,9 +29,16 @@ const (
 	// snapshots only). See docs/guides/snapshot-cpu-compatibility.md.
 	LabelCPUTemplate = "sandbox.fast.io/cpu-template"
 	// LabelCPUIdentity carries the vendor-family-model identity of a
-	// "none"-tier node — the scheduling key for unmasked snapshots. Set
-	// only alongside LabelCPUTemplate: "none".
+	// "none"-tier node. Set only alongside LabelCPUTemplate: "none".
 	LabelCPUIdentity = "sandbox.fast.io/cpu-identity"
+	// LabelCPUStepping carries the CPU stepping of a "none"-tier node.
+	// Restore admission matches unmasked snapshots on vendor, family, model
+	// and stepping, so LabelCPUIdentity and LabelCPUStepping together are
+	// the scheduling key for them: two steppings of one model share an
+	// identity label but not each other's snapshots. Set only alongside
+	// LabelCPUIdentity; a separate label keeps identity-only selectors
+	// working.
+	LabelCPUStepping = "sandbox.fast.io/cpu-stepping"
 	// ConditionFirecrackerReady is the Node condition reporting the last
 	// check pass (True when ready, False with the failing summary).
 	ConditionFirecrackerReady = "FirecrackerReady"
@@ -84,13 +91,13 @@ func NewNodeReconciler(client NodeClient, nodeName string) *NodeReconciler {
 // Apply converges labels + condition onto the report outcome. cpuTemplate
 // is the node's compatibility tier ("T2"/"T2A"/"none") for the
 // LabelCPUTemplate scheduling label; empty removes the label. cpuIdentity
-// (vendor-family-model) accompanies it on "none" nodes.
-func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate, cpuIdentity string) error {
+// (vendor-family-model) and cpuStepping accompany it on "none" nodes.
+func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate, cpuIdentity, cpuStepping string) error {
 	node, err := r.client.GetNode(ctx, r.nodeName)
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", r.nodeName, err)
 	}
-	if patch := labelPatch(node, report.Ready, cpuTemplate, cpuIdentity); patch != nil {
+	if patch := labelPatch(node, report.Ready, cpuTemplate, cpuIdentity, cpuStepping); patch != nil {
 		if err := r.client.PatchNode(ctx, r.nodeName, patch); err != nil {
 			return fmt.Errorf("patch node %s labels: %w", r.nodeName, err)
 		}
@@ -106,12 +113,13 @@ func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate, 
 // labelPatch returns the metadata patch moving the labels to the desired
 // state, or nil when they already match. Removal uses a null value (the
 // strategic merge delete form).
-func labelPatch(node *corev1.Node, ready bool, cpuTemplate, cpuIdentity string) []byte {
+func labelPatch(node *corev1.Node, ready bool, cpuTemplate, cpuIdentity, cpuStepping string) []byte {
 	desired := map[string]string{
 		LabelKVM:             "",
 		LabelFirecrackerNode: "",
 		LabelCPUTemplate:     "",
 		LabelCPUIdentity:     "",
+		LabelCPUStepping:     "",
 	}
 	if ready {
 		desired[LabelKVM] = "true"
@@ -121,6 +129,9 @@ func labelPatch(node *corev1.Node, ready bool, cpuTemplate, cpuIdentity string) 
 		}
 		if cpuTemplate == "none" && cpuIdentity != "" {
 			desired[LabelCPUIdentity] = cpuIdentity
+			if cpuStepping != "" {
+				desired[LabelCPUStepping] = cpuStepping
+			}
 		}
 	}
 	labels := map[string]interface{}{}

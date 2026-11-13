@@ -10,7 +10,8 @@
 #      FirecrackerReady condition, plus the snapshot CPU compatibility
 #      labels sandbox.fast.io/cpu-template (T2 / T2A / none — which golden
 #      snapshot tiers the node restores) and, on none-tier nodes,
-#      sandbox.fast.io/cpu-identity (vendor-family-model; see
+#      sandbox.fast.io/cpu-identity (vendor-family-model) and
+#      sandbox.fast.io/cpu-stepping (see
 #      docs/guides/snapshot-cpu-compatibility.md). scripts/
 #      firecracker-host-check.sh runs the same checks standalone.
 #   2. janitor — sweeps orphaned node resources: fastlet network state

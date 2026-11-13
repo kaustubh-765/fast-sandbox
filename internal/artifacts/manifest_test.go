@@ -82,6 +82,20 @@ func TestCPUIdentityLabel(t *testing.T) {
 	}
 }
 
+// TestCPUSteppingLabel: the stepping rides beside the identity label,
+// stepping 0 included; an unknown vendor renders empty, as the identity.
+func TestCPUSteppingLabel(t *testing.T) {
+	if got := CPUSteppingLabel(CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17}); got != "0" {
+		t.Fatalf("CPUSteppingLabel = %q, want 0", got)
+	}
+	if got := CPUSteppingLabel(CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 143, Stepping: 8}); got != "8" {
+		t.Fatalf("CPUSteppingLabel = %q, want 8", got)
+	}
+	if got := CPUSteppingLabel(CPUIdentity{Vendor: "unknown", Stepping: 3}); got != "" {
+		t.Fatalf("CPUSteppingLabel = %q, want empty", got)
+	}
+}
+
 // TestMatchRestoreCompatibility covers the tiered admission contract: the
 // template allowlist tier, the unmasked identity-equality tier, legacy
 // manifests, and the Firecracker version gate.

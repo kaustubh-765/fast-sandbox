@@ -535,13 +535,23 @@ func CompatibilityCPUTemplate(version string, identity CPUIdentity) string {
 }
 
 // CPUIdentityLabel renders the identity for a node scheduling label
-// ("vendor-family-model", the none-tier match key); empty when the vendor
-// is unknown.
+// ("vendor-family-model"; with CPUSteppingLabel, the none-tier match key);
+// empty when the vendor is unknown.
 func CPUIdentityLabel(identity CPUIdentity) string {
 	if identity.Vendor == "" || identity.Vendor == unknownProvenanceValue {
 		return ""
 	}
 	return fmt.Sprintf("%s-%d-%d", identity.Vendor, identity.Family, identity.Model)
+}
+
+// CPUSteppingLabel renders the stepping for a node scheduling label (the
+// decimal stepping, which none-tier restore admission matches exactly);
+// empty when the vendor is unknown, as for CPUIdentityLabel.
+func CPUSteppingLabel(identity CPUIdentity) string {
+	if identity.Vendor == "" || identity.Vendor == unknownProvenanceValue {
+		return ""
+	}
+	return strconv.Itoa(identity.Stepping)
 }
 
 // Admission errors from MatchRestoreCompatibility: legacy is admitted with

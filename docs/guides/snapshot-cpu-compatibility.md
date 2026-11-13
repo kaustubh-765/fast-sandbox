@@ -149,14 +149,18 @@ every healthy node (removed while the node is degraded):
 ```
 sandbox.fast.io/cpu-template:  "T2" | "T2A" | "none"
 sandbox.fast.io/cpu-identity:  "AuthenticAMD-26-17"   # "none" nodes only
+sandbox.fast.io/cpu-stepping:  "0"                    # "none" nodes only
 ```
 
 `T2`/`T2A` mean "restores template-masked snapshots of this tier" — the
 allowlist decides what fits, so no identity label is needed. `none`
 means "restores only identity-matched unmasked snapshots", and the
-`cpu-identity` label (`vendor-family-model`, matching the admission's
-none-tier key) says which ones; nodes whose CPU is unreadable get the
-tier but no identity label.
+`cpu-identity` (`vendor-family-model`) and `cpu-stepping` (the decimal
+stepping) labels together say which ones: they match the admission's
+none-tier key, which compares the stepping too. Two steppings of one
+model share a `cpu-identity` label but not each other's snapshots, so a
+selector for a none-tier image names both. Nodes whose CPU is unreadable
+get the tier but neither label.
 
 Scheduling examples:
 
@@ -169,10 +173,11 @@ nodeSelector:
 nodeSelector:
   sandbox.fast.io/cpu-template: "T2A"
 
-# A none-tier image (built on EPYC 9T95) stays on its identity pool.
+# A none-tier image (built on EPYC 9T95, stepping 0) stays on its identity pool.
 nodeSelector:
   sandbox.fast.io/cpu-template: "none"
   sandbox.fast.io/cpu-identity: "AuthenticAMD-26-17"
+  sandbox.fast.io/cpu-stepping: "0"
 ```
 
 Mixed pools work without labels: an incompatible candidate is rejected
