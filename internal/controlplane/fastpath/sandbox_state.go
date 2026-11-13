@@ -8,6 +8,7 @@ package fastpath
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,6 +18,7 @@ import (
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 )
 
 func (s *Server) PauseSandbox(ctx context.Context, request *fastpathv2.PauseSandboxRequest) (*fastpathv2.PauseSandboxResponse, error) {
@@ -83,12 +85,62 @@ func (s *Server) ResumeSandbox(ctx context.Context, request *fastpathv2.ResumeSa
 	if checkpoint != nil && request.ExpectedCheckpointId != "" && request.ExpectedCheckpointId != checkpoint.CheckpointID {
 		return nil, status.Errorf(codes.Aborted, "checkpoint changed: expected %s, current %s", request.ExpectedCheckpointId, checkpoint.CheckpointID)
 	}
+	if sandbox.Status.Runtime.State == apiv1alpha2.RuntimePaused {
+		if err := s.resumeHasRoom(ctx, sandbox); err != nil {
+			return nil, err
+		}
+	}
 	updated, err := s.patchSandboxState(ctx, sandbox, apiv1alpha2.SandboxStateRunning, request.ExpectedGeneration, request.Sandbox.ExpectedUid)
 	if err != nil {
 		return nil, err
 	}
 	klog.FromContext(ctx).Info("fastpath sandbox resume requested")
 	return &fastpathv2.ResumeSandboxResponse{Sandbox: sandboxInfoFromCRD(updated), Generation: updated.Generation}, nil
+}
+
+// resumeHasRoom refuses the resume of a released pause when no Fastlet in
+// the Sandbox's Pool can take it now. Such a resume would otherwise be
+// accepted and leave the Sandbox in Resuming (NoCandidate), retried with no
+// time limit until room frees up, or until the Sandbox expires and its
+// checkpoint is dropped; the caller would see success for a Sandbox that
+// doesn't run. Refused, it stays paused and the caller gets
+// RESOURCE_EXHAUSTED, as a create into a full Pool does.
+//
+// The check is the create path's candidate query (selectFastletsForPool):
+// the same Pool, the Sandbox's own resources, the Fastlet revision and the
+// Registry's cordon and freshness filtering, made before the intent is
+// persisted and without extra Kubernetes IO beyond the Pool read. It can't
+// reserve the room: a resume that passes and then loses the room to another
+// Sandbox still waits, as before. If the check itself can't run (no Pool,
+// no Registry, unresolvable resources), the resume goes through unchanged,
+// for the Controller to report as it does today.
+func (s *Server) resumeHasRoom(ctx context.Context, sandbox *apiv1alpha2.Sandbox) error {
+	logger := klog.FromContext(ctx)
+	orchestrator, err := s.orchestrator()
+	if err != nil {
+		logger.Info("fastpath sandbox resume room check skipped", "pool", sandbox.Spec.PoolRef, "err", err)
+		return nil
+	}
+	pool, err := s.getPool(ctx, sandbox.Namespace, sandbox.Spec.PoolRef)
+	if err != nil {
+		logger.Info("fastpath sandbox resume room check skipped", "pool", sandbox.Spec.PoolRef, "err", err)
+		return nil
+	}
+	parameters, err := fastPathRuntimeParameters(pool, sandbox)
+	if err != nil {
+		logger.Info("fastpath sandbox resume room check skipped", "pool", sandbox.Spec.PoolRef, "err", err)
+		return nil
+	}
+	candidates, err := orchestrator.FastPathCandidatesMatching(sandbox, string(sandbox.UID), parameters, nil)
+	if err != nil && !errors.Is(err, orchestration.ErrNoCandidate) {
+		logger.Info("fastpath sandbox resume room check skipped", "pool", sandbox.Spec.PoolRef, "err", err)
+		return nil
+	}
+	if len(compatibleCandidates(candidates, parameters.FastletRevision)) == 0 {
+		logger.Info("fastpath sandbox resume refused: no Fastlet has room", "pool", sandbox.Spec.PoolRef)
+		return status.Errorf(codes.ResourceExhausted, "no Fastlet in Pool %q has room to resume the Sandbox; it stays paused", sandbox.Spec.PoolRef)
+	}
+	return nil
 }
 
 // patchSandboxState compare-and-set patches spec.state, fenced by the

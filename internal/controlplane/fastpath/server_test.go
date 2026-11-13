@@ -1136,6 +1136,60 @@ func TestResumeSandboxRequiresCheckpointAndFences(t *testing.T) {
 	require.Equal(t, apiv1alpha2.SandboxStateRunning, current.Spec.State)
 }
 
+// TestResumeSandboxRefusedWhenPoolHasNoRoom: resuming a released pause into
+// a Pool with no Fastlet that can take it is refused with RESOURCE_EXHAUSTED
+// and the Sandbox stays paused, instead of waiting in Resuming; once room is
+// back, the same resume is accepted.
+func TestResumeSandboxRefusedWhenPoolHasNoRoom(t *testing.T) {
+	server, k8sClient, registry, _ := newV2Server(t)
+	sandbox := &apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "paused-full", Namespace: "default", UID: types.UID("uid-paused-full")},
+		Spec:       apiv1alpha2.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a", State: apiv1alpha2.SandboxStatePaused},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), sandbox))
+	key := types.NamespacedName{Namespace: "default", Name: "paused-full"}
+	var current apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), key, &current))
+	current.Status.Runtime = apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePaused, Checkpoint: &apiv1alpha2.CheckpointStatus{
+		CheckpointID: "ckpt-1", ManifestRef: "s3://bucket/publish/abc/manifest.json", ArtifactDigest: "deadbeef",
+	}}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), &current))
+
+	candidates := registry.candidates
+	registry.candidates = nil
+	_, err := server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{Sandbox: expectedReference("paused-full", "default")})
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.NoError(t, k8sClient.Get(context.Background(), key, &current))
+	require.Equal(t, apiv1alpha2.SandboxStatePaused, current.Spec.State, "a refused resume leaves the Sandbox paused")
+
+	registry.candidates = candidates
+	response, err := server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{Sandbox: expectedReference("paused-full", "default")})
+	require.NoError(t, err)
+	require.Equal(t, fastpathv2.SandboxState_SANDBOX_STATE_RUNNING, response.Sandbox.State)
+	require.NoError(t, k8sClient.Get(context.Background(), key, &current))
+	require.Equal(t, apiv1alpha2.SandboxStateRunning, current.Spec.State)
+}
+
+// TestResumeSandboxCancellingAPauseNeedsNoRoom: before the pause is released
+// the Sandbox still holds its Fastlet, so resuming only cancels the pause and
+// is accepted even when no other Fastlet has room.
+func TestResumeSandboxCancellingAPauseNeedsNoRoom(t *testing.T) {
+	server, k8sClient, registry, _ := newV2Server(t)
+	sandbox := &apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "pausing-a", Namespace: "default", UID: types.UID("uid-pausing-a")},
+		Spec:       apiv1alpha2.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a", State: apiv1alpha2.SandboxStatePaused},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), sandbox))
+	var current apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pausing-a"}, &current))
+	current.Status.Runtime = apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePausing}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), &current))
+
+	registry.candidates = nil
+	_, err := server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{Sandbox: expectedReference("pausing-a", "default")})
+	require.NoError(t, err)
+}
+
 func TestFastPathPersistsCleanupFinalizerBeforeRuntimeCreate(t *testing.T) {
 	server, k8sClient, _, fastlet := newV2Server(t)
 	fastlet.beforeCreate = func(request *fastletapi.CreateSandboxRequest) {
