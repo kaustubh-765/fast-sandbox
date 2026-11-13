@@ -148,11 +148,12 @@ func (m *Manager) pass(ctx context.Context) {
 		cpuTemplate := artifacts.CompatibilityCPUTemplate(
 			artifacts.FirecrackerVersion(filepath.Join(m.current.Check.AssetsDir, assetFirecracker)),
 			identity)
-		cpuIdentity := ""
+		cpuIdentity, cpuStepping := "", ""
 		if cpuTemplate == artifacts.CPUTemplateNone {
 			cpuIdentity = artifacts.CPUIdentityLabel(identity)
+			cpuStepping = artifacts.CPUSteppingLabel(identity)
 		}
-		if err := m.reconciler.Apply(ctx, report, cpuTemplate, cpuIdentity); err != nil {
+		if err := m.reconciler.Apply(ctx, report, cpuTemplate, cpuIdentity, cpuStepping); err != nil {
 			klog.ErrorS(err, "node readiness convergence failed", "ready", report.Ready, "cpuTemplate", cpuTemplate)
 		}
 	}
