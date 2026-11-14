@@ -246,8 +246,9 @@ func (d *Driver) pinVerified(ctx context.Context, reference string, pin func(con
 	}
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
+	requireCommit := d.agentSocket != ""
 	d.mu.RUnlock()
-	if verifyRestorableImage(stateRoot, reference) == nil {
+	if verifyDeliveredImage(stateRoot, reference, requireCommit) == nil {
 		return nil
 	}
 	retryID := fmt.Sprintf("%s-r%d", requestID, time.Now().UnixNano())
