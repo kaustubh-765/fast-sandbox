@@ -88,9 +88,6 @@ type Driver struct {
 	imageCacheLimitBytes int64
 	gcStop               chan struct{}
 	gcTrigger            chan struct{}
-	// ociDisks converts and caches OCI image drive disks (oci_drive.go); nil
-	// unless the Pool enables FAST_SANDBOX_OCI_DRIVE.
-	ociDisks *ociDiskManager
 	// imageUseCount records how often each cached image was pulled or booted,
 	// in memory: the GC evicts by this instead of filesystem timestamps.
 	// Guarded by mu.
@@ -206,10 +203,6 @@ func (d *Driver) Initialize(ctx context.Context, _ string) error {
 			return fmt.Errorf("validate Firecracker StateRoot storage: %w", err)
 		}
 	}
-	if ociDriveEnabled() {
-		d.ociDisks = newOCIDiskManager(d.config.StateRoot)
-		klog.InfoS("OCI image drive enabled", "cache", filepath.Join(d.config.StateRoot, ociDiskCacheDir), "dockerHubMirror", d.ociDisks.mirror)
-	}
 	d.initialized = true
 	interval := d.imageGCInterval
 	d.gcStop = make(chan struct{})
@@ -309,21 +302,6 @@ func (d *Driver) gcImageCache() {
 	}
 	if len(removed) > 0 {
 		klog.InfoS("firecracker image cache GC removed unreferenced images", "digests", removed)
-	}
-	if d.ociDisks != nil && d.ociDisks.obd != nil {
-		if released := d.ociDisks.obd.sweep(context.Background(), time.Now()); len(released) > 0 {
-			klog.InfoS("released orphaned OverlayBD OCI drive devices", "sandboxIDs", released)
-		}
-	}
-	// The converted-disk cache is node-wide like the image cache, and the
-	// references it honours are read from the whole StateRoot, so every
-	// Fastlet collects it: a node whose OCI-drive Fastlet moved away must
-	// not keep its disks forever.
-	evicted, err := garbageCollectOCIDisks(stateRoot, ociDiskCacheLimit(), time.Now())
-	if err != nil {
-		klog.V(2).InfoS("OCI disk cache GC skipped", "err", err)
-	} else if len(evicted) > 0 {
-		klog.InfoS("OCI disk cache GC removed unreferenced disks", "diskKeys", evicted)
 	}
 }
 
@@ -602,24 +580,6 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	defer releaseLifecycle()
-	// OCI image drive: resolve, and on first use convert, the image disk
-	// before a directory or network slot is allocated (conversion can take
-	// seconds). The placeholder is used when no image is requested.
-	ociDrive, ociDisk, ociFresh, err := d.resolveOCIDrive(ctx, stateRoot, restoreRef, spec)
-	if err != nil {
-		return nil, err
-	}
-	// Launch overrides only apply to a fresh create; a restore resumes a
-	// container that is already running.
-	var ociLaunch artifacts.OCILaunch
-	if ociFresh {
-		if ociLaunch, err = ociLaunchFromSpec(spec); err != nil {
-			return nil, err
-		}
-		if ociDrive != nil && ociDrive.Format == artifacts.OCIDriveFormatOverlayBD {
-			ociLaunch.ImageConfig = ociDrive.Config
-		}
-	}
 	directory, err := ensureSandboxDir(stateRoot, identity.SandboxUID)
 	if err != nil {
 		return nil, err
@@ -797,22 +757,6 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		klog.InfoS("firecracker Create cleanup removed partial sandbox",
 			"sandboxID", identity.SandboxUID, "jailRoot", jailRoot)
 	}()
-	if d.ociDisks != nil && !isOCI {
-		// The drive path baked into the vmstate is relative to the VMM
-		// working directory: the jail root, or the state dir in direct mode.
-		vmDir := directory
-		if jailRoot != "" {
-			vmDir = jailRoot
-		}
-		if err := d.placeOCIDriveFor(ctx, vmDir, identity.SandboxUID, ociDrive, ociDisk); err != nil {
-			releaseSlot()
-			return nil, err
-		}
-		if err := placeOCILaunch(vmDir, ociLaunch); err != nil {
-			releaseSlot()
-			return nil, err
-		}
-	}
 	d.touchImage(restoreRef)
 	rootfsDur := time.Since(rootfsStarted) + ociPrepareDur
 	rootfsMiB := float64(0)
@@ -865,7 +809,6 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		Phase:      PhaseStarting,
 		APIAddress: apiAddress, CreatedAt: time.Now().Unix(),
 		InfraServices: infraServices, InfraDiagnostics: infraDiagnostics,
-		OCIDrive: ociDrive,
 	}
 	// Full restores execute the kernel already present in RAM, not KernelPath.
 	state.BootKernelSHA256 = ociMetadata.Kernel.SHA256
@@ -1002,26 +945,6 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	bootDur := time.Since(bootStarted)
-
-	// A fresh OCI drive replaces the placeholder the golden snapshot was
-	// taken with: tell Firecracker so the guest sees the new disk size,
-	// which is the guest agent's signal to mount it and start the image.
-	// Resumes and snapshot restores already carry the disk size in vmstate.
-	if ociFresh {
-		_, patchSpan := observability.Start(ctx, "fastlet.firecracker.oci_drive")
-		err = client.PatchDrive(ctx, artifacts.OCIDriveID, artifacts.OCIDriveFileName)
-		observability.End(patchSpan, err)
-		if err == nil {
-			// Ready means the image's container answers, not just that the
-			// VM resumed: the guest agent mounts the drive and starts it.
-			err = waitForOCIContainer(ctx, slot.IP, ociReadyTimeout)
-		}
-		if err != nil {
-			d.killAndForget(identity.SandboxUID, process.PID())
-			releaseSlot()
-			return nil, fmt.Errorf("%w: attach OCI image drive: %w", ErrRuntimeNotInitialized, err)
-		}
-	}
 
 	// A resumed checkpoint may carry the egress-owned vault and policy
 	// files: import them into egress here — before EnsureSandbox returns, so
@@ -1727,7 +1650,7 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// A memcg OOM can kill the VMM before the jailer tears that mount down, so
 	// detach it explicitly before RemoveAll or the otherwise-dead jail leaks.
 	_ = unmountPath(jailedKVMDevicePath(root))
-	for _, target := range []string{rootfsDeviceName, "rootfs-kernel", artifacts.OCIDriveFileName, filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
+	for _, target := range []string{rootfsDeviceName, "rootfs-kernel", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
 	if err := os.RemoveAll(filepath.Dir(root)); err != nil {

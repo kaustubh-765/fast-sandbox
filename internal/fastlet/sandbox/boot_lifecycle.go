@@ -61,12 +61,6 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 			return delivery.DeliverCheckpoint(ctx, restore)
 		}, true
 	}
-	if delivery, ok := m.runtime.(SandboxDelivery); ok {
-		spec := input.Sandbox.Desired
-		return func(ctx context.Context) (ImageDeliveryStatus, error) {
-			return delivery.DeliverSandbox(ctx, spec)
-		}, true
-	}
 	delivery, ok := m.runtime.(ImageDelivery)
 	if !ok {
 		return nil, false

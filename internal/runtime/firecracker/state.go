@@ -61,9 +61,6 @@ type SandboxState struct {
 	// (acquire/rootfs/infra/launch/configure/boot) for load bottleneck
 	// analysis (serial vs parallel clone batches).
 	StageDurations map[string]time.Duration `json:"stageDurations,omitempty"`
-	// OCIDrive is the converted OCI image disk attached to the VM, recorded
-	// into snapshot manifests so restores re-attach it (oci_drive.go).
-	OCIDrive *artifacts.OCIDrive `json:"ociDrive,omitempty"`
 }
 
 // validateSandboxID rejects identities that could escape the StateRoot or
