@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {
+    "vcpuCount": 2,
+    "memoryMiB": 1024,
+    "rootfsSizeMiB": 1,
+    "rootfsDriveID": "rootfs",
+    "rootfsDrivePath": "rootfs.img"
+  },
+  "kernel": {
+    "version": "6.1.177"
+  },
+  "compatibility": {
+    "cpuArch": "x86_64",
+    "vendor": "GenuineIntel",
+    "cpuFamily": 6,
+    "cpuModel": 85,
+    "cpuStepping": 7,
+    "cpuModelName": "",
+    "cpuTemplate": "none",
+    "firecrackerVersion": "1.16.1",
+    "hostKernel": ""
+  },
+  "platform": {
+    "stateFiles": {
+      "policy.json": {
+        "sha256": "7b536df7f8e026f977e7a3df89b60d109fb9469b574282b0b771fdf2acb235ea",
+        "sizeBytes": 29
+      }
+    }
+  },
+  "files": {
+    "memory.snap": {
+      "sha256": "a42d7208722d88100f97bc29929a938cb6e53471dc2456d859132b5ed5cee2bf",
+      "sizeBytes": 131572
+    },
+    "rootfs.ext4": {
+      "sha256": "b5a2eb7113b548063b4e0b9afc2daa0a67a5c5fb755b2aec716f05a6cb4d6cfa",
+      "sizeBytes": 263144
+    },
+    "vmstate.snap": {
+      "sha256": "7c983d42e05665dcbb98103fe7d55b5266ee3024c0b0f6184d3927161f5910fa",
+      "sizeBytes": 777
+    }
+  }
+}

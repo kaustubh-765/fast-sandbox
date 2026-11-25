@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -145,6 +146,22 @@ func (c *s3Client) storeRootURI() string {
 // ownership of a request body and closes it after the attempt: a retry
 // must open a fresh reader (seeking a closed *os.File was the field bug).
 func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open func() (io.ReadCloser, error)) error {
+	return c.putSigned(ctx, storeKey, size, unsignedPayload, open)
+}
+
+// putBytes uploads an in-memory object payload-signed with its SHA-256, so
+// the store rejects a body that does not match. Content-addressed chunks are
+// then correct by construction, which is what makes skipping an existing key
+// safe.
+func (c *s3Client) putBytes(ctx context.Context, storeKey string, payload []byte) error {
+	return c.putSigned(ctx, storeKey, int64(len(payload)), sha256Hex(payload), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	})
+}
+
+// putSigned is put with an explicit x-amz-content-sha256: UNSIGNED-PAYLOAD
+// for streamed files, or the hex SHA-256 of the body.
+func (c *s3Client) putSigned(ctx context.Context, storeKey string, size int64, payloadHash string, open func() (io.ReadCloser, error)) error {
 	if !c.writable() {
 		return ErrNotWritable
 	}
@@ -171,7 +188,7 @@ func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open fu
 		if openErr != nil {
 			return openErr
 		}
-		err := c.putOnce(ctx, urlString, key, body, size)
+		err := c.putOnce(ctx, urlString, key, body, size, payloadHash)
 		_ = body.Close()
 		if err == nil {
 			if attempt > 0 {
@@ -189,16 +206,16 @@ func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open fu
 	return fmt.Errorf("PUT %s: %w", key, lastErr)
 }
 
-// putOnce performs a single signed PUT. The payload is signed as
+// putOnce performs a single signed PUT. Streamed files are signed as
 // UNSIGNED-PAYLOAD so multi-GiB artifacts stream from disk without a second
 // read for the content hash; Content-Length still carries the exact size.
-func (c *s3Client) putOnce(ctx context.Context, urlString, key string, body io.Reader, size int64) error {
+func (c *s3Client) putOnce(ctx context.Context, urlString, key string, body io.Reader, size int64, payloadHash string) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPut, urlString, body)
 	if err != nil {
 		return err
 	}
 	request.ContentLength = size
-	c.signWrite(request)
+	c.signWrite(request, payloadHash)
 	response, err := c.putHTTP.Do(request)
 	if err != nil {
 		return err
@@ -323,6 +340,49 @@ func (c *s3Client) getOnce(ctx context.Context, urlString, key string) (io.ReadC
 	return response.Body, nil
 }
 
+// size reports whether an object exists and its size (HEAD with the read
+// credential). Only a definitive answer reports presence; anything other
+// than 200, 404 or 403 is an error, so a caller deciding to skip an upload
+// never skips on a guess.
+func (c *s3Client) size(ctx context.Context, storeKey string) (int64, bool, error) {
+	key := storeKey
+	if c.prefix != "" {
+		key = c.prefix + "/" + storeKey
+	}
+	urlString, err := c.objectURL(key)
+	if err != nil {
+		return 0, false, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, urlString, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	c.sign(request)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return 0, false, err
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+		if response.ContentLength < 0 {
+			return 0, false, fmt.Errorf("HEAD %s: no content length", key)
+		}
+		return response.ContentLength, true, nil
+	case http.StatusNotFound:
+		return 0, false, nil
+	case http.StatusForbidden:
+		// AWS S3 answers 403 instead of 404 for a missing key when the
+		// credential lacks s3:ListBucket. Report "absent" so the caller
+		// uploads: chunk keys are content-addressed and the PUT is
+		// idempotent, and a real permission problem fails that PUT.
+		return 0, false, nil
+	default:
+		return 0, false, &httpError{StatusCode: response.StatusCode}
+	}
+}
+
 // objectURL returns the path-style URL of a store object.
 func (c *s3Client) objectURL(key string) (string, error) {
 	base, err := url.Parse(c.endpoint)
@@ -415,9 +475,9 @@ func awsQueryEscape(value string) string {
 	return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
 }
 
-// sign applies AWS Signature Version 4 to the request (service s3,
-// path-style). The payload hash is the empty-string digest: GETs carry no
-// body.
+// sign applies AWS Signature Version 4 to a read request (GET or HEAD;
+// service s3, path-style). The payload hash is the empty-string digest:
+// reads carry no body.
 func (c *s3Client) sign(request *http.Request) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
@@ -436,7 +496,7 @@ func (c *s3Client) sign(request *http.Request) {
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
-		http.MethodGet,
+		request.Method,
 		canonicalURI,
 		request.URL.RawQuery,
 		canonicalHeaders,
@@ -462,22 +522,22 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 }
 
 // signWrite applies AWS Signature Version 4 to a PUT with the write
-// credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
-// promise a content hash header without a second full read.
-func (c *s3Client) signWrite(request *http.Request) {
+// credential. payloadHash is UNSIGNED-PAYLOAD for streamed bodies (no
+// content hash without a second full read) or the body's hex SHA-256.
+func (c *s3Client) signWrite(request *http.Request, payloadHash string) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 
 	request.Header.Set("X-Amz-Date", amzDate)
-	request.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 	canonicalURI := request.URL.EscapedPath()
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
 	canonicalHeaders := "host:" + request.URL.Host + "\n" +
-		"x-amz-content-sha256:" + unsignedPayload + "\n" +
+		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
@@ -486,7 +546,7 @@ func (c *s3Client) signWrite(request *http.Request) {
 		request.URL.RawQuery,
 		canonicalHeaders,
 		signedHeaders,
-		unsignedPayload,
+		payloadHash,
 	}, "\n")
 	scope := date + "/" + c.region + "/s3/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + sha256Hex([]byte(canonicalRequest))

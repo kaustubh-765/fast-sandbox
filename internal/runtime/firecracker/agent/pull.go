@@ -15,8 +15,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
@@ -31,6 +33,14 @@ type Client struct {
 	s3 *s3Client
 	// peer is the P2P peer gateway; nil keeps pulls on the direct path.
 	peer *peerGateway
+	// transfer selects the store format of new publishes; pulls read
+	// both formats.
+	transfer TransferConfig
+	// knownChunks remembers chunk keys this client saw in the store
+	// (key -> stored size), so repeat publishes skip the HEAD.
+	knownChunks sync.Map
+	// chunkFlight single-flights concurrent uploads of one chunk key.
+	chunkFlight singleflight.Group
 }
 
 // peerGateway routes artifact GETs through a P2P peer gateway (the
@@ -50,11 +60,14 @@ func NewClient(storeRoot string, credential registryconfig.Credential, options .
 	for _, option := range options {
 		option(&config)
 	}
+	if err := config.transfer.Validate(); err != nil {
+		return nil, err
+	}
 	s3, err := newS3Client(storeRoot, credential, config.httpClient, config.region, config.endpoint)
 	if err != nil {
 		return nil, err
 	}
-	client := &Client{s3: s3}
+	client := &Client{s3: s3, transfer: config.transfer.normalized()}
 	if config.peerBase != "" {
 		httpClient := config.httpClient
 		if httpClient == nil {
@@ -78,6 +91,7 @@ type optionsConfig struct {
 	httpClient      *http.Client
 	peerBase        string
 	peerRoutePrefix string
+	transfer        TransferConfig
 }
 
 // WithRegion overrides the SigV4 signing region (default us-east-1).
@@ -277,14 +291,33 @@ func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactD
 	}
 
 	// Artifacts live in the same per-build digest namespace as the
-	// manifest, so their store keys derive from the manifest reference.
+	// manifest, so their store keys derive from the manifest reference. The
+	// manifest, not the agent's transfer setting, selects the reader.
 	buildDir := path.Dir(manifestKey)
+	binding, err := chunkBinding(payload)
+	if err != nil {
+		return err
+	}
+	if binding != nil {
+		err = c.materializeChunked(ctx, dir, buildDir, *binding, files)
+	} else {
+		err = c.stageWholeFiles(ctx, dir, buildDir, files)
+	}
+	if err != nil {
+		return err
+	}
+	return commitManifest(dir, payload)
+}
+
+// stageWholeFiles stages whole-file artifacts of one set: every artifact of
+// a whole-file set, or the optional state bundles of a chunked set.
+func (c *Client) stageWholeFiles(ctx context.Context, dir, buildDir string, files []nativeFile) error {
 	for _, file := range files {
 		if err := stageFile(ctx, c, dir, path.Join(buildDir, file.publish), file); err != nil {
 			return err
 		}
 	}
-	return commitManifest(dir, payload)
+	return nil
 }
 
 // getArtifact streams one native artifact object through the peer gateway

@@ -95,6 +95,7 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &source))
 	source["extension"] = map[string]any{"keep": true}
 	source["files"] = map[string]any{"memory.snap": map[string]any{}}
+	source[artifacts.ManifestChunksField] = map[string]any{"version": 1, "ref": artifacts.ChunkIndexName, "sha256": strings.Repeat("e", 64), "sizeBytes": 10}
 	source["platform"].(map[string]any)["extension"] = "keep"
 	source["platform"].(map[string]any)["checkpoint"] = map[string]any{"sandboxUID": "old"}
 	source["platform"].(map[string]any)["resourceLimits"] = map[string]string{"cpu": "4", "memory": "8Gi"}
@@ -108,6 +109,7 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	require.Equal(t, source["extension"], got["extension"])
 	require.Equal(t, m.Kernel.SHA256, got["kernel"].(map[string]any)["sha256"])
 	require.NotContains(t, got, "files")
+	require.NotContains(t, got, artifacts.ManifestChunksField, "the source set's chunk index binding is never inherited")
 	platform := got["platform"].(map[string]any)
 	require.Equal(t, "keep", platform["extension"])
 	require.NotContains(t, platform, "checkpoint")
