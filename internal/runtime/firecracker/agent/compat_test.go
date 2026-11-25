@@ -4,10 +4,11 @@ package agent
 // fixture in testdata/compat-2e505cb was published by the reference
 // implementation (#213 as deployed, 2e505cb) against an in-memory store:
 // compatContent staged with a sparse rootfs, an allocated zero chunk in
-// memory.snap and a policy bundle, once with raw chunks and once with zstd.
-// The tests pin that this reader restores those sets byte for byte and that
-// this publisher writes the same chunk objects, chunks.json and manifest
-// binding for the same staged input.
+// memory.snap and a policy bundle: with raw chunks, with zstd chunks, and
+// staged by size alone so the manifest identifies the native files only by
+// chunk-list digest. The tests pin that this reader restores those sets byte
+// for byte and that this publisher writes byte-identical objects (chunks,
+// chunks.json, SHA256SUMS, bundle, manifest) for the same staged input.
 
 import (
 	"bytes"
@@ -151,38 +152,20 @@ func writeCompatStaging(t *testing.T, set string) string {
 	return dir
 }
 
-// compatExpectedManifest is the manifest this publisher must write for a
-// fixture set: the deployed one, minus what this release does not write.
-func compatExpectedManifest(t *testing.T, published []byte) []byte {
-	t.Helper()
-	// Raw messages keep every value's bytes (and the binding's field order).
-	document := map[string]json.RawMessage{}
-	require.NoError(t, json.Unmarshal(published, &document))
-	files := map[string]map[string]json.RawMessage{}
-	require.NoError(t, json.Unmarshal(document["files"], &files))
-	// The chunk-list digest (FSEP-0004 PR 2) is not written yet.
-	for _, entry := range files {
-		delete(entry, "chunkList")
-	}
-	raw, err := json.Marshal(files)
-	require.NoError(t, err)
-	document["files"] = raw
-	payload, err := json.MarshalIndent(document, "", "  ")
-	require.NoError(t, err)
-	return append(payload, '\n')
-}
-
 func TestCompatPublisherMatchesDeployedSets(t *testing.T) {
 	for name, set := range compatSets(t) {
 		t.Run(name, func(t *testing.T) {
-			compression := TransferCompressionNone
-			if name == "zstd" {
-				compression = TransferCompressionZstd
+			transfer := chunkedTransfer(TransferCompressionNone)
+			switch name {
+			case "zstd":
+				transfer.Compression = TransferCompressionZstd
+			case "chunklist":
+				transfer.ChunkListOnly = true
 			}
 			store := newFakeObjectStore()
 			server := httptest.NewServer(http.HandlerFunc(store.handle))
 			defer server.Close()
-			result, err := newTestClient(t, server, chunkedTransfer(compression)).
+			result, err := newTestClient(t, server, transfer).
 				PublishImage(context.Background(), agentprotocol.PublishKindCheckpoint, "", writeCompatStaging(t, name))
 			require.NoError(t, err)
 
@@ -196,7 +179,8 @@ func TestCompatPublisherMatchesDeployedSets(t *testing.T) {
 			for _, file := range []string{artifacts.ChunkIndexName, artifacts.SHA256SUMSName, publishPolicyName} {
 				require.Equal(t, fixture(fixtureBase+"/"+file), store.object(base+"/"+file), "%s differs from the deployed publisher's", file)
 			}
-			require.Equal(t, string(compatExpectedManifest(t, fixture(fixtureBase+"/manifest.json"))), string(store.object(base+"/manifest.json")))
+			require.Equal(t, string(fixture(fixtureBase+"/manifest.json")), string(store.object(base+"/manifest.json")), "the manifest differs from the deployed publisher's")
+			require.Equal(t, set.ArtifactDigest, result.ArtifactDigest)
 			for _, key := range store.putKeys() {
 				if isChunkKey(key) {
 					require.Equal(t, fixture(key), store.object(key), "chunk object %s differs", key)

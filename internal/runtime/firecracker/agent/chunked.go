@@ -63,6 +63,11 @@ type TransferConfig struct {
 	Compression string
 	Concurrency int
 	ChunkSize   int64
+	// ChunkListOnly lets chunked sets omit the whole-file sha256 of native
+	// files: their chunk-list digest alone identifies them. Only agents and
+	// Fastlets that understand chunk-list digests read such sets, so it is
+	// the last, explicit rollout step (FSEP-0004 "Rollout and rollback").
+	ChunkListOnly bool
 }
 
 func (t TransferConfig) normalized() TransferConfig {
@@ -86,6 +91,12 @@ func (t TransferConfig) Chunked() bool {
 	return t.normalized().Format == TransferFormatChunked
 }
 
+// ChunkListDigest reports whether the agent advertises the chunkListDigest
+// capability: the Fastlet may then stage native files by size alone.
+func (t TransferConfig) ChunkListDigest() bool {
+	return t.Chunked() && t.ChunkListOnly
+}
+
 // Validate rejects unknown values and combinations that only make sense in
 // another format, so a typo never silently falls back to a default.
 func (t TransferConfig) Validate() error {
@@ -102,6 +113,9 @@ func (t TransferConfig) Validate() error {
 	}
 	if t.Format == TransferFormatLegacy && t.Compression != TransferCompressionNone {
 		return fmt.Errorf("transfer compression %q requires format %s", t.Compression, TransferFormatChunked)
+	}
+	if t.Format == TransferFormatLegacy && t.ChunkListOnly {
+		return fmt.Errorf("transfer chunkListOnly requires format %s", TransferFormatChunked)
 	}
 	if t.ChunkSize%chunkSizeAlignment != 0 {
 		return fmt.Errorf("transfer chunk size %d must be a multiple of 64KiB", t.ChunkSize)
@@ -305,7 +319,7 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 	executed := false
 	outcome, err, _ := c.chunkFlight.Do(key, func() (any, error) {
 		executed = true
-		size, reused, err := c.storeChunkOnce(ctx, key, encoding, block)
+		size, reused, err := c.storeChunkOnce(ctx, key, sum, encoding, block)
 		return stored{size: size, reused: reused}, err
 	})
 	if err != nil {
@@ -315,7 +329,7 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 	return result.size, result.reused || !executed, nil
 }
 
-func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block []byte) (int64, bool, error) {
+func (c *Client) storeChunkOnce(ctx context.Context, key, sum, encoding string, block []byte) (int64, bool, error) {
 	if size, ok := c.knownChunks.Load(key); ok {
 		return size.(int64), true, nil //nolint:forcetypeassert // the map only holds int64
 	}
@@ -334,11 +348,15 @@ func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block
 		c.knownChunks.Store(key, found.size)
 		return found.size, true, nil
 	}
-	payload := block
+	// A raw chunk is uploaded as exactly the bytes its sha256 names, so that
+	// digest doubles as the signed payload hash; an encoded payload is
+	// different bytes and is hashed for the signature.
+	payload, payloadSHA256 := block, sum
 	if encoding == artifacts.ChunkEncodingZstd {
 		payload = chunkEncoder().EncodeAll(block, make([]byte, 0, len(block)/2))
+		payloadSHA256 = sha256Hex(payload)
 	}
-	if err := c.s3.putBytes(ctx, key, payload); err != nil {
+	if err := c.s3.putBytesWithSHA256(ctx, key, payload, payloadSHA256); err != nil {
 		return 0, false, fmt.Errorf("upload chunk %s: %w", key, err)
 	}
 	c.knownChunks.Store(key, int64(len(payload)))
@@ -349,30 +367,48 @@ func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block
 // or with ref == nil drops a binding inherited from a source manifest (the
 // Fastlet builds a snapshot manifest from the one the Sandbox booted from,
 // and a whole-file set must not point at a chunks.json it never uploaded).
-// A document without a binding to drop keeps its exact bytes, so a legacy
-// publish stays byte-identical. The rewrite is atomic and deterministic: the
-// staged manifest then equals the published one, which the Fastlet's
-// same-node cache commit relies on. It returns the manifest bytes to publish.
-func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef) ([]byte, error) {
+// lists sets each named file entry's chunk-list digest; a whole-file sha256
+// the entry has is kept. A document without anything to change keeps its
+// exact bytes, so a legacy publish stays byte-identical. The rewrite is
+// atomic and deterministic: the staged manifest then equals the published
+// one, which the Fastlet's same-node cache commit relies on. It returns the
+// manifest bytes to publish.
+func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef, lists map[string]artifacts.ChunkListDigest) ([]byte, error) {
 	manifestPath := filepath.Join(dir, publishManifestName)
-	original, err := os.ReadFile(manifestPath)
+	original, document, err := readStagedManifestDocument(manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("read staged manifest: %w", err)
+		return nil, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(original))
-	decoder.UseNumber()
-	document := map[string]any{}
-	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("decode staged manifest: %w", err)
-	}
-	if _, had := document[artifacts.ManifestChunksField]; ref == nil && !had {
+	if _, had := document[artifacts.ManifestChunksField]; ref == nil && !had && len(lists) == 0 {
 		return original, nil
 	}
 	delete(document, artifacts.ManifestChunksField)
 	if ref != nil {
 		document[artifacts.ManifestChunksField] = ref
 	}
+	files, _ := document["files"].(map[string]any)
+	for name, list := range lists {
+		if entry, ok := files[name].(map[string]any); ok {
+			entry["chunkList"] = list
+		}
+	}
 	return rewriteStagedManifest(manifestPath, document)
+}
+
+// readStagedManifestDocument reads the staged manifest as a generic
+// document that keeps every field (numbers verbatim).
+func readStagedManifestDocument(manifestPath string) ([]byte, map[string]any, error) {
+	original, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read staged manifest: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(original))
+	decoder.UseNumber()
+	document := map[string]any{}
+	if err := decoder.Decode(&document); err != nil {
+		return nil, nil, fmt.Errorf("decode staged manifest: %w", err)
+	}
+	return original, document, nil
 }
 
 // rewriteStagedManifest atomically replaces the staged manifest with
@@ -419,9 +455,9 @@ type chunkTarget struct {
 // parallel into sparse temporary files, each chunk verified against its
 // digest before it is written. Files are committed only after every chunk
 // of every file was written, and each committed file is recorded in the
-// verified-digest memo under the manifest's digest, which the verified
-// chain (artifactDigest -> manifest -> chunks.json -> chunk digests) vouches
-// for. The state bundles (vault, policy) are small whole-file objects.
+// verified-digest memo under the manifest's digest (whole-file sha256, else
+// chunk-list digest), which the verified chain (artifactDigest -> manifest
+// -> chunks.json -> chunk digests) vouches for. The state bundles (vault, policy) are small whole-file objects.
 func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, ref artifacts.ChunkIndexRef, files []nativeFile) error { //nolint:gocognit // verify-then-write chain kept in one place for review
 	// Version 1 sets carry their index under one fixed name in the set's
 	// namespace; anything else would address an object outside it.
@@ -456,6 +492,13 @@ func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, r
 		}
 		if entry.SizeBytes != file.sizeBytes {
 			return fmt.Errorf("chunk index %s size %d does not match the manifest size %d", file.publish, entry.SizeBytes, file.sizeBytes)
+		}
+		if list := file.chunkList; list != nil {
+			// The manifest's chunk-list digest must describe exactly the
+			// verified index: chunk size and every chunk's place and digest.
+			if list.ChunkSize != index.ChunkSize || artifacts.ChunkListSHA256(index.ChunkSize, entry.SizeBytes, entry.Chunks) != list.SHA256 {
+				return fmt.Errorf("chunk index %s does not match the manifest chunk-list digest", file.publish)
+			}
 		}
 		if match, err := fileMatches(filepath.Join(dir, file.cache), file); err == nil && match {
 			continue
@@ -528,7 +571,7 @@ func commitChunkedFile(entry *chunkTarget, target string) error {
 		return err
 	}
 	if statErr == nil {
-		recordVerifiedFile(target, info, entry.file.sha256, time.Now())
+		recordVerifiedFile(target, info, entry.file.digestKey(), time.Now())
 	}
 	return nil
 }
