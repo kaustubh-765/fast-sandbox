@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "chunkSize": 65536,
+  "files": {
+    "memory.snap": {
+      "sizeBytes": 131572,
+      "chunks": [
+        {
+          "off": 0,
+          "len": 65536,
+          "sha256": "8e053183a6c53a055bb69d7cc90afd01dde121bcf25bf714a288c76453ea106e",
+          "storedSize": 65536
+        },
+        {
+          "off": 131072,
+          "len": 500,
+          "sha256": "dffc5ba4681da173064f4c2061523dd92fe37cb161364a0224834f7d5cdda0b1",
+          "storedSize": 500
+        }
+      ]
+    },
+    "rootfs.ext4": {
+      "sizeBytes": 263144,
+      "chunks": [
+        {
+          "off": 65536,
+          "len": 65536,
+          "sha256": "60620e0e50a37065b9aeaace3066dcfffbc570d37fe1a52d49fc7f2b9c8f0f82",
+          "storedSize": 65536
+        },
+        {
+          "off": 196608,
+          "len": 65536,
+          "sha256": "60620e0e50a37065b9aeaace3066dcfffbc570d37fe1a52d49fc7f2b9c8f0f82",
+          "storedSize": 65536
+        },
+        {
+          "off": 262144,
+          "len": 1000,
+          "sha256": "3e7c83322bb386bcb831675ceae1e343a84a2cd21e52f2e7718c2d8a07b2d8c4",
+          "storedSize": 1000
+        }
+      ]
+    },
+    "vmstate.snap": {
+      "sizeBytes": 777,
+      "chunks": [
+        {
+          "off": 0,
+          "len": 777,
+          "sha256": "7c983d42e05665dcbb98103fe7d55b5266ee3024c0b0f6184d3927161f5910fa",
+          "storedSize": 777
+        }
+      ]
+    }
+  }
+}

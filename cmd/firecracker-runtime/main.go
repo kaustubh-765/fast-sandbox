@@ -101,7 +101,7 @@ func run() error {
 	serviceOptions = append(serviceOptions, agentserver.WithTransfer(transfer))
 	klog.InfoS("artifact transfer configured", "chunked", transfer.Chunked(), "format", config.Transfer.Format,
 		"compression", config.Transfer.Compression, "concurrency", config.Transfer.Concurrency,
-		"chunkSizeMiB", config.Transfer.ChunkSizeMiB)
+		"chunkSizeMiB", config.Transfer.ChunkSizeMiB, "chunkListOnly", config.Transfer.ChunkListOnly)
 	var dartManager *agentdart.Manager
 	var p2pProbe func() bool
 	var gatewayProbers []*gatewayProber

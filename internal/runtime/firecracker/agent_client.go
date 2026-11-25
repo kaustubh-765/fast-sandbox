@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"fast-sandbox/internal/observability"
@@ -71,12 +72,27 @@ type PublishOutcome struct {
 	ArtifactDigest string
 }
 
+// chunkListDigestReporter is implemented by agent clients that remember
+// whether the agent last reported the chunkListDigest capability (Health or
+// PublishImage). Clients without it, and agents that predate it, mean the
+// Fastlet keeps hashing.
+type chunkListDigestReporter interface {
+	ChunkListDigest() bool
+}
+
 // agentHTTPClient implements AgentClient over the UDS socket.
 type agentHTTPClient struct {
 	client    *http.Client
 	namespace string
 	podUID    string
+	// chunkListDigest is the capability the agent last reported; a failed
+	// Health clears it.
+	chunkListDigest atomic.Bool
 }
+
+// ChunkListDigest reports whether the agent last said it publishes chunked
+// native artifacts without a whole-file sha256.
+func (c *agentHTTPClient) ChunkListDigest() bool { return c.chunkListDigest.Load() }
 
 // NewAgentClient builds the UDS HTTP client of the runtime-agent. The
 // caller identity (namespace + podUID) is attached to every request.
@@ -132,6 +148,7 @@ func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, kind, key
 	}, &response); err != nil {
 		return PublishOutcome{}, err
 	}
+	c.chunkListDigest.Store(response.ChunkListDigest)
 	return PublishOutcome{ManifestRef: response.ManifestRef, ArtifactDigest: response.ArtifactDigest}, nil
 }
 
@@ -181,8 +198,10 @@ func (c *agentHTTPClient) Compatibility(ctx context.Context) (string, error) {
 func (c *agentHTTPClient) Health(ctx context.Context) error {
 	var response agentprotocol.HealthResponse
 	if err := c.doJSON(ctx, agentprotocol.RouteHealth, c.identity(""), &response); err != nil {
+		c.chunkListDigest.Store(false)
 		return err
 	}
+	c.chunkListDigest.Store(response.OK && response.ChunkListDigest)
 	if !response.OK {
 		return fmt.Errorf("runtime-agent reports unhealthy: leases=%d images=%d", response.LeaseCount, response.ImageCount)
 	}

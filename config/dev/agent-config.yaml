@@ -73,6 +73,9 @@ data:
     #   compression: none     # none | zstd (chunked only)
     #   concurrency: 8        # parallel chunk transfers per publish/pull
     #   chunkSizeMiB: 4
+    #   # Omit the whole-file sha256 of native files (chunked only). Set
+    #   # it last, once every agent and Fastlet reads chunk-list digests.
+    #   chunkListOnly: false
     nodeReadiness:
       # The host-check / firecracker-asset-install / node-label loop.
       # Requires FAST_SANDBOX_NODE_NAME (injected by the DaemonSet).

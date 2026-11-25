@@ -75,6 +75,10 @@ type agentTransferConfig struct {
 	Concurrency int `yaml:"concurrency"`
 	// ChunkSizeMiB is the chunk size of new chunked sets (4).
 	ChunkSizeMiB int `yaml:"chunkSizeMiB"`
+	// ChunkListOnly lets chunked sets omit the whole-file sha256 of native
+	// files (chunked only). Set it only once every agent and Fastlet reads
+	// chunk-list digests: older readers cannot restore such sets.
+	ChunkListOnly bool `yaml:"chunkListOnly"`
 }
 
 // transfer converts the YAML section into the pull-client configuration.
@@ -82,6 +86,7 @@ func (c agentTransferConfig) transfer() agentpull.TransferConfig {
 	return agentpull.TransferConfig{
 		Format: c.Format, Compression: c.Compression,
 		Concurrency: c.Concurrency, ChunkSize: int64(c.ChunkSizeMiB) << 20,
+		ChunkListOnly: c.ChunkListOnly,
 	}
 }
 

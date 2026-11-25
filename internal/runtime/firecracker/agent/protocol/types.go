@@ -175,6 +175,12 @@ type PublishImageResponse struct {
 	// ("legacy" or "chunked"); empty from agents that predate the setting,
 	// which callers treat as legacy.
 	TransferFormat string `json:"transferFormat,omitempty"`
+	// ChunkListDigest reports that the agent publishes chunked native
+	// artifacts under chunk-list digests without a whole-file sha256
+	// (format: chunked and chunkListOnly: true), so the caller may stage
+	// them by size alone. False from agents that predate it: callers keep
+	// hashing.
+	ChunkListDigest bool `json:"chunkListDigest,omitempty"`
 }
 
 // CompatibilityResponse returns the node compatibility class (a placeholder
@@ -197,6 +203,8 @@ type HealthResponse struct {
 	P2PUp bool `json:"p2pUp"`
 	// TransferFormat: see PublishImageResponse.TransferFormat.
 	TransferFormat string `json:"transferFormat,omitempty"`
+	// ChunkListDigest: see PublishImageResponse.ChunkListDigest.
+	ChunkListDigest bool `json:"chunkListDigest,omitempty"`
 	// HostReady reports the last node-readiness check outcome (the KVM/
 	// storage/asset check behind the scheduling labels). Nil when the
 	// readiness manager is not running (no node name configured).

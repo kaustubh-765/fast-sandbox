@@ -19,7 +19,7 @@ import (
 // assembleSnapshotManifest is the manifest assembly without earlier proofs,
 // as the assembly tests drive it directly.
 func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind) (int64, error) {
-	size, _, err := assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir, kind, nil)
+	size, _, err := assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir, kind, nil, false)
 	return size, err
 }
 
