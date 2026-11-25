@@ -63,7 +63,13 @@ func NewClient(storeRoot string, credential registryconfig.Credential, options .
 	if err := config.transfer.Validate(); err != nil {
 		return nil, err
 	}
-	s3, err := newS3Client(storeRoot, credential, config.httpClient, config.region, config.endpoint)
+	storeHTTP := config.httpClient
+	if storeHTTP == nil && config.transfer.Chunked() {
+		// Parallel chunk transfers need a pooled transport; the legacy
+		// whole-file path keeps net/http's defaults.
+		storeHTTP = &http.Client{Timeout: defaultS3RequestTimeout, Transport: newStoreTransport()}
+	}
+	s3, err := newS3Client(storeRoot, credential, storeHTTP, config.region, config.endpoint)
 	if err != nil {
 		return nil, err
 	}
