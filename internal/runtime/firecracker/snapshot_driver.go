@@ -1609,6 +1609,10 @@ func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string
 		return 0, nil, err
 	}
 	delete(document, "files")
+	// The chunk index binding describes the source set's chunks.json, which
+	// this set's publish never uploaded: drop it, and let a chunked publish
+	// bind its own.
+	delete(document, artifacts.ManifestChunksField)
 	if !isOCI {
 		document["files"], err = json.Marshal(files)
 		if err != nil {

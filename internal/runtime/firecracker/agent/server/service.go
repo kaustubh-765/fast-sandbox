@@ -51,6 +51,9 @@ type Service struct {
 	// hostReady reports the node-readiness check outcome (ready flag +
 	// summary); nil when the hostready manager is not running.
 	hostReady func() (bool, string)
+	// transfer is the store format of new publishes, reported to the
+	// Fastlet in Health and PublishImage.
+	transfer agentpull.TransferConfig
 	// ensures single-flights concurrent ensures of one cache entry, so a
 	// Pin racing a Lease of the same image runs one pull (see ensureOnce).
 	ensures singleflight.Group
@@ -89,6 +92,20 @@ func WithP2PProbe(p2pUp func() bool) ServiceOption {
 // host verdict.
 func WithHostReadyProbe(hostReady func() (bool, string)) ServiceOption {
 	return func(service *Service) { service.hostReady = hostReady }
+}
+
+// WithTransfer records the agent's transfer configuration so Health and
+// PublishImage can report it.
+func WithTransfer(transfer agentpull.TransferConfig) ServiceOption {
+	return func(service *Service) { service.transfer = transfer }
+}
+
+// transferFormat is the transferFormat the agent reports.
+func (s *Service) transferFormat() string {
+	if s.transfer.Chunked() {
+		return agentpull.TransferFormatChunked
+	}
+	return agentpull.TransferFormatLegacy
 }
 
 // PinImage pulls the image (if not already cached) and records one pin.
@@ -188,6 +205,8 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 		LeaseCount: snapshot.LeaseCount,
 		PinCount:   snapshot.PinCount,
 		ImageCount: snapshot.ImageCount,
+
+		TransferFormat: s.transferFormat(),
 	}
 	if s.p2pUp != nil {
 		response.P2PUp = s.p2pUp()
@@ -220,7 +239,7 @@ func (s *Service) PublishImage(ctx context.Context, request agentprotocol.Publis
 		}
 		return agentprotocol.PublishImageResponse{}, err
 	}
-	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest}, nil
+	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest, TransferFormat: s.transferFormat()}, nil
 }
 
 // manifestDigestFor re-reads the committed manifest digest of an image.

@@ -129,6 +129,17 @@ single source. Credentials stay separate — builds use the template's
 `output.publishSecretRef` (write) and agents use the pool-compiled registry
 Secret (read).
 
+### Runtime-agent transfer
+
+The `transfer` section of the runtime-agent's `agent.yaml` selects the store format of new snapshot publishes ([FSEP-0004](../../fseps/0004-chunked-snapshot-transfer.md); see [Sandbox snapshots](../guides/sandbox-snapshots.md#appendix-how-it-works)). It is read at startup. Pulls read both formats whatever it says. An unknown value, or `compression: zstd` with `format: legacy`, fails agent startup.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `transfer.format` | `legacy` | `legacy` publishes whole-file sets; `chunked` publishes zero-elided, content-addressed chunks with a `chunks.json` index |
+| `transfer.compression` | `none` | `none` or `zstd` for new chunk objects; `chunked` only. Readers decode each chunk by the encoding recorded in `chunks.json` |
+| `transfer.concurrency` | `8` | Parallel chunk transfers per publish or pull |
+| `transfer.chunkSizeMiB` | `4` | Chunk size of new chunked sets, recorded per index; a multiple of 64 KiB |
+
 ## Fastlet configuration
 
 Fastlet configuration is delivered by level:

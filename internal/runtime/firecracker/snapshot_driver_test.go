@@ -441,6 +441,45 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 		document["lineage"].(map[string]any)["image"])
 }
 
+// A Sandbox restored from a chunked set boots from a manifest that binds the
+// source set's chunks.json. A new snapshot must not inherit that binding: a
+// legacy publish would otherwise point at a chunk index it never uploaded.
+func TestAssembleSnapshotManifestDropsInheritedChunkBinding(t *testing.T) {
+	fixture := newSnapshotDriverFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	dir := filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID)
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
+	state.Config.Desired.Restore = restore
+	require.NoError(t, saveState(dir, state))
+
+	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
+	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
+	sourceDocument := testManifestDocument(t)
+	sourceDocument["guestNetwork"].(map[string]any)["ip"] = "10.0.0.2"
+	sourceDocument["guestNetwork"].(map[string]any)["gateway"] = "10.0.0.1"
+	sourceDocument["machine"].(map[string]any)["vcpuCount"] = 1
+	sourceDocument["machine"].(map[string]any)["memoryMiB"] = 512
+	sourceDocument[artifacts.ManifestChunksField] = map[string]any{"version": 1, "ref": artifacts.ChunkIndexName, "sha256": strings.Repeat("e", 64), "sizeBytes": 10}
+	lineage, err := json.Marshal(sourceDocument)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "manifest.json"), lineage, 0o644))
+
+	staging := t.TempDir()
+	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
+		require.NoError(t, os.WriteFile(filepath.Join(staging, name), []byte("data-"+name), 0o640))
+	}
+	_, err = assembleSnapshotManifest(fixture.stateRoot, fixture.driver.ociRoot(), staging, dir, fastletapi.SnapshotKindCheckpoint)
+	require.NoError(t, err)
+
+	payload, err := os.ReadFile(filepath.Join(staging, "manifest.json"))
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(payload, &document))
+	require.NotContains(t, document, artifacts.ManifestChunksField)
+}
+
 func TestAssembleSnapshotManifestDropsInheritedEgressVaultMarker(t *testing.T) {
 	fixture := newSnapshotDriverFixture(t)
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
