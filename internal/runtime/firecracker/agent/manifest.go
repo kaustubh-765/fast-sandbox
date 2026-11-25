@@ -26,12 +26,28 @@ func parseManifest(payload []byte) (manifest, error) {
 }
 
 // nativeFile pairs a published artifact with its local cache name and the
-// expected digest.
+// expected digest: the whole-file sha256, or for a chunked artifact
+// published without one, its chunk-list digest.
 type nativeFile struct {
 	publish   string
 	cache     string
 	sha256    string
 	sizeBytes int64
+	chunkList *artifacts.ChunkListDigest
+}
+
+// chunkListDigestPrefix keeps a chunk-list digest apart from any whole-file
+// sha256 in the verified-digest memo.
+const chunkListDigestPrefix = "chunklist-v1:"
+
+// digestKey is the identity the verified-digest memo records for the file:
+// the whole-file sha256 when the manifest has one, else the prefixed
+// chunk-list digest.
+func (f nativeFile) digestKey() string {
+	if f.sha256 != "" || f.chunkList == nil {
+		return f.sha256
+	}
+	return chunkListDigestPrefix + f.chunkList.SHA256
 }
 
 // manifestVMStateName and manifestMemoryName are the published artifact
@@ -61,6 +77,10 @@ func (m manifest) nativeFiles() ([]nativeFile, error) {
 // stagedNativeFiles is nativeFiles for a staged manifest before publish: an
 // entry may carry only its size (a Fastlet that skipped the whole-file
 // hash), but a digest that is present must be well-formed.
+//
+// nativeFiles accepts a chunk-list digest in place of the whole-file sha256:
+// the chunked reader verifies it against chunks.json, and a whole-file pull
+// refuses an entry without sha256.
 func (m manifest) stagedNativeFiles() ([]nativeFile, error) {
 	return m.nativeFilesWith(false)
 }
@@ -75,7 +95,13 @@ func (m manifest) nativeFilesWith(requireDigest bool) ([]nativeFile, error) {
 		if !ok {
 			return nil, fmt.Errorf("manifest is missing the %s artifact", name.publish)
 		}
-		if (requireDigest || entry.SHA256 != "") && !validSHA256(entry.SHA256) {
+		if entry.ChunkList != nil {
+			if err := entry.ChunkList.Validate(); err != nil {
+				return nil, fmt.Errorf("manifest artifact %s: %w", name.publish, err)
+			}
+		}
+		digestRequired := requireDigest && entry.ChunkList == nil
+		if (digestRequired || entry.SHA256 != "") && !validSHA256(entry.SHA256) {
 			return nil, fmt.Errorf("manifest artifact %s has an invalid sha256", name.publish)
 		}
 		if entry.SizeBytes <= 0 {
@@ -83,7 +109,7 @@ func (m manifest) nativeFilesWith(requireDigest bool) ([]nativeFile, error) {
 		}
 		files = append(files, nativeFile{
 			publish: name.publish, cache: name.cache,
-			sha256: entry.SHA256, sizeBytes: entry.SizeBytes,
+			sha256: entry.SHA256, sizeBytes: entry.SizeBytes, chunkList: entry.ChunkList,
 		})
 	}
 	return files, nil
