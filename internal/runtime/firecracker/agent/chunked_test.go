@@ -608,8 +608,9 @@ func TestChunkedPublishCancelledWritesNoManifest(t *testing.T) {
 	}
 }
 
-// Chunk PUTs are payload-signed with the SHA-256 of the stored body (raw or
-// zstd), which the store checks.
+// Chunk PUTs are payload-signed with the SHA-256 of the stored body, which
+// the store checks: a raw chunk reuses its chunk digest instead of hashing
+// the block again, a zstd chunk signs the hash of the compressed body.
 func TestChunkPutSignsPayloadDigest(t *testing.T) {
 	for _, compression := range []string{TransferCompressionNone, TransferCompressionZstd} {
 		t.Run(compression, func(t *testing.T) {
@@ -631,6 +632,9 @@ func TestChunkPutSignsPayloadDigest(t *testing.T) {
 			require.NotEmpty(t, signed)
 			for key, claimed := range signed {
 				require.Equal(t, sha256Hex(store.object(key)), claimed, "chunk %s signed with a wrong payload hash", key)
+				if compression == TransferCompressionNone {
+					require.Equal(t, filepath.Base(key), claimed, "a raw chunk signs its own digest")
+				}
 			}
 		})
 	}
@@ -688,4 +692,17 @@ func TestChunkedPullRetriesTruncatedChunk(t *testing.T) {
 	require.NoError(t, newTestClient(t, flaky, TransferConfig{}).
 		PullCheckpoint(context.Background(), stateRoot, reference, result.ManifestRef, result.ArtifactDigest))
 	require.True(t, truncated.Load())
+}
+
+// The digest handed to the signer is checked by the store against the body,
+// so a chunk can never land under a key that does not name its bytes.
+func TestChunkPutRejectsWrongDigest(t *testing.T) {
+	store := newFakeObjectStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+	client := newTestClient(t, server, chunkedTransfer(TransferCompressionNone))
+	wrong := sha256Hex([]byte("other bytes"))
+	_, _, err := client.storeChunkOnce(context.Background(), artifacts.ChunkObjectKey(wrong, artifacts.ChunkEncodingRaw), wrong, artifacts.ChunkEncodingRaw, []byte("chunk bytes"))
+	require.Error(t, err)
+	require.Empty(t, store.putKeys())
 }
