@@ -588,26 +588,6 @@ func TestPublishAcceptanceFailsBeforeAnyUpload(t *testing.T) {
 	}
 }
 
-// A size-only native entry passes acceptance, but this agent requires the
-// whole-file sha256 in what it publishes: the pre-manifest check fails the
-// publish before any manifest, chunk index or whole-file object exists.
-func TestPublishSizeOnlyEntryFailsPreManifestCheck(t *testing.T) {
-	for _, transfer := range []TransferConfig{{}, chunkedTransfer(TransferCompressionNone)} {
-		t.Run(transfer.normalized().Format, func(t *testing.T) {
-			store := newFakeObjectStore()
-			server := httptest.NewServer(http.HandlerFunc(store.handle))
-			defer server.Close()
-			dir := stageSet(t, stagedFiles(), nil)
-			editStagedManifest(t, dir, manifestMemoryName, func(entry map[string]any) { delete(entry, "sha256") })
-			_, err := newTestClient(t, server, transfer).PublishImage(context.Background(), agentprotocol.PublishKindTemplate, "app", dir)
-			require.ErrorContains(t, err, "invalid sha256")
-			for _, key := range store.putKeys() {
-				require.True(t, isChunkKey(key), "only unreferenced chunks may exist, got %s", key)
-			}
-		})
-	}
-}
-
 func TestChunkedPublishCancelledWritesNoManifest(t *testing.T) {
 	store := newFakeObjectStore()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -172,6 +172,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	if err := d.cleanupSnapshotStaging(ctx, plan.staging); err != nil {
 		return nil, fmt.Errorf("clear stale snapshot staging %s: %w", plan.staging, err)
 	}
+	plan.sizeOnly = !ociSnapshot && d.agentStagesBySize(ctx)
 
 	// Capacity gate BEFORE any pause: a dump that cannot land wastes the
 	// business interruption. Reclaim unused image and checkpoint caches first.
@@ -291,7 +292,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 // plan.verifiedFiles for the same-node cache commit.
 func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
 	plan.awaitRootfsHash()
-	sizeBytes, verified, err := assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.verifiedFiles)
+	sizeBytes, verified, err := assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.verifiedFiles, plan.sizeOnly)
 	if err != nil {
 		return 0, err
 	}
@@ -708,6 +709,9 @@ type dumpPlan struct {
 	pauseAPI      time.Duration
 	dumpAPI       time.Duration
 	resumeAPI     time.Duration
+	// sizeOnly stages the native files by size alone, without any
+	// whole-file hash: the agent identifies them by chunk-list digest.
+	sizeOnly bool
 	// rootfsHash delivers the proof of the reflinked staged rootfs, hashed
 	// in the background from the clone on, so the hash runs during the
 	// pause, the dump and the relocation instead of after them.
@@ -944,7 +948,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 	}
 	plan.rootfsClone = time.Since(reflinkStarted)
-	if rootfsCloned {
+	if rootfsCloned && !plan.sizeOnly {
 		plan.startRootfsHash(stagedRootfs)
 	}
 
@@ -1481,7 +1485,8 @@ type snapshotManifestEntries struct {
 	Files, StateFiles     map[string]artifacts.ManifestFile
 	RootfsSize, SizeBytes int64
 	Cache                 map[string]string
-	Names                 []string
+	// Names are the hashed staged files, which SHA256SUMS lists.
+	Names []string
 	// Verified holds the proof of every hashed staged file (staged name ->
 	// digest bound to the file identity it was computed on).
 	Verified map[string]agentpull.VerifiedFile
@@ -1490,7 +1495,7 @@ type snapshotManifestEntries struct {
 // collectSnapshotManifestEntries describes the staged files of a snapshot
 // set. Digests proven earlier (known) are reused while their proof still
 // matches the file; the other files are hashed concurrently.
-func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]agentpull.VerifiedFile) (snapshotManifestEntries, error) {
+func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]agentpull.VerifiedFile, sizeOnly bool) (snapshotManifestEntries, error) {
 	bundleFiles, err := stagedBundleFiles(staging)
 	if err != nil {
 		return snapshotManifestEntries{}, err
@@ -1499,15 +1504,33 @@ func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string
 	if isOCI {
 		bundleFiles = bundleFiles[1:]
 	}
+	// With sizeOnly the native files are described by size and the agent
+	// adds their identity when it publishes; only the small state files
+	// (vault, policy) are hashed, and SHA256SUMS lists those.
+	native := func(name string) bool {
+		return sizeOnly && name != vaultBundleName && name != policyBundleName
+	}
+	hashed := make([]string, 0, len(bundleFiles))
+	for _, name := range bundleFiles {
+		if !native(name) {
+			hashed = append(hashed, name)
+		}
+	}
 	files, stateFiles := map[string]artifacts.ManifestFile{}, map[string]artifacts.ManifestFile{}
 	var sizeBytes, rootfsSize int64
-	cache, verified, err := hashStagedFiles(staging, bundleFiles, known)
+	cache, verified, err := hashStagedFiles(staging, hashed, known)
 	if err != nil {
 		return snapshotManifestEntries{}, err
 	}
 	for _, name := range bundleFiles {
-		file, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
-		if err != nil {
+		var file artifacts.ManifestFile
+		if native(name) {
+			info, err := os.Stat(filepath.Join(staging, name))
+			if err != nil {
+				return snapshotManifestEntries{}, err
+			}
+			file = artifacts.ManifestFile{SizeBytes: info.Size()}
+		} else if file, err = artifacts.FileEntry(filepath.Join(staging, name), cache); err != nil {
 			return snapshotManifestEntries{}, err
 		}
 		sizeBytes += file.SizeBytes
@@ -1531,13 +1554,13 @@ func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string
 		rootfsSize = upper.VirtualSizeBytes
 		sizeBytes += rootfsSize
 	}
-	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles, Verified: verified}, nil
+	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: hashed, Verified: verified}, nil
 }
 
 // assembleSnapshotManifestWith writes the manifest and SHA256SUMS of a staged
 // snapshot set and returns its size and the proofs of its hashed files (see
 // collectSnapshotManifestEntries for known).
-func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]agentpull.VerifiedFile) (int64, map[string]agentpull.VerifiedFile, error) {
+func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]agentpull.VerifiedFile, sizeOnly bool) (int64, map[string]agentpull.VerifiedFile, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
 		return 0, nil, err
@@ -1547,7 +1570,7 @@ func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string
 		return 0, nil, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
-	entries, err := collectSnapshotManifestEntries(staging, isOCI, known)
+	entries, err := collectSnapshotManifestEntries(staging, isOCI, known, sizeOnly)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1700,6 +1723,28 @@ func proofHolds(path string, proof agentpull.VerifiedFile) bool {
 	return proof.MatchesFile(file)
 }
 
+// agentStagesBySize reports whether this snapshot may stage its native
+// files without whole-file hashes: only when the agent reports the
+// chunkListDigest capability right now. Health is called first so a
+// capability cached from an earlier response is never trusted after the
+// agent changed mode; a Health error clears it, and the Fastlet hashes. An
+// agent that changes mode after this answer still publishes a complete set:
+// it fills in a missing sha256 itself.
+func (d *Driver) agentStagesBySize(ctx context.Context) bool {
+	client, err := d.agentClientOrNil()
+	if err != nil || client == nil {
+		return false
+	}
+	reporter, ok := client.(chunkListDigestReporter)
+	if !ok {
+		return false
+	}
+	if err := client.Health(ctx); err != nil {
+		return false
+	}
+	return reporter.ChunkListDigest()
+}
+
 // relocateSpilled is the post-resume relocation of one spilled dump file
 // (a variable so tests can observe it).
 var relocateSpilled = relocateSpilledFile
@@ -1710,6 +1755,10 @@ var relocateSpilled = relocateSpilledFile
 // plan.verifiedFiles, so the manifest assembly does not read guest memory a
 // second time.
 func relocateSpilledFile(plan *dumpPlan, source, target string) error {
+	if plan.sizeOnly {
+		// Nothing hashes a size-only staged file: copy it at write speed.
+		return copyFile(source, target)
+	}
 	sum, proof, err := copyFileHashed(source, target)
 	if err != nil {
 		return err
