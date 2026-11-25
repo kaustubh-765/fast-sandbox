@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -137,6 +138,45 @@ type Driver struct {
 // to Sandbox lifecycle events.
 const defaultImageGCInterval = time.Hour
 
+// imageGCIntervalEnv overrides the GC period (a Go duration, e.g. "10m"):
+// under a sustained pause/snapshot load the cache outgrows its limit by far
+// between hourly passes.
+const imageGCIntervalEnv = "FAST_SANDBOX_IMAGE_GC_INTERVAL"
+
+// imageGCInterval returns the configured GC period; an empty, invalid or
+// non-positive value keeps the default.
+func imageGCInterval() time.Duration {
+	value := strings.TrimSpace(os.Getenv(imageGCIntervalEnv))
+	if value == "" {
+		return defaultImageGCInterval
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		klog.InfoS("ignoring invalid image GC interval", "env", imageGCIntervalEnv, "value", value, "default", defaultImageGCInterval.String())
+		return defaultImageGCInterval
+	}
+	return interval
+}
+
+// imageCacheLimitEnv overrides the node image-cache limit in GiB: the 20 GiB
+// default is small for nodes that cache many templates and checkpoints.
+const imageCacheLimitEnv = "FAST_SANDBOX_IMAGE_CACHE_LIMIT_GB"
+
+// imageCacheLimitBytes returns the configured cache limit; an empty, invalid
+// or non-positive value keeps the default.
+func imageCacheLimitBytes() int64 {
+	value := strings.TrimSpace(os.Getenv(imageCacheLimitEnv))
+	if value == "" {
+		return defaultImageCacheLimitBytes
+	}
+	gib, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || gib <= 0 || gib > 1<<20 {
+		klog.InfoS("ignoring invalid image cache limit", "env", imageCacheLimitEnv, "value", value, "defaultGiB", defaultImageCacheLimitBytes>>30)
+		return defaultImageCacheLimitBytes
+	}
+	return gib << 30
+}
+
 // New validates the runtime profile configuration and returns the driver.
 func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 	if profile.Firecracker == nil {
@@ -150,8 +190,8 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
 		checkStorage:           checkStateRootStorage,
 		writeVMMetadataPayload: writeVMMetadataPayload,
-		imageGCInterval:        defaultImageGCInterval,
-		imageCacheLimitBytes:   defaultImageCacheLimitBytes,
+		imageGCInterval:        imageGCInterval(),
+		imageCacheLimitBytes:   imageCacheLimitBytes(),
 	}, nil
 }
 
