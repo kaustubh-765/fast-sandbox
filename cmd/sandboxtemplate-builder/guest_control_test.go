@@ -111,7 +111,7 @@ func TestGuestControlInjection(t *testing.T) {
 	require.NoError(t, err)
 }
 func TestGuestControlInitOrder(t *testing.T) {
-	script := renderGuestInitWithControl(apiv1alpha2.SandboxTemplateSpec{}, true)
+	script := renderGuestInitWithControl(apiv1alpha2.SandboxTemplateSpec{}, true, "/bin/sh")
 	require.Less(t, strings.Index(script, "mount -t tmpfs tmpfs /run"), strings.Index(script, "setsid /usr/local/sbin/fsb-guest-control"))
 	require.Less(t, strings.Index(script, "setsid /usr/local/sbin/fsb-guest-control"), strings.Index(script, "BOOTSTRAP_CMD="))
 	require.NotContains(t, renderGuestInit(apiv1alpha2.SandboxTemplateSpec{}), "fsb-guest-control")
@@ -156,7 +156,7 @@ func TestGuestControlBinaryInjectionIntegration(t *testing.T) {
 }
 
 func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
-	return renderGuestInitWithControl(spec, false)
+	return renderGuestInitWithControl(spec, false, "/bin/sh")
 }
 
 func TestNativeBootProvenanceRequiresProbeAndPinnedKernel(t *testing.T) {
