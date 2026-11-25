@@ -565,16 +565,20 @@ func (c *Client) fetchChunkIndex(ctx context.Context, key string, ref artifacts.
 	return artifacts.ParseChunkIndex(payload)
 }
 
-// withChunkAttempts runs one chunk request, retrying transient failures
-// (including a truncated body, which the store client's own retry does not
-// cover). A missing object and a cancelled context are final.
+// withChunkAttempts runs one chunk request with a per-attempt timeout,
+// retrying transient failures: a stalled connection, which the timeout
+// drops so the retry dials a fresh one, and a truncated body, which the
+// store client's own retry does not cover. A missing object and a cancelled
+// context are final.
 func withChunkAttempts[T any](ctx context.Context, what string, attempt func(context.Context) (T, error)) (T, error) {
 	var (
 		zero    T
 		lastErr error
 	)
 	for try := 0; try <= s3RetryAttempts; try++ {
-		result, err := attempt(ctx)
+		attemptCtx, cancel := context.WithTimeout(ctx, chunkAttemptTimeout)
+		result, err := attempt(attemptCtx)
+		cancel()
 		if err == nil {
 			return result, nil
 		}
