@@ -212,6 +212,14 @@ credentials) see the sections below.
   verbatim from the source image (they describe the vmstate lineage that
   restore validates). Only the template-name index is written — never a
   default `sha256(image)` key, which would pollute the golden image.
+- **Store format** (`transfer.format` in the runtime-agent config; see the [configuration reference](../reference/configuration.md#runtime-agent-transfer)): selects how new publishes are stored. Pulls read both formats in either mode; the manifest of each set selects the reader.
+  - `legacy` (default): the whole-file layout above. The published manifest is the staged one, byte for byte.
+  - `chunked` ([FSEP-0004](../../fseps/0004-chunked-snapshot-transfer.md)): the native artifacts the manifest lists (rootfs, VM state and memory; only the rootfs for a RootfsOnly set) are split into 4 MiB chunks. All-zero chunks are skipped and stay holes in the restored file; every other chunk is stored once under `<store>/chunks/sha256/<aa>/<sha256>` (`.zst` with `compression: zstd`), so identical chunks are uploaded and downloaded once across sets. The set namespace holds `chunks.json` (the chunk index) instead of the native artifacts, bound into the manifest by a `chunks` field (`version`, `ref`, `sha256`, `sizeBytes`). Index digest → manifest → `chunks.json` → per-chunk SHA-256 is one verification chain; a pull verifies each chunk before it writes it and commits a file only after all its chunks are written.
+  - Upload order: chunks → `chunks.json` → state bundles and `SHA256SUMS` → `manifest.json` → index object. Before any upload the agent checks that the staged files match the staged manifest; right before the manifest it checks that readers will accept it, so a failed publish leaves at most unreferenced chunks.
+  - A snapshot of a Sandbox restored from a chunked set never inherits that set's `chunks` binding: the Fastlet drops it when it assembles the manifest, and a `legacy` publish drops it too.
+  - Store requirements are unchanged: path-style SigV4 `GET`, `PUT` and `HEAD`. Chunk `PUT`s are payload-signed, so the store rejects a corrupted body. A `HEAD` answered with 403 (AWS without `s3:ListBucket`) falls back to uploading the chunk.
+  - Chunks are shared between sets and nothing deletes them yet. Before enabling `chunked`, make sure no store lifecycle rule or external cleanup job deletes objects under `chunks/`.
+  - Rollback: set `format: legacy` (and `compression: none` in the same change). Every chunked set already published stays restorable. An agent that predates the chunk reader cannot restore chunked sets: do not downgrade below it once `chunked` was enabled.
 - **Follow-ups**: [#56](https://github.com/opensandbox-group/fast-sandbox/issues/56)
   diff snapshots (pause window proportional to dirty pages),
   [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)

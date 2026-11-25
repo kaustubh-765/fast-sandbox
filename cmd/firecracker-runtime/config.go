@@ -24,6 +24,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/registryconfig"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agenthostready "fast-sandbox/internal/runtime/firecracker/agent/hostready"
 )
 
@@ -56,6 +57,32 @@ type agentConfig struct {
 	Dart *agentDartConfig `yaml:"dart,omitempty"`
 	// NodeReadiness configures the host-check/asset-install/label loop.
 	NodeReadiness agentNodeReadinessConfig `yaml:"nodeReadiness"`
+	// Transfer selects the store format of new publishes (startup only).
+	// Pulls read both formats whatever it says.
+	Transfer agentTransferConfig `yaml:"transfer"`
+}
+
+// agentTransferConfig is the transfer section of agent.yaml (FSEP-0004).
+type agentTransferConfig struct {
+	// Format is "legacy" (whole-file sets, the default) or "chunked"
+	// (zero-elided, content-addressed chunks). Roll a chunk-aware agent to
+	// every node before switching any node to chunked.
+	Format string `yaml:"format"`
+	// Compression is "none" (default) or "zstd" for new chunk objects
+	// (chunked only).
+	Compression string `yaml:"compression"`
+	// Concurrency is the parallel chunk transfers per publish or pull (8).
+	Concurrency int `yaml:"concurrency"`
+	// ChunkSizeMiB is the chunk size of new chunked sets (4).
+	ChunkSizeMiB int `yaml:"chunkSizeMiB"`
+}
+
+// transfer converts the YAML section into the pull-client configuration.
+func (c agentTransferConfig) transfer() agentpull.TransferConfig {
+	return agentpull.TransferConfig{
+		Format: c.Format, Compression: c.Compression,
+		Concurrency: c.Concurrency, ChunkSize: int64(c.ChunkSizeMiB) << 20,
+	}
 }
 
 // agentP2PConfig selects the peer-distribution provider; dart and gateway
@@ -178,6 +205,12 @@ func (c *agentConfig) normalize() error {
 	// never boots one (#84). minFree/minMemory/interval are resolved by
 	// the readiness settings loader against the hostready package
 	// defaults — no duplicated default literals here.
+	if c.Transfer.Concurrency < 0 || c.Transfer.ChunkSizeMiB < 0 {
+		return fmt.Errorf("transfer: concurrency and chunkSizeMiB must not be negative")
+	}
+	if err := c.Transfer.transfer().Validate(); err != nil {
+		return fmt.Errorf("transfer: %w", err)
+	}
 	return nil
 }
 
