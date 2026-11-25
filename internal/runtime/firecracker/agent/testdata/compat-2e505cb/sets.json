@@ -1,0 +1,10 @@
+{
+  "raw": {
+    "artifactDigest": "7ae09d5dce3268f6e2ec052885deb9bbc2f34ceb9cb5cba24c8f11f7d8e8da82",
+    "manifestRef": "s3://bucket/publish/7ae09d5dce3268f6/manifest.json"
+  },
+  "zstd": {
+    "artifactDigest": "01bfbb889b0de57ed048f75c883741a341ff8625e42f99d6c942cb896706ca36",
+    "manifestRef": "s3://bucket/publish/01bfbb889b0de57e/manifest.json"
+  }
+}
