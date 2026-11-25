@@ -331,6 +331,11 @@ func manifestFilesComplete(dir string, document manifest) (bool, error) {
 // verifies. The object is fetched through the client, which routes artifact
 // bytes over the P2P gateway when configured (falling back to direct S3).
 func stageFile(ctx context.Context, c *Client, dir, storeKey string, file nativeFile) error {
+	if file.sha256 == "" {
+		// Only a chunked set may identify an artifact by chunk-list
+		// digest: a whole-file download has nothing to verify it against.
+		return fmt.Errorf("artifact %s has no whole-file sha256 in a whole-file set", file.publish)
+	}
 	target := filepath.Join(dir, file.cache)
 	match, err := fileMatches(target, file)
 	if err == nil && match {
@@ -461,8 +466,11 @@ func fileMatches(path string, file nativeFile) (bool, error) {
 		return false, nil
 	}
 	statID, hasStatID := fileIdentityFromInfo(info)
-	if hasStatID && defaultVerifiedDigests.matches(path, statID, file.sha256) {
+	if hasStatID && defaultVerifiedDigests.matches(path, statID, file.digestKey()) {
 		return true, nil
+	}
+	if file.sha256 == "" && file.chunkList != nil {
+		return chunkListMatches(path, file, info, statID, hasStatID)
 	}
 	input, err := os.Open(path)
 	if err != nil {
@@ -493,6 +501,32 @@ func fileMatches(path string, file nativeFile) (bool, error) {
 		afterID, okAfter := fileIdentityFromInfo(afterInfo)
 		if hasStatID && okBefore && okAfter && statID == beforeID && beforeID == afterID {
 			recordVerifiedFile(path, afterInfo, sum, time.Now())
+		}
+	}
+	return true, nil
+}
+
+// chunkListVerifyWorkers bounds the parallel reads of a chunk-list re-verify
+// (a cached file the memo does not know, e.g. after an agent restart).
+const chunkListVerifyWorkers = 8
+
+// chunkListMatches is fileMatches for an entry identified only by its
+// chunk-list digest: it hashes the non-zero chunks in parallel and memoizes
+// a match like a whole-file hash.
+func chunkListMatches(path string, file nativeFile, info os.FileInfo, statID fileIdentity, hasStatID bool) (bool, error) {
+	fileMatchesHashCount.Add(1)
+	sum, err := artifacts.FileChunkListSHA256(path, file.chunkList.ChunkSize, chunkListVerifyWorkers)
+	if err != nil {
+		return false, err
+	}
+	if sum != file.chunkList.SHA256 {
+		defaultVerifiedDigests.invalidate(path)
+		return false, nil
+	}
+	after, err := os.Stat(path)
+	if err == nil && hasStatID {
+		if afterID, ok := fileIdentityFromInfo(after); ok && afterID == statID {
+			recordVerifiedFile(path, info, file.digestKey(), time.Now())
 		}
 	}
 	return true, nil
