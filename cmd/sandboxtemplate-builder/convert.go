@@ -158,7 +158,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 			klog.V(2).InfoS("execd file missing from execd image", "file", name, execdAssetName, spec.Execd)
 		}
 	}
-	injectStaticBusybox(mountPoint)
+	busybox := injectStaticBusybox(mountPoint)
 
 	// The guest init is always injected (default path when spec.init is
 	// empty) at the exact path the spec declares; the boot args pass the
@@ -174,7 +174,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	if err := os.MkdirAll(filepath.Dir(guestInit), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(guestInit, []byte(renderGuestInitWithControl(spec, control)), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
+	if err := os.WriteFile(guestInit, []byte(renderGuestInitWithControl(spec, control, guestInitShell(mountPoint, busybox))), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
 		return nil, err
 	}
 
@@ -231,12 +231,25 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 }
 
 // injectStaticBusybox copies the builder image's static busybox into the
-// rootfs; absence only logs, and the init surfaces the gap at the gate.
-func injectStaticBusybox(mountPoint string) {
+// rootfs and reports whether it did; absence only logs, and the init then
+// needs every tool from the image itself.
+func injectStaticBusybox(mountPoint string) bool {
 	if !injectBusyboxFrom(hostBusyboxCandidates, mountPoint) {
-		klog.V(2).InfoS("no static busybox in the builder image; guest init falls back to image-local ip/ifconfig",
+		klog.V(2).InfoS("no static busybox in the builder image; guest init relies on image-local tools",
 			"candidates", hostBusyboxCandidates)
+		return false
 	}
+	return true
+}
+
+// guestInitShell is the interpreter line of the guest init: the image's
+// /bin/sh when it has one (unchanged behaviour), the injected busybox shell
+// otherwise, so images without a shell (distroless) still boot.
+func guestInitShell(mountPoint string, busybox bool) string {
+	if _, err := os.Lstat(filepath.Join(mountPoint, "bin", "sh")); err == nil || !busybox {
+		return "/bin/sh"
+	}
+	return guestBusyboxPath + " sh"
 }
 
 // injectBusyboxFrom copies the first readable candidate into the rootfs and
@@ -343,11 +356,15 @@ var hostBusyboxCandidates = []string{"/bin/busybox", "/usr/bin/busybox"}
 // healthcheck), the one-shot SANDBOX_READY marker, and a heartbeat loop so
 // the host can verify the guest is alive after a snapshot restore (the init
 // does not re-run after resume).
-
-func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bool) string {
+//
+// shell is the interpreter line. Every external tool the script needs
+// (mountpoint, mount, mkdir, hostname, setsid, sleep) runs through tool():
+// the image's own command when it has one, the injected static busybox applet
+// otherwise, so images without these tools or without a shell still boot.
+func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bool, shell string) string {
 	controlStart := ""
 	if control {
-		controlStart = "setsid /usr/local/sbin/fsb-guest-control --mount / --port 1234 </dev/null >/dev/console 2>&1 &\n"
+		controlStart = "tool setsid /usr/local/sbin/fsb-guest-control --mount / --port 1234 </dev/null >/dev/console 2>&1 &\n"
 	}
 	var readiness []string
 	if spec.Readiness.Probe != "" {
@@ -377,28 +394,36 @@ func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bo
   exit 1
 }`
 	}
-	return `#!/bin/sh
+	return `#!` + shell + `
 set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-mountpoint -q /proc || mount -t proc proc /proc
-mountpoint -q /sys || mount -t sysfs sysfs /sys
-mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
-mkdir -p /dev/pts /dev/shm /run /tmp
-mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
-mountpoint -q /run || mount -t tmpfs tmpfs /run
-mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
+BB=` + guestBusyboxPath + `
+# tool CMD ARGS...: the image's CMD, else the injected busybox applet
+tool() { if command -v "$1" >/dev/null 2>&1; then "$@"; elif [ -x "$BB" ]; then "$BB" "$@"; else return 127; fi; }
+SH=/bin/sh; [ -x /bin/sh ] || SH="$BB sh"
+tool mountpoint -q /proc || tool mount -t proc proc /proc
+tool mountpoint -q /sys || tool mount -t sysfs sysfs /sys
+tool mountpoint -q /dev || tool mount -t devtmpfs devtmpfs /dev
+tool mkdir -p /dev/pts /dev/shm /run /tmp
+tool mountpoint -q /dev/pts || tool mount -t devpts devpts /dev/pts
+tool mountpoint -q /run || tool mount -t tmpfs tmpfs /run
+tool mountpoint -q /tmp || tool mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
-hostname sandbox
+tool hostname sandbox
 ` + firecrackerconfig.RenderFreePageReportingCheck() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs
   # execd once its command exits, and its no-command fallback (an
   # interactive shell) exits instantly on the EOF serial console stdin.
-  BOOTSTRAP_CMD="${ENTRYPOINT:-tail -f /dev/null}" setsid /bin/sh /opt/opensandbox/bootstrap.sh &
+  # Export it: tool() is a shell function, and some shells (busybox 1.30, the
+  # injected interpreter when the image has no /bin/sh at render time) do not
+  # export prefix assignments of a function call to the commands it runs.
+  export BOOTSTRAP_CMD="${ENTRYPOINT:-tail -f /dev/null}"
+  tool setsid $SH /opt/opensandbox/bootstrap.sh &
 elif [ -n "${ENTRYPOINT:-}" ]; then
-  setsid /bin/sh -c "$ENTRYPOINT" &
+  tool setsid $SH -c "$ENTRYPOINT" &
 fi
 ` + readinessBlock + `
 select_nc() {
@@ -412,25 +437,25 @@ select_nc() {
   fi
 }
 ready_tcp() { host=${1#tcp://}; host=${host%%:*}; port=${1##*:}; guest_nc -w 1 "$host" "$port" </dev/null >/dev/null 2>&1; }
-ready_cmd() { /bin/sh -c "${1#cmd://}" >/dev/null 2>&1; }
+ready_cmd() { $SH -c "${1#cmd://}" >/dev/null 2>&1; }
 ready_execd_ping() { guest_nc -w 1 127.0.0.1 44772 </dev/null >/dev/null 2>&1; }
 if [ -n "${READINESS_PROBE:-}" ]; then
   case "$READINESS_PROBE" in
-    tcp://*) select_nc; until ready_tcp "$READINESS_PROBE"; do sleep 1; done ;;
-    cmd://*) until ready_cmd "$READINESS_PROBE"; do sleep 1; done ;;
+    tcp://*) select_nc; until ready_tcp "$READINESS_PROBE"; do tool sleep 1; done ;;
+    cmd://*) until ready_cmd "$READINESS_PROBE"; do tool sleep 1; done ;;
     *) echo "SANDBOX_STARTUP_FAILED invalid_probe"; exit 1 ;;
   esac
 elif [ -x /opt/opensandbox/execd ]; then
   select_nc
-  until ready_execd_ping; do sleep 1; done
+  until ready_execd_ping; do tool sleep 1; done
 else
-  sleep "${WARMUP_SECONDS:-60}"
+  tool sleep "${WARMUP_SECONDS:-60}"
   if [ -n "${HEALTHCHECK:-}" ]; then
-    until /bin/sh -c "$HEALTHCHECK" >/dev/null 2>&1; do sleep 1; done
+    until $SH -c "$HEALTHCHECK" >/dev/null 2>&1; do tool sleep 1; done
   fi
 fi
 echo SANDBOX_READY
-while true; do echo SANDBOX_HEARTBEAT; sleep 5; done
+while true; do echo SANDBOX_HEARTBEAT; tool sleep 5; done
 `
 }
 
