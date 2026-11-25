@@ -356,12 +356,16 @@ printf 'busybox %s\n' "$*" >> "$CALLS"
 				writeExecutable("execd", "exit 0\n")
 			}
 			script := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{})
+			// The tool() helper and $SH precede the readiness block.
+			helpersEnd := strings.Index(script, "SH=/bin/sh;")
+			helpersEnd += strings.Index(script[helpersEnd:], "\n") + 1
+			helpers := script[strings.Index(script, "BB="):helpersEnd]
 			start := strings.Index(script, "select_nc() {")
 			end := strings.Index(script, "echo SANDBOX_READY") + len("echo SANDBOX_READY")
 			if start < 0 || end < start {
 				t.Fatal("rendered readiness block missing")
 			}
-			script = strings.ReplaceAll(script[start:end], guestBusyboxPath, shellQuote(busybox))
+			script = strings.ReplaceAll(helpers+script[start:end], guestBusyboxPath, shellQuote(busybox))
 			script = strings.ReplaceAll(script, "/opt/opensandbox/execd", execd)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
