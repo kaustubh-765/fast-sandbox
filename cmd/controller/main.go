@@ -218,9 +218,14 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 		LeaderElection:                role.LeaderElection(),
 		LeaderElectionID:              "fast-sandbox-reconciler.sandbox.fast.io",
 		LeaderElectionReleaseOnCancel: true,
+		// Nodes are watched cluster-wide only for spec.unschedulable;
+		// trim everything else so the Node cache stays light.
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Node{}: {Transform: reconciler.TrimNodeForCache},
+		}},
 	}
 	if namespaces, scoped := cacheNamespaceConfigs(cacheNamespaceSet); scoped {
-		managerOptions.Cache = cache.Options{DefaultNamespaces: namespaces}
+		managerOptions.Cache.DefaultNamespaces = namespaces
 		klog.InfoS("scoping informer cache to namespaces", "namespaces", strings.Join(sortedCacheNamespaceNames(namespaces), ","))
 	}
 	manager, err := ctrl.NewManager(restConfig, managerOptions)
@@ -270,6 +275,16 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 	orchestrator := &orchestration.Orchestrator{
 		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog,
 		DisableResourceAwarePlacement: !resourceAwarePlacement,
+	}
+
+	// Every role feeds Node cordon state into the Registry: FastPath
+	// placement skips cordoned nodes and Pool scale-down drains them first.
+	// The controller does not need leader election (process-local state).
+	if err := (&reconciler.NodeSchedulabilityReconciler{
+		Client: manager.GetClient(), Registry: registry,
+	}).SetupWithManager(manager); err != nil {
+		klog.ErrorS(err, "Register Node schedulability controller")
+		os.Exit(1)
 	}
 
 	if role.RunsControllers() {
