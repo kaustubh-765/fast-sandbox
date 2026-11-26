@@ -146,7 +146,37 @@ func (c *s3Client) storeRootURI() string {
 // ownership of a request body and closes it after the attempt: a retry
 // must open a fresh reader (seeking a closed *os.File was the field bug).
 func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open func() (io.ReadCloser, error)) error {
-	return c.putSigned(ctx, storeKey, size, unsignedPayload, open)
+	return c.putSigned(ctx, storeKey, size, unsignedPayload, 0, open)
+}
+
+// chunkAttemptTimeout bounds one chunk request attempt. A 4 MiB chunk takes
+// milliseconds on a healthy path (10 s still allows ~3.4 Mbit/s); behind a
+// lossy rate policer a single TCP connection can collapse to a few hundred
+// kbit/s, or a pooled connection can be dead, and would otherwise stall the
+// whole publish or pull. Timing out drops that connection, and the retry
+// dials a fresh one.
+var chunkAttemptTimeout = 10 * time.Second
+
+// storeConnsPerHost sizes the idle connection pool of the chunked store
+// transport: parallel chunk transfers keep up to one connection per worker
+// busy against the single store endpoint, and net/http's default of 2 idle
+// connections per host would redial for almost every chunk.
+const storeConnsPerHost = 64
+
+// storeIdleConnTimeout drops pooled connections before typical server and
+// NAT idle limits (RGW, conntrack). net/http's 90 s default can outlive
+// them: a request written onto a connection the far side already forgot
+// hangs until the attempt timeout.
+const storeIdleConnTimeout = 30 * time.Second
+
+// newStoreTransport clones the default transport with a pool sized for
+// parallel chunk transfers.
+func newStoreTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert // net/http's default transport
+	transport.MaxIdleConns = storeConnsPerHost
+	transport.MaxIdleConnsPerHost = storeConnsPerHost
+	transport.IdleConnTimeout = storeIdleConnTimeout
+	return transport
 }
 
 // putBytes uploads an in-memory object payload-signed with its SHA-256, so
@@ -163,14 +193,15 @@ func (c *s3Client) putBytes(ctx context.Context, storeKey string, payload []byte
 // still checks the body against it, so a wrong digest fails the upload and
 // the existing-key skip stays safe.
 func (c *s3Client) putBytesWithSHA256(ctx context.Context, storeKey string, payload []byte, payloadSHA256 string) error {
-	return c.putSigned(ctx, storeKey, int64(len(payload)), payloadSHA256, func() (io.ReadCloser, error) {
+	return c.putSigned(ctx, storeKey, int64(len(payload)), payloadSHA256, chunkAttemptTimeout, func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(payload)), nil
 	})
 }
 
-// putSigned is put with an explicit x-amz-content-sha256: UNSIGNED-PAYLOAD
-// for streamed files, or the hex SHA-256 of the body.
-func (c *s3Client) putSigned(ctx context.Context, storeKey string, size int64, payloadHash string, open func() (io.ReadCloser, error)) error {
+// putSigned is put with an explicit x-amz-content-sha256 (UNSIGNED-PAYLOAD
+// for streamed files, or the hex SHA-256 of the body) and an optional
+// per-attempt timeout (0: bounded only by ctx, for multi-GiB streamed files).
+func (c *s3Client) putSigned(ctx context.Context, storeKey string, size int64, payloadHash string, attemptTimeout time.Duration, open func() (io.ReadCloser, error)) error {
 	if !c.writable() {
 		return ErrNotWritable
 	}
@@ -197,8 +228,16 @@ func (c *s3Client) putSigned(ctx context.Context, storeKey string, size int64, p
 		if openErr != nil {
 			return openErr
 		}
-		err := c.putOnce(ctx, urlString, key, body, size, payloadHash)
+		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+		if attemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
+		}
+		err := c.putOnce(attemptCtx, urlString, key, body, size, payloadHash)
+		cancel()
 		_ = body.Close()
+		if err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err == nil {
 			if attempt > 0 {
 				klog.V(2).InfoS("S3 PUT succeeded after retries", "key", key, "attempt", attempt+1)
