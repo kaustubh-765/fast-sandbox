@@ -55,6 +55,17 @@ var nativeArtifactNames = []struct{ publish, cache string }{
 // nativeFiles validates that the manifest carries the complete native
 // artifact set for its snapshot mode and returns the expected digests.
 func (m manifest) nativeFiles() ([]nativeFile, error) {
+	return m.nativeFilesWith(true)
+}
+
+// stagedNativeFiles is nativeFiles for a staged manifest before publish: an
+// entry may carry only its size (a Fastlet that skipped the whole-file
+// hash), but a digest that is present must be well-formed.
+func (m manifest) stagedNativeFiles() ([]nativeFile, error) {
+	return m.nativeFilesWith(false)
+}
+
+func (m manifest) nativeFilesWith(requireDigest bool) ([]nativeFile, error) {
 	files := make([]nativeFile, 0, len(nativeArtifactNames))
 	for _, name := range nativeArtifactNames {
 		if artifacts.VMManifest(m).IsRootfsOnly() && name.publish != "rootfs.ext4" {
@@ -64,7 +75,7 @@ func (m manifest) nativeFiles() ([]nativeFile, error) {
 		if !ok {
 			return nil, fmt.Errorf("manifest is missing the %s artifact", name.publish)
 		}
-		if !validSHA256(entry.SHA256) {
+		if (requireDigest || entry.SHA256 != "") && !validSHA256(entry.SHA256) {
 			return nil, fmt.Errorf("manifest artifact %s has an invalid sha256", name.publish)
 		}
 		if entry.SizeBytes <= 0 {
