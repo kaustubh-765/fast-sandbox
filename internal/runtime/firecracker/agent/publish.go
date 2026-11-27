@@ -17,7 +17,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -80,11 +82,15 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 		return PublishResult{}, err
 	}
 	started := time.Now()
+	if files, err = c.completeStagedSet(dir, files); err != nil {
+		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "completion", "elapsed", time.Since(started).String())
+		return PublishResult{}, err
+	}
 	manifestBytes, chunkIndex, err := c.prepareManifest(ctx, kind, key, dir, files, started)
 	if err != nil {
 		return PublishResult{}, err
 	}
-	if err := checkPublishManifest(manifestBytes, chunkIndex, dir); err != nil {
+	if err := checkPublishManifest(manifestBytes, chunkIndex, dir, c.transfer.ChunkListOnly); err != nil {
 		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "manifest check", "elapsed", time.Since(started).String())
 		return PublishResult{}, err
 	}
@@ -164,7 +170,7 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 // with it the namespace, is only known after.
 func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, files []nativeFile, started time.Time) ([]byte, []byte, error) {
 	if !c.transfer.Chunked() {
-		manifestBytes, err := bindChunkIndex(dir, nil)
+		manifestBytes, err := bindChunkIndex(dir, nil, nil)
 		return manifestBytes, nil, err
 	}
 	names := make([]string, 0, len(files))
@@ -186,10 +192,20 @@ func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, fil
 	if err != nil {
 		return nil, nil, err
 	}
+	// Every chunked artifact gets its chunk-list digest, from the index just
+	// built: the identity under which an entry staged without a whole-file
+	// sha256 is published.
+	lists := map[string]artifacts.ChunkListDigest{}
+	for name, file := range index.Files {
+		lists[name] = artifacts.ChunkListDigest{
+			Version: artifacts.ChunkListDigestVersion, ChunkSize: index.ChunkSize,
+			SHA256: artifacts.ChunkListSHA256(index.ChunkSize, file.SizeBytes, file.Chunks),
+		}
+	}
 	manifestBytes, err := bindChunkIndex(dir, &artifacts.ChunkIndexRef{
 		Version: artifacts.ChunkIndexVersion, Ref: artifacts.ChunkIndexName,
 		SHA256: sha256Hex(indexBytes), SizeBytes: int64(len(indexBytes)),
-	})
+	}, lists)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -236,22 +252,26 @@ func acceptStagedSet(document manifest, kind, dir string) ([]nativeFile, error) 
 
 // checkPublishManifest is the last check before any manifest, chunk index or
 // whole-file object is uploaded: readers must accept the manifest about to
-// be published. Every native entry needs a size and a whole-file sha256,
-// state files need a sha256, the chunk binding must match the chunk index
-// just built (and be absent from a whole-file set), and SHA256SUMS must list
-// at least one entry. A failure leaves at most unreferenced chunks behind.
-func checkPublishManifest(payload, chunkIndex []byte, dir string) error {
+// be published. Every native entry needs a size and the digests its mode
+// requires (legacy: sha256; chunked: a chunkList bound to the chunk index
+// just built, plus sha256 unless chunkListOnly), state files need a sha256,
+// the chunk binding must match the index (and be absent from a whole-file
+// set), and SHA256SUMS must list at least one entry. A failure leaves at
+// most unreferenced chunks behind.
+func checkPublishManifest(payload, chunkIndex []byte, dir string, chunkListOnly bool) error {
 	document, err := parseManifest(payload)
 	if err != nil {
 		return err
 	}
-	if _, err := document.downloadFiles(); err != nil {
+	files, err := document.downloadFiles()
+	if err != nil {
 		return fmt.Errorf("published manifest is incomplete: %w", err)
 	}
 	binding, err := chunkBinding(payload)
 	if err != nil {
 		return err
 	}
+	var index artifacts.ChunkIndex
 	switch {
 	case chunkIndex == nil && binding != nil:
 		return errors.New("whole-file set binds a chunk index")
@@ -259,6 +279,26 @@ func checkPublishManifest(payload, chunkIndex []byte, dir string) error {
 		binding.Ref != artifacts.ChunkIndexName || binding.SHA256 != sha256Hex(chunkIndex) ||
 		binding.SizeBytes != int64(len(chunkIndex))):
 		return errors.New("chunk index binding does not match the chunk index")
+	case chunkIndex != nil:
+		if index, err = artifacts.ParseChunkIndex(chunkIndex); err != nil {
+			return err
+		}
+	}
+	for _, file := range files {
+		if !isNativeArtifact(file.publish) {
+			continue
+		}
+		if (chunkIndex == nil || !chunkListOnly) && file.sha256 == "" {
+			return fmt.Errorf("published manifest artifact %s has no sha256", file.publish)
+		}
+		if chunkIndex == nil {
+			continue
+		}
+		entry, ok := index.Files[file.publish]
+		if !ok || file.chunkList == nil || file.chunkList.ChunkSize != index.ChunkSize ||
+			file.chunkList.SHA256 != artifacts.ChunkListSHA256(index.ChunkSize, entry.SizeBytes, entry.Chunks) {
+			return fmt.Errorf("published manifest artifact %s has no chunk-list digest bound to the chunk index", file.publish)
+		}
 	}
 	sums, err := os.ReadFile(filepath.Join(dir, artifacts.SHA256SUMSName))
 	if err != nil {
@@ -268,6 +308,94 @@ func checkPublishManifest(payload, chunkIndex []byte, dir string) error {
 		return fmt.Errorf("staged %s: %w", artifacts.SHA256SUMSName, err)
 	}
 	return nil
+}
+
+// completeStagedSet fills in the whole-file sha256 of native entries staged
+// by size alone (a Fastlet that skipped the hash, possibly on a stale
+// capability) and rewrites SHA256SUMS from the completed manifest. Only an
+// agent with format: chunked and chunkListOnly: true publishes such entries
+// as they are, and even then not when SHA256SUMS would list nothing, which
+// readers reject. It returns the native files with their digests.
+func (c *Client) completeStagedSet(dir string, files []nativeFile) ([]nativeFile, error) {
+	var missing []int
+	for i, file := range files {
+		if file.sha256 == "" {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) == 0 {
+		return files, nil
+	}
+	if c.transfer.ChunkListDigest() {
+		sums, err := os.ReadFile(filepath.Join(dir, artifacts.SHA256SUMSName))
+		if err == nil {
+			if _, err := artifacts.ParseSHA256SUMS(sums); err == nil {
+				return files, nil
+			}
+		}
+	}
+	var (
+		wg   sync.WaitGroup
+		errs = make([]error, len(missing))
+	)
+	completed := append([]nativeFile(nil), files...)
+	for slot, i := range missing {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sum, _, _, err := HashAndTrackFile(filepath.Join(dir, completed[i].publish))
+			if err != nil {
+				errs[slot] = fmt.Errorf("checksum staged %s: %w", completed[i].publish, err)
+				return
+			}
+			completed[i].sha256 = sum
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	manifestPath := filepath.Join(dir, publishManifestName)
+	_, document, err := readStagedManifestDocument(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	entries, _ := document["files"].(map[string]any)
+	cache := map[string]string{}
+	names := make([]string, 0, len(completed)+2)
+	for _, file := range completed {
+		entry, ok := entries[file.publish].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("staged manifest is missing the %s artifact", file.publish)
+		}
+		entry["sha256"] = file.sha256
+		cache[filepath.Join(dir, file.publish)] = file.sha256
+		names = append(names, file.publish)
+	}
+	payload, err := rewriteStagedManifest(manifestPath, document)
+	if err != nil {
+		return nil, err
+	}
+	completedDocument, err := parseManifest(payload)
+	if err != nil {
+		return nil, err
+	}
+	for _, bundleFile := range []func() (nativeFile, bool, error){completedDocument.vaultFile, completedDocument.policyFile} {
+		bundle, ok, err := bundleFile()
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			cache[filepath.Join(dir, bundle.publish)] = bundle.sha256
+			names = append(names, bundle.publish)
+		}
+	}
+	sort.Strings(names)
+	if err := artifacts.WriteSHA256SUMS(dir, names, cache); err != nil {
+		return nil, err
+	}
+	klog.InfoS("runtime-agent completed size-only staged entries", "dir", dir, "files", len(missing))
+	return completed, nil
 }
 
 // putFile streams one staged file into the store under a store-relative
