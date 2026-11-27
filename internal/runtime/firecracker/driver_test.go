@@ -1788,3 +1788,32 @@ func TestRecoveryDoesNotInspectAnotherFastletPodVM(t *testing.T) {
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	require.FileExists(t, filepath.Join(directory, sandboxMetaName))
 }
+
+func TestImageGCIntervalFromEnv(t *testing.T) {
+	for value, want := range map[string]time.Duration{
+		"":      defaultImageGCInterval,
+		"10m":   10 * time.Minute,
+		" 90s ": 90 * time.Second,
+		"bogus": defaultImageGCInterval,
+		"0s":    defaultImageGCInterval,
+		"-5m":   defaultImageGCInterval,
+	} {
+		t.Setenv(imageGCIntervalEnv, value)
+		require.Equal(t, want, imageGCInterval(), "value %q", value)
+	}
+}
+
+func TestImageCacheLimitFromEnv(t *testing.T) {
+	for value, want := range map[string]int64{
+		"":      defaultImageCacheLimitBytes,
+		"200":   200 << 30,
+		" 60 ":  60 << 30,
+		"bogus": defaultImageCacheLimitBytes,
+		"0":     defaultImageCacheLimitBytes,
+		"-5":    defaultImageCacheLimitBytes,
+		"1.5":   defaultImageCacheLimitBytes,
+	} {
+		t.Setenv(imageCacheLimitEnv, value)
+		require.Equal(t, want, imageCacheLimitBytes(), "value %q", value)
+	}
+}
