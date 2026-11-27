@@ -98,7 +98,7 @@ func stageArtifactSet(t *testing.T) string {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "rootfs.ext4"), []byte("rootfs"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "vmstate.snap"), []byte("vmstate"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "memory.snap"), []byte("memory"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SHA256SUMS"), []byte("sums\n"), 0o644))
+	require.NoError(t, artifacts.WriteSHA256SUMS(dir, []string{"memory.snap", "rootfs.ext4", "vmstate.snap"}, nil))
 	return dir
 }
 
