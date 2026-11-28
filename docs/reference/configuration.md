@@ -268,6 +268,13 @@ optimization: the policy restricting port 5758 to control-plane Pods is what
 protects the bearer token on the pod network, where a captured token remains
 a valid Fastlet control credential for up to its one-hour lifetime.
 
+### Firecracker image cache
+
+Pool templates may set these optional variables on the Fastlet container:
+
+- `FAST_SANDBOX_IMAGE_GC_INTERVAL`: the period of the node image-cache garbage collection, as a Go duration such as `10m` (default `1h`). An empty, invalid, or non-positive value keeps the default. A shorter period keeps the cache closer to its limit under a sustained pause or snapshot load.
+- `FAST_SANDBOX_IMAGE_CACHE_LIMIT_GB`: the node image-cache limit in GiB, as a positive integer (default `20`). An empty, invalid, or non-positive value keeps the default. Size it to the templates and checkpoints a node keeps warm; the cache is shared by every Fastlet on the node.
+
 ## Proxy configuration
 
 Sandbox Proxy flags:
