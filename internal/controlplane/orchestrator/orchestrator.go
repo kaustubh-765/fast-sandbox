@@ -18,10 +18,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/pkg/util/idgen"
 )
@@ -219,12 +221,30 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
 		ResourceMode:    o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
-		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
+		Image: placementImage(sandbox), StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
 	}
 	return candidates, parameters, nil
+}
+
+// placementImage is the cache reference Top-K image affinity ranks on. A
+// Sandbox resuming from a pause checkpoint restores that checkpoint, not its
+// image, so it ranks on the checkpoint reference: every Fastlet whose node
+// cache already holds the set ranks above the cut, and the resume loads it
+// locally instead of pulling it across the network. The reference matches
+// the runtime's restore reference (restoreReference in the firecracker
+// runtime).
+func placementImage(sandbox *apiv1alpha2.Sandbox) string {
+	checkpoint := ResumeCheckpoint(sandbox)
+	if checkpoint == nil || checkpoint.ArtifactDigest == "" {
+		return sandbox.Spec.Image
+	}
+	if strings.HasPrefix(checkpoint.ManifestRef, ocitemplate.Prefix) {
+		return checkpoint.ManifestRef
+	}
+	return artifacts.CheckpointReference(checkpoint.ArtifactDigest)
 }
 
 // FastPathCandidates is intentionally registry-only. Calling it cannot issue
