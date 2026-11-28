@@ -17,7 +17,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -79,6 +81,21 @@ const (
 	// /dev/net/tun; the build Pod is pinned to them via nodeSelector.
 	sandboxTemplateKVMNodeLabel = "sandbox.fast.io/kvm"
 )
+
+// BuildNodeSelectorAnnotation lets a SandboxTemplate narrow where its build
+// Pod runs (for example onto the CPU family its SandboxPool serves). The
+// value is a JSON object of string label keys to string label values that is
+// merged into the build Pod's nodeSelector. The platform KVM selector
+// (sandbox.fast.io/kvm=true) is always kept and wins over the annotation. An
+// invalid value fails the build with reasonInvalidBuildNodeSelector instead
+// of creating a Pod. The annotation is read when the build Pod is created;
+// changing it does not rebuild an already built generation.
+const BuildNodeSelectorAnnotation = "sandbox.fast.io/build-node-selector"
+
+// reasonInvalidBuildNodeSelector marks a build failed by an unparsable or
+// invalid BuildNodeSelectorAnnotation. Annotation edits do not bump the
+// generation, so the failure is re-evaluated once the annotation is fixed.
+const reasonInvalidBuildNodeSelector = "InvalidBuildNodeSelector"
 
 // sandboxTemplatePublishSecretDir is where the build Pod mounts the
 // template's publishSecretRef; the builder reads the credential keys as files
@@ -148,13 +165,15 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 	// deletes its own workspace with the Pod) and cleaned up
 	// opportunistically afterwards; requeue at
 	// the earliest retention expiry so a quiet cluster still reaps them. The
-	// one exception is a failure caused by the platform artifact store not
-	// being configured yet: the store is read live, so that state is retried
-	// and can heal without a template change.
+	// exceptions are a failure caused by the platform artifact store not
+	// being configured yet (the store is read live, so that state is retried
+	// and can heal without a template change) and an invalid build node
+	// selector annotation that has since been fixed (annotation edits do not
+	// bump the generation).
 	if template.Status.ObservedGeneration == template.Generation &&
 		(template.Status.Phase == apiv1alpha2.SandboxTemplatePhaseSucceeded ||
 			template.Status.Phase == apiv1alpha2.SandboxTemplatePhaseFailed) &&
-		!failedArtifactStoreUnconfigured(&template) {
+		!failedBuildRetryable(&template) {
 		if err := r.cleanupFinishedPods(ctx, &template); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -236,11 +255,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		// (apiserver flake, quota) requeue with backoff instead of failing
 		// the generation permanently — only the Pod's own outcome decides
 		// Succeeded/Failed.
-		if err := r.createBuildPod(ctx, &template, output, store.Endpoint); err != nil {
-			return ctrl.Result{}, err
-		}
-		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseBuilding
-		return ctrl.Result{}, r.updatePhase(ctx, &template)
+		return ctrl.Result{}, r.startBuild(ctx, &template, output, store.Endpoint)
 	case pod.Status.Phase == corev1.PodSucceeded:
 		// Build Pod finished: consume the reported annotations, mark the
 		// build succeeded, and clear the finished Pod.
@@ -715,8 +730,9 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: sandboxTemplateBuilderServiceAccount,
 			// The builder needs /dev/kvm and /dev/net/tun; label the
-			// KVM-capable nodes accordingly.
-			NodeSelector:          map[string]string{sandboxTemplateKVMNodeLabel: "true"},
+			// KVM-capable nodes accordingly. The template may narrow the
+			// selection further via BuildNodeSelectorAnnotation.
+			NodeSelector:          buildPodNodeSelector(template),
 			ActiveDeadlineSeconds: ptr(buildDeadlineSeconds),
 			Containers: []corev1.Container{{
 				Name:            "build",
@@ -857,6 +873,27 @@ func (r *SandboxTemplateReconciler) updatePhase(ctx context.Context, template *a
 	return r.Status().Update(ctx, template)
 }
 
+// startBuild creates the build Pod for the current generation and marks the
+// template Building. An invalid build node selector annotation is a user
+// error, so it fails the build terminally before any Pod exists.
+func (r *SandboxTemplateReconciler) startBuild(ctx context.Context, template *apiv1alpha2.SandboxTemplate, output apiv1alpha2.OutputSpec, endpoint string) error {
+	if _, err := buildNodeSelector(template); err != nil {
+		return r.failBuild(ctx, template, reasonInvalidBuildNodeSelector, err)
+	}
+	if err := r.createBuildPod(ctx, template, output, endpoint); err != nil {
+		return err
+	}
+	template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseBuilding
+	return r.updatePhase(ctx, template)
+}
+
+// failedBuildRetryable reports whether a terminal Failed phase can heal
+// without a generation bump: the platform artifact store was not configured
+// yet, or an invalid build node selector annotation has since been fixed.
+func failedBuildRetryable(template *apiv1alpha2.SandboxTemplate) bool {
+	return failedArtifactStoreUnconfigured(template) || failedBuildNodeSelectorFixed(template)
+}
+
 // failedArtifactStoreUnconfigured reports whether a terminal Failed phase is
 // the retryable "platform artifact store not configured" state rather than a
 // spec error.
@@ -870,6 +907,69 @@ func failedArtifactStoreUnconfigured(template *apiv1alpha2.SandboxTemplate) bool
 		}
 	}
 	return false
+}
+
+// failedBuildNodeSelectorFixed reports whether a terminal Failed phase was
+// caused by an invalid build node selector annotation that is now valid, so
+// the build can be retried without a generation bump.
+func failedBuildNodeSelectorFixed(template *apiv1alpha2.SandboxTemplate) bool {
+	if template.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed {
+		return false
+	}
+	for _, condition := range template.Status.Conditions {
+		if condition.Type == apiv1alpha2.SandboxTemplateConditionBuildSucceeded {
+			if condition.Reason != reasonInvalidBuildNodeSelector {
+				return false
+			}
+			_, err := buildNodeSelector(template)
+			return err == nil
+		}
+	}
+	return false
+}
+
+// buildPodNodeSelector is buildNodeSelector for Pod creation. startBuild
+// rejects an invalid annotation before any Pod is created, so an error here
+// only falls back to the platform KVM selector.
+func buildPodNodeSelector(template *apiv1alpha2.SandboxTemplate) map[string]string {
+	selector, err := buildNodeSelector(template)
+	if err != nil {
+		return platformBuildNodeSelector()
+	}
+	return selector
+}
+
+// platformBuildNodeSelector is the selector every build Pod needs: the
+// builder requires /dev/kvm and /dev/net/tun.
+func platformBuildNodeSelector() map[string]string {
+	return map[string]string{sandboxTemplateKVMNodeLabel: "true"}
+}
+
+// buildNodeSelector returns the build Pod's nodeSelector: the platform KVM
+// selector merged with the template's BuildNodeSelectorAnnotation. The
+// annotation must be a JSON object of valid label keys to valid label
+// values; the platform KVM key always keeps its platform value.
+func buildNodeSelector(template *apiv1alpha2.SandboxTemplate) (map[string]string, error) {
+	selector := platformBuildNodeSelector()
+	raw, ok := template.Annotations[BuildNodeSelectorAnnotation]
+	if !ok {
+		return selector, nil
+	}
+	var requested map[string]string
+	if err := json.Unmarshal([]byte(raw), &requested); err != nil {
+		return nil, fmt.Errorf("annotation %s must be a JSON object of string label keys to string values: %w", BuildNodeSelectorAnnotation, err)
+	}
+	if errs := metav1validation.ValidateLabels(requested, field.NewPath("metadata", "annotations").Key(BuildNodeSelectorAnnotation)); len(errs) > 0 {
+		return nil, fmt.Errorf("annotation %s is not a valid node selector: %w", BuildNodeSelectorAnnotation, errs.ToAggregate())
+	}
+	for key, value := range requested {
+		if key == sandboxTemplateKVMNodeLabel {
+			// Platform-owned: the builder cannot run without KVM.
+			continue
+		}
+		selector[key] = value
+	}
+	return selector, nil
 }
 
 // failBuild marks the template as Failed with a condition. The condition is
