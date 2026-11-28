@@ -141,7 +141,7 @@ Secret (read).
 
 ### Runtime-agent transfer
 
-The `transfer` section of the runtime-agent's `agent.yaml` selects the store format of new snapshot publishes ([FSEP-0004](../../fseps/0004-chunked-snapshot-transfer.md); see [Sandbox snapshots](../guides/sandbox-snapshots.md#appendix-how-it-works)). It is read at startup. Pulls read both formats whatever it says. An unknown value, or `compression: zstd` with `format: legacy`, fails agent startup.
+The `transfer` section of the runtime-agent's `agent.yaml` selects the store format of new snapshot publishes ([FSEP-0004](../../fseps/0004-chunked-snapshot-transfer.md); see [Sandbox snapshots](../guides/sandbox-snapshots.md#appendix-how-it-works)). It is read at startup. Pulls read both formats whatever it says. An unknown value, or `compression: zstd` or `chunkListOnly: true` with `format: legacy`, fails agent startup.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -149,6 +149,7 @@ The `transfer` section of the runtime-agent's `agent.yaml` selects the store for
 | `transfer.compression` | `none` | `none` or `zstd` for new chunk objects; `chunked` only. Readers decode each chunk by the encoding recorded in `chunks.json` |
 | `transfer.concurrency` | `8` | Parallel chunk transfers per publish or pull |
 | `transfer.chunkSizeMiB` | `4` | Chunk size of new chunked sets, recorded per index; a multiple of 64 KiB |
+| `transfer.chunkListOnly` | `false` | `chunked` only. Lets manifests omit the whole-file `sha256` of native files, which the chunk-list digest then identifies alone, and makes the agent report the `chunkListDigest` capability so Fastlets stop hashing them. Set it only once every agent and Fastlet reads chunk-list digests |
 
 ## Fastlet configuration
 

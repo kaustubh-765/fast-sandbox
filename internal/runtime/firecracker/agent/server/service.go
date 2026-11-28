@@ -206,7 +206,8 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 		PinCount:   snapshot.PinCount,
 		ImageCount: snapshot.ImageCount,
 
-		TransferFormat: s.transferFormat(),
+		TransferFormat:  s.transferFormat(),
+		ChunkListDigest: s.transfer.ChunkListDigest(),
 	}
 	if s.p2pUp != nil {
 		response.P2PUp = s.p2pUp()
@@ -239,7 +240,7 @@ func (s *Service) PublishImage(ctx context.Context, request agentprotocol.Publis
 		}
 		return agentprotocol.PublishImageResponse{}, err
 	}
-	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest, TransferFormat: s.transferFormat()}, nil
+	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest, TransferFormat: s.transferFormat(), ChunkListDigest: s.transfer.ChunkListDigest()}, nil
 }
 
 // manifestDigestFor re-reads the committed manifest digest of an image.
