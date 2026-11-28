@@ -473,6 +473,9 @@ func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest,
 		return nil, err
 	}
 	delete(document, "files")
+	// As in the full snapshot assembly: an inherited chunk index binding
+	// names a chunks.json this set never uploads.
+	delete(document, artifacts.ManifestChunksField)
 	if len(manifest.Files) > 0 {
 		files, err := json.Marshal(manifest.Files)
 		if err != nil {

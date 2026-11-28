@@ -1,0 +1,68 @@
+{
+  "chunks": {
+    "version": 1,
+    "ref": "chunks.json",
+    "sha256": "3a34b3eb88b44668ca44f49bfc5df8843ae0dbfb61f854d6e295288995e99ee4",
+    "sizeBytes": 1546
+  },
+  "compatibility": {
+    "cpuArch": "x86_64",
+    "cpuFamily": 6,
+    "cpuModel": 85,
+    "cpuModelName": "",
+    "cpuStepping": 7,
+    "cpuTemplate": "none",
+    "firecrackerVersion": "1.16.1",
+    "hostKernel": "",
+    "vendor": "GenuineIntel"
+  },
+  "files": {
+    "memory.snap": {
+      "chunkList": {
+        "version": 1,
+        "chunkSize": 65536,
+        "sha256": "8b081ecf7d9fb99cbedcb47189c6106b5662388a2128aff03e48d0f0908b30af"
+      },
+      "sha256": "a42d7208722d88100f97bc29929a938cb6e53471dc2456d859132b5ed5cee2bf",
+      "sizeBytes": 131572
+    },
+    "rootfs.ext4": {
+      "chunkList": {
+        "version": 1,
+        "chunkSize": 65536,
+        "sha256": "66ca1b1a2129dcbcc1fa89a942ea0beaea4c5b8a0f711791200a3aadd8ebbd7c"
+      },
+      "sha256": "b5a2eb7113b548063b4e0b9afc2daa0a67a5c5fb755b2aec716f05a6cb4d6cfa",
+      "sizeBytes": 263144
+    },
+    "vmstate.snap": {
+      "chunkList": {
+        "version": 1,
+        "chunkSize": 65536,
+        "sha256": "08273121e076f6ca3c0dd316d37ac4087930ef41e34152df0b816407793d2ca9"
+      },
+      "sha256": "7c983d42e05665dcbb98103fe7d55b5266ee3024c0b0f6184d3927161f5910fa",
+      "sizeBytes": 777
+    }
+  },
+  "kernel": {
+    "version": "6.1.177"
+  },
+  "machine": {
+    "memoryMiB": 1024,
+    "rootfsDriveID": "rootfs",
+    "rootfsDrivePath": "rootfs.img",
+    "rootfsSizeMiB": 1,
+    "vcpuCount": 2
+  },
+  "platform": {
+    "stateFiles": {
+      "policy.json": {
+        "sha256": "7b536df7f8e026f977e7a3df89b60d109fb9469b574282b0b771fdf2acb235ea",
+        "sizeBytes": 29
+      }
+    }
+  },
+  "runtime": "firecracker",
+  "schemaVersion": 1
+}

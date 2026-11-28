@@ -67,37 +67,48 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	default:
 		return PublishResult{}, fmt.Errorf("unknown publish kind %q", kind)
 	}
-	manifestBytes, err := os.ReadFile(filepath.Join(dir, publishManifestName))
+	staged, err := os.ReadFile(filepath.Join(dir, publishManifestName))
 	if err != nil {
 		return PublishResult{}, fmt.Errorf("read staged manifest: %w", err)
 	}
-	document, err := parseManifest(manifestBytes)
+	document, err := parseManifest(staged)
 	if err != nil {
 		return PublishResult{}, err
 	}
-	files, err := document.nativeFiles()
+	files, err := acceptStagedSet(document, kind, dir)
 	if err != nil {
 		return PublishResult{}, err
 	}
-	if artifacts.VMManifest(document).IsRootfsOnly() {
-		if err := validateRootfsStaging(document, kind, dir); err != nil {
-			return PublishResult{}, err
-		}
+	started := time.Now()
+	manifestBytes, chunkIndex, err := c.prepareManifest(ctx, kind, key, dir, files, started)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if err := checkPublishManifest(manifestBytes, chunkIndex, dir); err != nil {
+		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "manifest check", "elapsed", time.Since(started).String())
+		return PublishResult{}, err
 	}
 	artifactDigest := artifacts.SHA256Of(manifestBytes)
 	base := artifacts.Digest16(manifestBytes)
-	started := time.Now()
-	klog.InfoS("runtime-agent publish started", "kind", kind, "key", key, "digest", artifactDigest, "stagingDir", dir)
+	klog.InfoS("runtime-agent publish started", "kind", kind, "key", key, "digest", artifactDigest, "format", c.transfer.Format, "stagingDir", dir)
 
 	// Artifacts and SHA256SUMS first: the namespace stays incomplete (and
-	// unaddressable) until the manifest lands. The optional state bundle
-	// files (vault, recorded policy) join the artifact uploads when staged —
-	// any stat failure other than absence fails the publish, since the
-	// staged manifest and SHA256SUMS already reference the files and a
-	// stranded member would break the cross-node resume.
+	// unaddressable) until the manifest lands. A chunked set uploaded its
+	// native artifacts as chunks already and adds its chunk index instead.
+	// The optional state bundle files (vault, recorded policy) join the
+	// uploads when staged — any stat failure other than absence fails the
+	// publish, since the staged manifest and SHA256SUMS already reference
+	// the files and a stranded member would break the cross-node resume.
 	entries := make([]string, 0, len(files)+3)
-	for _, file := range files {
-		entries = append(entries, file.publish)
+	if chunkIndex != nil {
+		if err := c.s3.putBytes(ctx, base+"/"+artifacts.ChunkIndexName, chunkIndex); err != nil {
+			klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "file", artifacts.ChunkIndexName, "elapsed", time.Since(started).String())
+			return PublishResult{}, fmt.Errorf("publish chunk index: %w", err)
+		}
+	} else {
+		for _, file := range files {
+			entries = append(entries, file.publish)
+		}
 	}
 	for _, bundleName := range []string{publishVaultName, publishPolicyName} {
 		if _, err := os.Stat(filepath.Join(dir, bundleName)); err == nil {
@@ -144,6 +155,121 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	return PublishResult{ManifestRef: manifestURI, ArtifactDigest: artifactDigest}, nil
 }
 
+// prepareManifest returns the manifest bytes the set publishes under and,
+// for a chunked set, its chunk index. A legacy set publishes the staged
+// manifest as is; only a chunk binding inherited from the manifest the
+// Sandbox booted from is dropped, since the set carries whole files. A
+// chunked set first uploads the chunks of the native files its manifest
+// lists, then binds their index into the manifest: the manifest digest, and
+// with it the namespace, is only known after.
+func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, files []nativeFile, started time.Time) ([]byte, []byte, error) {
+	if !c.transfer.Chunked() {
+		manifestBytes, err := bindChunkIndex(dir, nil)
+		return manifestBytes, nil, err
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.publish)
+	}
+	index, stats, err := c.publishChunks(ctx, dir, names)
+	if err == nil {
+		// A cancelled publish must not bind (and rewrite the staged
+		// manifest with) a chunk index that may be missing chunks.
+		err = ctx.Err()
+	}
+	if err != nil {
+		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "chunks", "elapsed", time.Since(started).String())
+		return nil, nil, fmt.Errorf("publish chunks: %w", err)
+	}
+	logPublishStats(kind, key, stats)
+	indexBytes, err := artifacts.MarshalChunkIndex(index)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestBytes, err := bindChunkIndex(dir, &artifacts.ChunkIndexRef{
+		Version: artifacts.ChunkIndexVersion, Ref: artifacts.ChunkIndexName,
+		SHA256: sha256Hex(indexBytes), SizeBytes: int64(len(indexBytes)),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifestBytes, indexBytes, nil
+}
+
+// acceptStagedSet checks a staged set before anything is uploaded: every
+// native file the set needs and every declared state bundle exists as a
+// regular file of the declared size, and every digest that is present is
+// well-formed. A native entry with only its size is accepted; whether the
+// published set may omit the digest is decided by checkPublishManifest. It
+// returns the native files to publish.
+func acceptStagedSet(document manifest, kind, dir string) ([]nativeFile, error) {
+	if artifacts.VMManifest(document).IsRootfsOnly() {
+		if err := validateRootfsStaging(kind, dir); err != nil {
+			return nil, err
+		}
+	}
+	files, err := document.stagedNativeFiles()
+	if err != nil {
+		return nil, err
+	}
+	members := append([]nativeFile(nil), files...)
+	for _, bundleFile := range []func() (nativeFile, bool, error){document.vaultFile, document.policyFile} {
+		file, ok, err := bundleFile()
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			members = append(members, file)
+		}
+	}
+	for _, member := range members {
+		info, err := os.Stat(filepath.Join(dir, member.publish))
+		if err != nil {
+			return nil, fmt.Errorf("stat staged %s: %w", member.publish, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() != member.sizeBytes {
+			return nil, fmt.Errorf("staged %s has invalid type or size", member.publish)
+		}
+	}
+	return files, nil
+}
+
+// checkPublishManifest is the last check before any manifest, chunk index or
+// whole-file object is uploaded: readers must accept the manifest about to
+// be published. Every native entry needs a size and a whole-file sha256,
+// state files need a sha256, the chunk binding must match the chunk index
+// just built (and be absent from a whole-file set), and SHA256SUMS must list
+// at least one entry. A failure leaves at most unreferenced chunks behind.
+func checkPublishManifest(payload, chunkIndex []byte, dir string) error {
+	document, err := parseManifest(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := document.downloadFiles(); err != nil {
+		return fmt.Errorf("published manifest is incomplete: %w", err)
+	}
+	binding, err := chunkBinding(payload)
+	if err != nil {
+		return err
+	}
+	switch {
+	case chunkIndex == nil && binding != nil:
+		return errors.New("whole-file set binds a chunk index")
+	case chunkIndex != nil && (binding == nil || binding.Version != artifacts.ChunkIndexVersion ||
+		binding.Ref != artifacts.ChunkIndexName || binding.SHA256 != sha256Hex(chunkIndex) ||
+		binding.SizeBytes != int64(len(chunkIndex))):
+		return errors.New("chunk index binding does not match the chunk index")
+	}
+	sums, err := os.ReadFile(filepath.Join(dir, artifacts.SHA256SUMSName))
+	if err != nil {
+		return fmt.Errorf("read staged %s: %w", artifacts.SHA256SUMSName, err)
+	}
+	if _, err := artifacts.ParseSHA256SUMS(sums); err != nil {
+		return fmt.Errorf("staged %s: %w", artifacts.SHA256SUMSName, err)
+	}
+	return nil
+}
+
 // putFile streams one staged file into the store under a store-relative
 // key. The opener reopens the file per attempt (net/http closes request
 // bodies), so a transient failure retries against a fresh reader.
@@ -161,7 +287,7 @@ func (c *Client) putFile(ctx context.Context, dir, name, storeKey string) error 
 // nowFunc is the publish clock; factored for tests.
 var nowFunc = time.Now
 
-func validateRootfsStaging(document manifest, kind, dir string) error {
+func validateRootfsStaging(kind, dir string) error {
 	if kind == agentprotocol.PublishKindCheckpoint {
 		return fmt.Errorf("rootfsOnly cannot be published as a checkpoint")
 	}
@@ -171,20 +297,6 @@ func validateRootfsStaging(document manifest, kind, dir string) error {
 			return fmt.Errorf("rootfsOnly staging contains %s", name)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat staged %s: %w", name, err)
-		}
-	}
-	// All declared members must exist before making any part of this set public.
-	members, err := document.downloadFiles()
-	if err != nil {
-		return err
-	}
-	for _, member := range members {
-		info, err := os.Stat(filepath.Join(dir, member.publish))
-		if err != nil {
-			return fmt.Errorf("stat staged %s: %w", member.publish, err)
-		}
-		if !info.Mode().IsRegular() || info.Size() != member.sizeBytes {
-			return fmt.Errorf("staged %s has invalid type or size", member.publish)
 		}
 	}
 	return nil

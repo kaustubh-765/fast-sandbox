@@ -147,6 +147,20 @@ func HashAndTrackFile(path string) (string, int64, VerifiedFile, error) {
 	return sum, afterInfo.Size(), tracked, nil
 }
 
+// TrackWrittenFile binds digest, computed over exactly the bytes the caller
+// wrote to file, to the file's current stat identity. Unlike
+// HashAndTrackFile it does not read the file back: the caller vouches that
+// the digest covers the content it wrote and that nothing writes the file
+// afterwards. Any later write changes the identity and voids the proof.
+func TrackWrittenFile(file *os.File, digest string) (VerifiedFile, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return VerifiedFile{}, err
+	}
+	id, ok := fileIdentityFromInfo(info)
+	return VerifiedFile{id: id, sha256: digest, valid: ok}, nil
+}
+
 func (c *verifiedDigestCache) matches(path string, id fileIdentity, expected string) bool {
 	cleaned := filepath.Clean(path)
 	c.mu.RLock()
@@ -373,6 +387,11 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 	// post-rename stat identity is derived from its open descriptor (fstat)
 	// rather than re-stating target by name.
 	PrepareCommittedCacheFile(tmp.Name())
+	// Make the verified bytes durable before the name commits them; the
+	// directory fsync in commitManifest covers the rename itself.
+	if err := fsyncFile(tmp); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		return err
 	}
@@ -390,7 +409,9 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 
 // commitManifest writes the downloaded manifest as the pull commit point:
 // its presence with matching files means the pull is complete. The write is
-// atomic so a crash never leaves a half-written manifest.
+// atomic so a crash never leaves a half-written manifest, and durable: the
+// manifest is fsynced before its rename, and one directory fsync after it
+// persists the artifact renames of stageFile and the commit point together.
 func commitManifest(dir string, payload []byte) error {
 	tmp, err := os.CreateTemp(dir, manifestName+".tmp-*")
 	if err != nil {
@@ -409,13 +430,19 @@ func commitManifest(dir string, payload []byte) error {
 	if err := tmp.Chmod(cacheFileMode); err != nil {
 		return err
 	}
+	if err := fsyncFile(tmp); err != nil {
+		return err
+	}
 	// Flush before the rename so the committed name never points at a
 	// half-written file; the deferred cleanup skips the already-closed file.
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	closed = true
-	return os.Rename(tmp.Name(), filepath.Join(dir, manifestName))
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, manifestName)); err != nil {
+		return err
+	}
+	return fsyncDir(dir)
 }
 
 // fileMatches reports whether the file exists with the expected size and
