@@ -138,6 +138,24 @@ func TestCreateParksColdImageThenBootsAsync(t *testing.T) {
 	require.GreaterOrEqual(t, runtime.deliveryPollCount(), 2, "the boot worker must poll the delivery state")
 }
 
+// A long delivery must not leave the boot worker asleep on a multi-second
+// backoff: once the artifact lands, the Sandbox boots within one short poll.
+func TestCreateBootsSoonAfterLongDeliveryCompletes(t *testing.T) {
+	runtime := newAsyncBootRuntime(ImageDelivering)
+	manager := NewSandboxManager(runtime)
+	_, err := ensureSandboxForTest(context.Background(), manager, runtimeSpecForTest("sb-slow", "sb-slow", "img-slow"))
+	require.NoError(t, err)
+
+	time.Sleep(3 * time.Second) // a ~3 s cross-node download
+	delivered := time.Now()
+	runtime.setDeliverStatus(ImageDelivered)
+	waitForSandboxState(t, manager, "sb-slow", func(s fastletapi.SandboxStatus) bool {
+		return s.Runtime.State == fastletapi.RuntimeStateReady
+	})
+	require.Less(t, time.Since(delivered), 800*time.Millisecond,
+		"the boot follows the delivery within one in-flight poll")
+}
+
 func TestCreateParksThenDeleteWhileDeliveringRemovesSandbox(t *testing.T) {
 	runtime := newAsyncBootRuntime(ImageDelivering)
 	manager := NewSandboxManager(runtime)
